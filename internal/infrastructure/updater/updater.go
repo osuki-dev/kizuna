@@ -17,6 +17,8 @@ import (
 	"runtime"
 	"strings"
 	"time"
+
+	"golang.org/x/mod/semver"
 )
 
 const (
@@ -113,6 +115,16 @@ func IsNewerVersion(currentVersion, remoteVersion string) bool {
 	if cleanCur == "dev" || cleanCur == "none" || cleanCur == "" {
 		return false
 	}
+	if cleanRem == "" || cleanRem == "dev" || cleanRem == "none" {
+		return false
+	}
+
+	vCur := "v" + cleanCur
+	vRem := "v" + cleanRem
+	if semver.IsValid(vCur) && semver.IsValid(vRem) {
+		return semver.Compare(vRem, vCur) > 0
+	}
+
 	return cleanCur != cleanRem
 }
 

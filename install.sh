@@ -194,11 +194,11 @@ if [ -z "${WANT_SERVICE}" ] && [ -t 0 ]; then
 fi
 
 if [ "${WANT_SERVICE}" = "yes" ] || [ "${WANT_SERVICE}" = "true" ]; then
-    info "Installing Kizuna system daemon..."
+    info "Installing Kizuna background service..."
     if [ -n "${USE_SUDO}" ]; then
-        ${USE_SUDO} "${TARGET_PATH}" service install
+        ${USE_SUDO} "${TARGET_PATH}" service install --system
     else
-        "${TARGET_PATH}" service install
+        "${TARGET_PATH}" service install --user
     fi
     success "Kizuna background service registered and started!"
 else

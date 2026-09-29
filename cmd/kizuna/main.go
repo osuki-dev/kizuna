@@ -6,8 +6,10 @@ import (
 	"io"
 	"net"
 	"os"
+	"os/exec"
 	"os/signal"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
 	"sync"
@@ -239,9 +241,40 @@ func printCmdRow(name, desc string, ui *presenter.UI) {
 	fmt.Printf("  %-12s  %s\n", ui.SecondaryStyle.Bold(true).Render(name), ui.MutedStyle.Render(desc))
 }
 
+func elevateWithSudo() error {
+	if runtime.GOOS == "windows" {
+		return fmt.Errorf("managing system services on Windows requires running the command prompt or PowerShell as Administrator")
+	}
+	if os.Geteuid() == 0 {
+		return nil
+	}
+	sudoPath, err := exec.LookPath("sudo")
+	if err != nil {
+		return fmt.Errorf("sudo is required for this action but was not found in PATH")
+	}
+
+	execPath, err := os.Executable()
+	if err != nil {
+		return fmt.Errorf("failed to determine executable path: %w", err)
+	}
+
+	args := append([]string{execPath}, os.Args[1:]...)
+	cmd := exec.Command(sudoPath, args...)
+	cmd.Stdin = os.Stdin
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+
+	if err := cmd.Run(); err != nil {
+		return fmt.Errorf("failed to run with sudo: %w", err)
+	}
+
+	os.Exit(0)
+	return nil
+}
+
 func newServiceCmd() *cobra.Command {
 	svcCmd := &cobra.Command{
-		Use:     "service",
+		Use:   "service",
 		Short: "Manage the Kizuna background service daemon on this node",
 		RunE: func(cmd *cobra.Command, args []string) error {
 			return runServer()
@@ -256,15 +289,39 @@ func newServiceCmd() *cobra.Command {
 		},
 	}
 
+	var flagUser bool
+	var flagSystem bool
+
 	installCmd := &cobra.Command{
 		Use:   "install",
 		Short: i18n.T("cmd_service_install_desc"),
 		RunE: func(cmd *cobra.Command, args []string) error {
+			isRoot := os.Geteuid() == 0
+			useUserService := true
+
+			if flagSystem {
+				useUserService = false
+			} else if flagUser {
+				useUserService = true
+			} else {
+				// Default: root -> system service; non-root -> user service (no sudo/root required)
+				useUserService = !isRoot
+			}
+
+			// If system daemon was explicitly requested by a non-root user, elevate using sudo
+			if !useUserService && !isRoot {
+				if err := elevateWithSudo(); err != nil {
+					return fmt.Errorf("installing as a system daemon requires root permissions. Please run with sudo: 'sudo kizuna service install --system' or install as a user service: 'kizuna service install --user': %w", err)
+				}
+				return nil
+			}
+
 			daemonCfg := service.DaemonConfig{
 				Name:        "kizuna-server",
 				DisplayName: "Kizuna Service",
 				Description: "Kizuna P2P Zero-Trust Deployment Service",
 				Arguments:   []string{"service", "run"},
+				UserService: useUserService,
 			}
 			mgr, err := service.NewManager(daemonCfg, func() {
 				_ = runServer()
@@ -276,16 +333,31 @@ func newServiceCmd() *cobra.Command {
 				return err
 			}
 			_ = mgr.Start()
-			fmt.Println("✓ Kizuna system service installed, registered, and started.")
+
+			if useUserService {
+				fmt.Println("✓ Kizuna user background service installed, registered, and started.")
+				fmt.Println("  (Running as user service. To install as a system-wide service instead, run with '--system')")
+			} else {
+				fmt.Println("✓ Kizuna system background service installed, registered, and started.")
+			}
 			return nil
 		},
 	}
+	installCmd.Flags().BoolVar(&flagUser, "user", false, "Install as user-level background service (default for non-root, no password required)")
+	installCmd.Flags().BoolVar(&flagSystem, "system", false, "Install as system-wide daemon (requires administrator/root)")
 
 	startCmd := &cobra.Command{
 		Use:   "start",
 		Short: i18n.T("cmd_service_start_desc"),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			daemonCfg := service.DaemonConfig{Name: "kizuna-server"}
+			useUser := service.DetectUserService("kizuna-server")
+			if !useUser && os.Geteuid() != 0 {
+				if err := elevateWithSudo(); err != nil {
+					return fmt.Errorf("service is installed as system daemon, please run with sudo: 'sudo kizuna service start': %w", err)
+				}
+				return nil
+			}
+			daemonCfg := service.DaemonConfig{Name: "kizuna-server", UserService: useUser}
 			mgr, err := service.NewManager(daemonCfg, nil)
 			if err != nil {
 				return err
@@ -302,7 +374,14 @@ func newServiceCmd() *cobra.Command {
 		Use:   "stop",
 		Short: i18n.T("cmd_service_stop_desc"),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			daemonCfg := service.DaemonConfig{Name: "kizuna-server"}
+			useUser := service.DetectUserService("kizuna-server")
+			if !useUser && os.Geteuid() != 0 {
+				if err := elevateWithSudo(); err != nil {
+					return fmt.Errorf("service is installed as system daemon, please run with sudo: 'sudo kizuna service stop': %w", err)
+				}
+				return nil
+			}
+			daemonCfg := service.DaemonConfig{Name: "kizuna-server", UserService: useUser}
 			mgr, err := service.NewManager(daemonCfg, nil)
 			if err != nil {
 				return err
@@ -319,7 +398,14 @@ func newServiceCmd() *cobra.Command {
 		Use:   "restart",
 		Short: "Restart the Kizuna background service",
 		RunE: func(cmd *cobra.Command, args []string) error {
-			daemonCfg := service.DaemonConfig{Name: "kizuna-server"}
+			useUser := service.DetectUserService("kizuna-server")
+			if !useUser && os.Geteuid() != 0 {
+				if err := elevateWithSudo(); err != nil {
+					return fmt.Errorf("service is installed as system daemon, please run with sudo: 'sudo kizuna service restart': %w", err)
+				}
+				return nil
+			}
+			daemonCfg := service.DaemonConfig{Name: "kizuna-server", UserService: useUser}
 			mgr, err := service.NewManager(daemonCfg, nil)
 			if err != nil {
 				return err
@@ -336,7 +422,8 @@ func newServiceCmd() *cobra.Command {
 		Use:   "status",
 		Short: i18n.T("cmd_service_status_desc"),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			daemonCfg := service.DaemonConfig{Name: "kizuna-server"}
+			useUser := service.DetectUserService("kizuna-server")
+			daemonCfg := service.DaemonConfig{Name: "kizuna-server", UserService: useUser}
 			mgr, err := service.NewManager(daemonCfg, nil)
 			if err != nil {
 				return err
@@ -357,7 +444,14 @@ func newServiceCmd() *cobra.Command {
 		Use:   "uninstall",
 		Short: i18n.T("cmd_service_uninstall_desc"),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			daemonCfg := service.DaemonConfig{Name: "kizuna-server"}
+			useUser := service.DetectUserService("kizuna-server")
+			if !useUser && os.Geteuid() != 0 {
+				if err := elevateWithSudo(); err != nil {
+					return fmt.Errorf("service is installed as system daemon, please run with sudo: 'sudo kizuna service uninstall': %w", err)
+				}
+				return nil
+			}
+			daemonCfg := service.DaemonConfig{Name: "kizuna-server", UserService: useUser}
 			mgr, err := service.NewManager(daemonCfg, nil)
 			if err != nil {
 				return err

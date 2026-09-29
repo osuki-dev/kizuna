@@ -47,3 +47,27 @@ func TestNewManagerLifecycle(t *testing.T) {
 		t.Fatalf("prg.Stop failed: %v", err)
 	}
 }
+
+func TestUserServiceConfig(t *testing.T) {
+	cfg := DaemonConfig{
+		Name:        "test-user-svc",
+		DisplayName: "Test User Service",
+		Description: "A unit test service",
+		Arguments:   []string{"service", "run"},
+		UserService: true,
+	}
+
+	mgr, err := NewManager(cfg, nil)
+	if err != nil {
+		t.Fatalf("failed to create user service manager: %v", err)
+	}
+	if mgr == nil {
+		t.Fatalf("expected non-nil service manager")
+	}
+
+	// Verify detection logic doesn't panic
+	_ = DetectUserService("test-user-svc")
+	_ = IsSystemInstalled("test-user-svc")
+	_ = IsInstalled("test-user-svc")
+}
+
