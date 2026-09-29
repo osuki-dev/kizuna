@@ -619,16 +619,17 @@ func (e *Engine) applyUpdateLocked(u *entity.GossipUpdate) {
 		existing.Incarnation = u.Incarnation
 		existing.GossipState = u.State
 		existing.LastSeen = time.Now()
-		if u.State == entity.GossipStateAlive {
+		switch u.State {
+		case entity.GossipStateAlive:
 			existing.IsOnline = true
 			if t, ok := e.suspectTimers[existing.ID]; ok {
 				t.Stop()
 				delete(e.suspectTimers, existing.ID)
 			}
-		} else if u.State == entity.GossipStateSuspect {
+		case entity.GossipStateSuspect:
 			existing.IsOnline = false
 			e.startSuspectTimerLocked(existing.ID)
-		} else if u.State == entity.GossipStateDead {
+		case entity.GossipStateDead:
 			existing.IsOnline = false
 		}
 

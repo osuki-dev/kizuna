@@ -301,7 +301,7 @@ func newServiceCmd() *cobra.Command {
 		Short: i18n.T("cmd_service_install_desc"),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			isRoot := os.Geteuid() == 0
-			useUserService := true
+			var useUserService bool
 
 			if flagSystem {
 				useUserService = false

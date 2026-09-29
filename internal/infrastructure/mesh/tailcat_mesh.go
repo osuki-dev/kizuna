@@ -105,12 +105,12 @@ func (m *TailcatMesh) Listen(ctx context.Context, port uint16, handler func(net.
 				if err == nil {
 					_ = localConn.Close()
 					return func(c net.Conn) {
-						defer c.Close()
+						defer func() { _ = c.Close() }()
 						target, err := net.Dial("tcp", "127.0.0.1:22")
 						if err != nil {
 							return
 						}
-						defer target.Close()
+						defer func() { _ = target.Close() }()
 						go func() { _, _ = io.Copy(target, c) }()
 						_, _ = io.Copy(c, target)
 					}

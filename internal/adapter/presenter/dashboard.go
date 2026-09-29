@@ -1081,9 +1081,10 @@ func (m *DashboardModel) renderNodesTab(width int) string {
 				tagsStr = strings.Join(n.Tags, ",")
 			}
 
-			if n.GossipState == entity.GossipStateSuspect {
+			switch n.GossipState {
+			case entity.GossipStateSuspect:
 				statusStr = m.styles.WarningText.Render("▲ Suspect")
-			} else if n.GossipState == entity.GossipStateDead {
+			case entity.GossipStateDead:
 				statusStr = m.styles.StatusFailed
 			}
 
@@ -1162,9 +1163,10 @@ func (m *DashboardModel) renderNodesTab(width int) string {
 				tagsStr = strings.Join(n.Tags, ",")
 			}
 
-			if n.GossipState == entity.GossipStateSuspect {
+			switch n.GossipState {
+			case entity.GossipStateSuspect:
 				statusStr = m.styles.WarningText.Render("▲ Suspect")
-			} else if n.GossipState == entity.GossipStateDead {
+			case entity.GossipStateDead:
 				statusStr = m.styles.StatusFailed
 			}
 
@@ -1232,9 +1234,10 @@ func (m *DashboardModel) renderNodesTab(width int) string {
 				hostStr = truncate(n.Addr, 17)
 			}
 
-			if n.GossipState == entity.GossipStateSuspect {
+			switch n.GossipState {
+			case entity.GossipStateSuspect:
 				statusStr = m.styles.WarningText.Render("▲ Suspect")
-			} else if n.GossipState == entity.GossipStateDead {
+			case entity.GossipStateDead:
 				statusStr = m.styles.StatusFailed
 			}
 

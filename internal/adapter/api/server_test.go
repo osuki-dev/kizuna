@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
-	"os"
 	"testing"
 
 	"github.com/osuki-dev/kizuna/internal/adapter/api"
@@ -15,9 +14,7 @@ import (
 
 func TestNodeMetaEndpoints(t *testing.T) {
 	tempDir := t.TempDir()
-	origHome := os.Getenv("HOME")
-	os.Setenv("HOME", tempDir)
-	defer os.Setenv("HOME", origHome)
+	t.Setenv("HOME", tempDir)
 
 	authStore, err := auth.NewAuthStore(tempDir)
 	if err != nil {
