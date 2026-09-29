@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -594,6 +595,14 @@ func newNodeCmd() *cobra.Command {
 				return err
 			}
 
+			// Notify running daemon if active
+			clientHTTP := &http.Client{Timeout: 1200 * time.Millisecond}
+			if reqBody, err := json.Marshal(node); err == nil {
+				if resp, err := clientHTTP.Post("http://127.0.0.1:19800/api/v1/node/add", "application/json", bytes.NewReader(reqBody)); err == nil {
+					_ = resp.Body.Close()
+				}
+			}
+
 			if flagJSON {
 				return presenter.PrintJSON(os.Stdout, map[string]any{
 					"success": true,
@@ -620,20 +629,27 @@ func newNodeCmd() *cobra.Command {
 
 	rmCmd := &cobra.Command{
 		Use:   "rm <node-name>",
-		Short: "Remove a paired mesh node from the repository",
+		Short: "Remove a paired mesh node from the repository and live mesh",
 		Args:  cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
+			nodeName := args[0]
 			repo, err := config.NewNodeRepository("")
 			if err != nil {
 				return err
 			}
-			if err := repo.DeleteNode(args[0]); err != nil {
-				return err
+			_ = repo.DeleteNode(nodeName)
+
+			// Notify running daemon to drop from memory & active gossip
+			clientHTTP := &http.Client{Timeout: 1500 * time.Millisecond}
+			reqBody, _ := json.Marshal(map[string]string{"name": nodeName})
+			if resp, err := clientHTTP.Post("http://127.0.0.1:19800/api/v1/node/remove", "application/json", bytes.NewReader(reqBody)); err == nil {
+				_ = resp.Body.Close()
 			}
+
 			if flagJSON {
-				return presenter.PrintJSON(os.Stdout, map[string]any{"success": true, "removed": args[0]})
+				return presenter.PrintJSON(os.Stdout, map[string]any{"success": true, "removed": nodeName})
 			}
-			fmt.Printf("✓ Removed node '%s'\n", args[0])
+			fmt.Printf("✓ Removed node '%s'\n", nodeName)
 			return nil
 		},
 	}
@@ -883,6 +899,13 @@ func newNodeCmd() *cobra.Command {
 				return fmt.Errorf("failed to delete node from repository: %w", err)
 			}
 
+			// 4. Notify local daemon to remove from memory and active gossip
+			clientHTTP := &http.Client{Timeout: 1500 * time.Millisecond}
+			reqBody, _ := json.Marshal(map[string]string{"name": nodeName, "id": node.ID})
+			if resp, err := clientHTTP.Post("http://127.0.0.1:19800/api/v1/node/remove", "application/json", bytes.NewReader(reqBody)); err == nil {
+				_ = resp.Body.Close()
+			}
+
 			if flagJSON {
 				return presenter.PrintJSON(os.Stdout, map[string]any{"success": true, "kicked": nodeName})
 			}
@@ -1063,7 +1086,7 @@ func listNodes() error {
 
 	// 1. Check if local daemon is running and has live mesh members
 	var meshNodes []*entity.Node
-	clientHTTP := &http.Client{Timeout: 800 * time.Millisecond}
+	clientHTTP := &http.Client{Timeout: 1200 * time.Millisecond}
 	resp, httpErr := clientHTTP.Get("http://127.0.0.1:19800/api/v1/node/members")
 	if httpErr == nil && resp.StatusCode == http.StatusOK {
 		defer func() { _ = resp.Body.Close() }()
@@ -1121,6 +1144,15 @@ func listNodes() error {
 		wg.Wait()
 		finalNodes = probed
 	}
+
+	// Filter out any nodes that are dead or removed from cluster
+	var activeNodes []*entity.Node
+	for _, n := range finalNodes {
+		if n != nil && n.GossipState != entity.GossipStateDead && n.Status != "dead" {
+			activeNodes = append(activeNodes, n)
+		}
+	}
+	finalNodes = activeNodes
 
 	// Guarantee Status is populated on all returned nodes
 	for _, n := range finalNodes {

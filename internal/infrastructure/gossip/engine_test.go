@@ -295,3 +295,59 @@ func TestGossipRepoPersistence(t *testing.T) {
 	}
 }
 
+func TestGossipRemoveMemberAndTombstone(t *testing.T) {
+	repo := newMockRepo()
+	transport := newMockTransport()
+
+	engine := gossip.NewEngine(gossip.Config{
+		NodeID:    "node_A",
+		NodeName:  "desktop-a",
+		MeshAddr:  "10.0.0.1",
+		Transport: transport,
+		Repo:      repo,
+	})
+
+	// Add node_B
+	engine.AddOrUpdateMember(&entity.Node{
+		ID:          "node_B",
+		Name:        "mac-mini",
+		Addr:        "10.0.0.2",
+		IsOnline:    true,
+		GossipState: entity.GossipStateAlive,
+	})
+
+	members := engine.GetMembers()
+	if len(members) != 2 {
+		t.Fatalf("expected 2 members, got %d", len(members))
+	}
+
+	// Remove node_B
+	removed := engine.RemoveMember("mac-mini")
+	if !removed {
+		t.Fatalf("expected RemoveMember to return true")
+	}
+
+	membersAfter := engine.GetMembers()
+	if len(membersAfter) != 1 {
+		t.Fatalf("expected 1 member after removal, got %d", len(membersAfter))
+	}
+	if _, ok := engine.GetMember("mac-mini"); ok {
+		t.Fatalf("expected mac-mini to be gone from GetMember")
+	}
+
+	// An incoming message from removed node should be rejected (no resurrection)
+	pingMsg := &entity.GossipMessage{
+		Type:        entity.GossipMsgPing,
+		SenderID:    "node_B",
+		SenderName:  "mac-mini",
+		SenderAddr:  "10.0.0.2",
+		Incarnation: 5,
+	}
+	_, _ = engine.HandleMessage(pingMsg)
+
+	if len(engine.GetMembers()) != 1 {
+		t.Fatalf("expected tombstone to prevent node_B from resurrecting, got %d members", len(engine.GetMembers()))
+	}
+}
+
+

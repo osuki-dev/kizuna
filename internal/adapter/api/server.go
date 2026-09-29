@@ -23,6 +23,8 @@ type GossipEngine interface {
 	GetMembers() []*entity.Node
 	GetStatus() entity.GossipEngineStatus
 	UpdateLocalMeta(meta *entity.NodeMetaUpdate)
+	RemoveMember(nameOrID string) bool
+	AddOrUpdateMember(node *entity.Node)
 }
 
 // Server handles incoming RPC requests to the Agent over mesh or local TCP
@@ -105,6 +107,8 @@ func (s *Server) Handler() http.Handler {
 	// Internal node mesh synchronization & member discovery
 	mux.HandleFunc("/api/v1/node/sync", s.handleNodeSync)
 	mux.HandleFunc("/api/v1/node/members", s.handleNodeMembers)
+	mux.HandleFunc("/api/v1/node/remove", s.handleNodeRemove)
+	mux.HandleFunc("/api/v1/node/add", s.handleNodeAdd)
 
 	return mux
 }
@@ -477,3 +481,86 @@ func (s *Server) handleNodeMembers(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(members)
 }
+
+func (s *Server) handleNodeRemove(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	var req struct {
+		Name string `json:"name"`
+		ID   string `json:"id"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "invalid json request", http.StatusBadRequest)
+		return
+	}
+
+	target := req.Name
+	if target == "" {
+		target = req.ID
+	}
+	if target == "" {
+		http.Error(w, "name or id is required", http.StatusBadRequest)
+		return
+	}
+
+	s.mu.RLock()
+	ge := s.gossip
+	s.mu.RUnlock()
+
+	var removed bool
+	if ge != nil {
+		removed = ge.RemoveMember(target)
+	}
+
+	if s.auth != nil {
+		if req.Name != "" {
+			_ = s.auth.RevokeClient(req.Name)
+		}
+		if req.ID != "" {
+			_ = s.auth.RevokeClient(req.ID)
+		}
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(map[string]any{
+		"success": true,
+		"removed": removed,
+		"target":  target,
+	})
+}
+
+func (s *Server) handleNodeAdd(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	var node entity.Node
+	if err := json.NewDecoder(r.Body).Decode(&node); err != nil {
+		http.Error(w, "invalid json request", http.StatusBadRequest)
+		return
+	}
+
+	if node.ID == "" && node.Name == "" {
+		http.Error(w, "node id or name is required", http.StatusBadRequest)
+		return
+	}
+
+	s.mu.RLock()
+	ge := s.gossip
+	s.mu.RUnlock()
+
+	if ge != nil {
+		ge.AddOrUpdateMember(&node)
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(map[string]any{
+		"success": true,
+		"node":    node.Name,
+	})
+}
+

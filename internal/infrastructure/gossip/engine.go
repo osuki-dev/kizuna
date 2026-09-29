@@ -38,6 +38,8 @@ type Engine struct {
 	nameToID      map[string]string          // Maps Node.Name to Node.ID
 	suspectTimers map[string]*time.Timer     // Keyed by Node.ID
 	recentUpdates []*entity.GossipUpdate     // Piggybacked update queue
+	tombstones    map[string]time.Time       // Deleted / kicked node IDs and Names
+	failCount     map[string]int             // Node ID -> consecutive failed probe count
 	transport     Transport
 	repo          domain.NodeRepository
 	interval      time.Duration
@@ -56,13 +58,13 @@ type Engine struct {
 // NewEngine creates and initializes a new Gossip Engine
 func NewEngine(cfg Config) *Engine {
 	if cfg.Interval <= 0 {
-		cfg.Interval = 2 * time.Second
+		cfg.Interval = 3 * time.Second
 	}
 	if cfg.SuspectTimeout <= 0 {
-		cfg.SuspectTimeout = 10 * time.Second
+		cfg.SuspectTimeout = 15 * time.Second
 	}
 	if cfg.SyncInterval <= 0 {
-		cfg.SyncInterval = 15 * time.Second
+		cfg.SyncInterval = 20 * time.Second
 	}
 	if cfg.NodeName == "" {
 		cfg.NodeName, _ = os.Hostname()
@@ -95,6 +97,8 @@ func NewEngine(cfg Config) *Engine {
 		nameToID:      make(map[string]string),
 		suspectTimers: make(map[string]*time.Timer),
 		recentUpdates: make([]*entity.GossipUpdate, 0, 50),
+		tombstones:    make(map[string]time.Time),
+		failCount:     make(map[string]int),
 		transport:     cfg.Transport,
 		repo:          cfg.Repo,
 		interval:      cfg.Interval,
@@ -232,16 +236,124 @@ func (e *Engine) BroadcastUpdate(node *entity.Node) {
 	e.applyUpdateLocked(update)
 }
 
-// GetMembers returns all known members in the cluster
+// GetMembers returns all known active members in the cluster
 func (e *Engine) GetMembers() []*entity.Node {
 	e.mu.RLock()
 	defer e.mu.RUnlock()
 
 	list := make([]*entity.Node, 0, len(e.members))
 	for _, n := range e.members {
+		if _, dead := e.tombstones[n.ID]; dead {
+			continue
+		}
+		if _, dead := e.tombstones[n.Name]; dead {
+			continue
+		}
 		list = append(list, e.cloneNode(n))
 	}
 	return list
+}
+
+// RemoveMember removes a member from the live mesh and registers a tombstone to prevent resurrection
+func (e *Engine) RemoveMember(nameOrID string) bool {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+
+	id, ok := e.nameToID[nameOrID]
+	if !ok {
+		id = nameOrID
+	}
+	node, exists := e.members[id]
+	if !exists {
+		for mid, m := range e.members {
+			if m.Name == nameOrID {
+				id = mid
+				node = m
+				exists = true
+				break
+			}
+		}
+	}
+
+	// Always tombstone by both ID and Name to reject incoming gossip
+	e.tombstones[nameOrID] = time.Now()
+	e.tombstones[id] = time.Now()
+	delete(e.failCount, id)
+	delete(e.failCount, nameOrID)
+
+	if !exists || node == nil {
+		if e.repo != nil {
+			_ = e.repo.DeleteNode(nameOrID)
+		}
+		return false
+	}
+
+	if node.Name != "" {
+		e.tombstones[node.Name] = time.Now()
+	}
+
+	if timer, ok := e.suspectTimers[id]; ok {
+		timer.Stop()
+		delete(e.suspectTimers, id)
+	}
+
+	delete(e.members, id)
+	delete(e.nameToID, node.Name)
+
+	// Broadcast dead update to mesh peers
+	deadUpdate := &entity.GossipUpdate{
+		Node:        e.cloneNode(node),
+		State:       entity.GossipStateDead,
+		Incarnation: node.Incarnation + 1,
+		Timestamp:   time.Now(),
+	}
+	e.queueUpdateLocked(deadUpdate)
+
+	if e.repo != nil {
+		_ = e.repo.DeleteNode(node.Name)
+		_ = e.repo.DeleteNode(node.ID)
+	}
+
+	return true
+}
+
+// AddOrUpdateMember adds or updates a member and clears any tombstone
+func (e *Engine) AddOrUpdateMember(node *entity.Node) {
+	if node == nil || node.ID == "" {
+		return
+	}
+	e.mu.Lock()
+	defer e.mu.Unlock()
+
+	delete(e.tombstones, node.ID)
+	if node.Name != "" {
+		delete(e.tombstones, node.Name)
+	}
+	delete(e.failCount, node.ID)
+
+	nCopy := e.cloneNode(node)
+	if nCopy.GossipState == "" {
+		nCopy.GossipState = entity.GossipStateAlive
+	}
+	nCopy.LastSeen = time.Now()
+	e.members[nCopy.ID] = nCopy
+	if nCopy.Name != "" {
+		e.nameToID[nCopy.Name] = nCopy.ID
+	}
+
+	if e.repo != nil {
+		_ = e.repo.SaveNode(e.cloneNode(nCopy))
+	}
+}
+
+// ClearTombstone removes a node from the tombstones map
+func (e *Engine) ClearTombstone(nameOrID string) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	delete(e.tombstones, nameOrID)
+	if id, ok := e.nameToID[nameOrID]; ok {
+		delete(e.tombstones, id)
+	}
 }
 
 // GetMember retrieves a single member by ID or Name
@@ -249,10 +361,17 @@ func (e *Engine) GetMember(nameOrID string) (*entity.Node, bool) {
 	e.mu.RLock()
 	defer e.mu.RUnlock()
 
+	if _, dead := e.tombstones[nameOrID]; dead {
+		return nil, false
+	}
+
 	if n, ok := e.members[nameOrID]; ok {
 		return e.cloneNode(n), true
 	}
 	if id, ok := e.nameToID[nameOrID]; ok {
+		if _, dead := e.tombstones[id]; dead {
+			return nil, false
+		}
 		if n, ok := e.members[id]; ok {
 			return e.cloneNode(n), true
 		}
@@ -522,9 +641,19 @@ func (e *Engine) handleUpdate(msg *entity.GossipMessage) (*entity.GossipMessage,
 }
 
 func (e *Engine) registerOrTouchSenderLocked(msg *entity.GossipMessage) {
-	if msg.SenderID == "" || msg.SenderID == e.self.ID {
+	if msg == nil || msg.SenderID == "" || msg.SenderID == e.self.ID {
 		return
 	}
+
+	if _, dead := e.tombstones[msg.SenderID]; dead {
+		return
+	}
+	if msg.SenderName != "" {
+		if _, dead := e.tombstones[msg.SenderName]; dead {
+			return
+		}
+	}
+	delete(e.failCount, msg.SenderID)
 
 	sender, exists := e.members[msg.SenderID]
 	if !exists {
@@ -563,6 +692,15 @@ func (e *Engine) registerOrTouchSenderLocked(msg *entity.GossipMessage) {
 func (e *Engine) applyUpdateLocked(u *entity.GossipUpdate) {
 	if u == nil || u.Node == nil || u.Node.ID == "" {
 		return
+	}
+
+	if _, dead := e.tombstones[u.Node.ID]; dead {
+		return
+	}
+	if u.Node.Name != "" {
+		if _, dead := e.tombstones[u.Node.Name]; dead {
+			return
+		}
 	}
 
 	// 1. If update is about self
@@ -783,7 +921,7 @@ func (e *Engine) performGossipRound() {
 	e.mu.Unlock()
 
 	start := time.Now()
-	ctx, cancel := context.WithTimeout(e.ctx, 3500*time.Millisecond)
+	ctx, cancel := context.WithTimeout(e.ctx, 5000*time.Millisecond)
 	reply, err := e.transport.SendMessage(ctx, peer.Addr, 19800, pingMsg)
 	cancel()
 
@@ -792,6 +930,7 @@ func (e *Engine) performGossipRound() {
 	if err == nil && reply != nil && reply.Type == entity.GossipMsgAck {
 		// Ping succeeded
 		e.mu.Lock()
+		delete(e.failCount, peer.ID)
 		if n, ok := e.members[peer.ID]; ok {
 			n.IsOnline = true
 			n.GossipState = entity.GossipStateAlive
@@ -812,7 +951,7 @@ func (e *Engine) performGossipRound() {
 	// Direct ping failed -> Try indirect ping via another peer
 	indirectHelper := e.selectRandomPeerExcluding(peer.ID)
 	if indirectHelper != nil {
-		indCtx, indCancel := context.WithTimeout(e.ctx, 4000*time.Millisecond)
+		indCtx, indCancel := context.WithTimeout(e.ctx, 5000*time.Millisecond)
 		indMsg := &entity.GossipMessage{
 			Type:        entity.GossipMsgIndirectPing,
 			SenderID:    e.self.ID,
@@ -829,6 +968,7 @@ func (e *Engine) performGossipRound() {
 				if u.Node != nil && u.Node.ID == peer.ID && u.State == entity.GossipStateAlive {
 					// Indirect ping succeeded! Peer is alive through helper
 					e.mu.Lock()
+					delete(e.failCount, peer.ID)
 					if n, ok := e.members[peer.ID]; ok {
 						n.IsOnline = true
 						n.GossipState = entity.GossipStateAlive
@@ -841,20 +981,25 @@ func (e *Engine) performGossipRound() {
 		}
 	}
 
-	// Both direct and indirect ping failed -> Node enters Suspect state
+	// Both direct and indirect ping failed: track consecutive failure count
 	e.mu.Lock()
-	if n, ok := e.members[peer.ID]; ok && n.GossipState == entity.GossipStateAlive {
-		n.GossipState = entity.GossipStateSuspect
-		n.IsOnline = false
-		e.startSuspectTimerLocked(peer.ID)
+	e.failCount[peer.ID]++
+	// Require at least 2 consecutive failed rounds before marking Suspect
+	// to prevent transient WAN / DERP relay latency spikes from causing state flapping
+	if e.failCount[peer.ID] >= 2 {
+		if n, ok := e.members[peer.ID]; ok && n.GossipState == entity.GossipStateAlive {
+			n.GossipState = entity.GossipStateSuspect
+			n.IsOnline = false
+			e.startSuspectTimerLocked(peer.ID)
 
-		suspectUpdate := &entity.GossipUpdate{
-			Node:        e.cloneNode(n),
-			State:       entity.GossipStateSuspect,
-			Incarnation: n.Incarnation,
-			Timestamp:   time.Now(),
+			suspectUpdate := &entity.GossipUpdate{
+				Node:        e.cloneNode(n),
+				State:       entity.GossipStateSuspect,
+				Incarnation: n.Incarnation,
+				Timestamp:   time.Now(),
+			}
+			e.queueUpdateLocked(suspectUpdate)
 		}
-		e.queueUpdateLocked(suspectUpdate)
 	}
 	e.mu.Unlock()
 }
@@ -884,8 +1029,43 @@ func (e *Engine) reloadFromRepo() {
 	}
 	e.mu.Lock()
 	defer e.mu.Unlock()
+
+	validRepo := make(map[string]bool)
+	for _, n := range nodes {
+		if n != nil {
+			validRepo[n.ID] = true
+			if n.Name != "" {
+				validRepo[n.Name] = true
+			}
+		}
+	}
+
+	// Purge any members from memory that were deleted from disk repository
+	for id, m := range e.members {
+		if id == e.self.ID || (m != nil && m.Name == e.self.Name) {
+			continue
+		}
+		if !validRepo[id] && (m == nil || !validRepo[m.Name]) {
+			delete(e.members, id)
+			if m != nil {
+				delete(e.nameToID, m.Name)
+			}
+			delete(e.failCount, id)
+			if t, ok := e.suspectTimers[id]; ok {
+				t.Stop()
+				delete(e.suspectTimers, id)
+			}
+		}
+	}
+
 	for _, n := range nodes {
 		if n == nil || n.ID == e.self.ID || n.Name == e.self.Name {
+			continue
+		}
+		if _, dead := e.tombstones[n.ID]; dead {
+			continue
+		}
+		if _, dead := e.tombstones[n.Name]; dead {
 			continue
 		}
 		if existing, ok := e.members[n.ID]; ok {
@@ -993,6 +1173,12 @@ func (e *Engine) selectRandomPeer() *entity.Node {
 	var candidates []*entity.Node
 	for _, m := range e.members {
 		if m.ID != e.self.ID && m.Addr != "" && m.GossipState != entity.GossipStateDead {
+			if _, dead := e.tombstones[m.ID]; dead {
+				continue
+			}
+			if _, dead := e.tombstones[m.Name]; dead {
+				continue
+			}
 			candidates = append(candidates, m)
 		}
 	}
@@ -1011,6 +1197,12 @@ func (e *Engine) selectRandomPeerExcluding(excludeID string) *entity.Node {
 	var candidates []*entity.Node
 	for _, m := range e.members {
 		if m.ID != e.self.ID && m.ID != excludeID && m.Addr != "" && m.GossipState == entity.GossipStateAlive {
+			if _, dead := e.tombstones[m.ID]; dead {
+				continue
+			}
+			if _, dead := e.tombstones[m.Name]; dead {
+				continue
+			}
 			candidates = append(candidates, m)
 		}
 	}
