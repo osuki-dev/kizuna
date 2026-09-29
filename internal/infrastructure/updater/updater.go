@@ -50,9 +50,41 @@ type UpdateCache struct {
 	DownloadURL   string    `json:"download_url"`
 }
 
+// UpgradeStep represents a stage in the upgrade pipeline
+type UpgradeStep string
+
+const (
+	StepChecking    UpgradeStep = "checking"
+	StepUpToDate    UpgradeStep = "up_to_date"
+	StepFound       UpgradeStep = "found"
+	StepDownloading UpgradeStep = "downloading"
+	StepVerifying   UpgradeStep = "verifying"
+	StepExtracting  UpgradeStep = "extracting"
+	StepApplying    UpgradeStep = "applying"
+	StepComplete    UpgradeStep = "complete"
+	StepFailed      UpgradeStep = "failed"
+)
+
+// UpgradeEvent conveys progress and state during self-update
+type UpgradeEvent struct {
+	Step        UpgradeStep
+	Message     string
+	CurrentVer  string
+	LatestVer   string
+	Release     *Release
+	Asset       *ReleaseAsset
+	Downloaded  int64
+	TotalSize   int64
+	Speed       float64 // bytes/sec
+	Percent     float64
+	TargetExec  string
+	Err         error
+}
+
 // Manager manages CLI self-updating
 type Manager struct {
 	repo       string
+	apiBaseURL string
 	httpClient *http.Client
 	cacheDir   string
 }
@@ -69,7 +101,8 @@ func NewManager(repo, cacheDir string) *Manager {
 	_ = os.MkdirAll(cacheDir, 0755)
 
 	return &Manager{
-		repo: repo,
+		repo:       repo,
+		apiBaseURL: "https://api.github.com",
 		httpClient: &http.Client{
 			Timeout: 30 * time.Second,
 		},
@@ -79,7 +112,11 @@ func NewManager(repo, cacheDir string) *Manager {
 
 // FetchLatestRelease queries GitHub API for the latest release
 func (m *Manager) FetchLatestRelease(ctx context.Context) (*Release, error) {
-	apiURL := fmt.Sprintf("https://api.github.com/repos/%s/releases/latest", m.repo)
+	baseURL := m.apiBaseURL
+	if baseURL == "" {
+		baseURL = "https://api.github.com"
+	}
+	apiURL := fmt.Sprintf("%s/repos/%s/releases/latest", baseURL, m.repo)
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, apiURL, nil)
 	if err != nil {
 		return nil, err
@@ -129,21 +166,71 @@ func IsNewerVersion(currentVersion, remoteVersion string) bool {
 	return cleanCur != cleanRem
 }
 
-// Upgrade performs self-update to the latest version
-func (m *Manager) Upgrade(ctx context.Context, currentVersion string, out io.Writer) error {
-	_, _ = fmt.Fprintln(out, "🔍 Checking for latest release...")
+type progressReader struct {
+	reader     io.Reader
+	total      int64
+	current    int64
+	lastTime   time.Time
+	lastBytes  int64
+	onProgress func(current, total int64, speed float64)
+}
+
+func (pr *progressReader) Read(p []byte) (int, error) {
+	n, err := pr.reader.Read(p)
+	if n > 0 {
+		pr.current += int64(n)
+		now := time.Now()
+		elapsed := now.Sub(pr.lastTime).Seconds()
+		if elapsed >= 0.05 || pr.current >= pr.total || err != nil {
+			var speed float64
+			if elapsed > 0 {
+				speed = float64(pr.current-pr.lastBytes) / elapsed
+			}
+			pr.lastTime = now
+			pr.lastBytes = pr.current
+			if pr.onProgress != nil {
+				pr.onProgress(pr.current, pr.total, speed)
+			}
+		}
+	}
+	return n, err
+}
+
+// UpgradeWithProgress performs self-update with detailed progress events
+func (m *Manager) UpgradeWithProgress(ctx context.Context, currentVersion string, onEvent func(UpgradeEvent)) error {
+	emit := func(ev UpgradeEvent) {
+		if onEvent != nil {
+			onEvent(ev)
+		}
+	}
+
+	emit(UpgradeEvent{
+		Step:       StepChecking,
+		Message:    "Checking for latest release...",
+		CurrentVer: currentVersion,
+	})
 
 	rel, err := m.FetchLatestRelease(ctx)
 	if err != nil {
+		emit(UpgradeEvent{
+			Step:       StepFailed,
+			Message:    err.Error(),
+			CurrentVer: currentVersion,
+			Err:        err,
+		})
 		return err
 	}
 
 	if !IsNewerVersion(currentVersion, rel.TagName) && currentVersion != "dev" {
-		_, _ = fmt.Fprintf(out, "✓ kizuna is already up to date (%s)\n", currentVersion)
+		emit(UpgradeEvent{
+			Step:       StepUpToDate,
+			Message:    fmt.Sprintf("kizuna is already up to date (%s)", currentVersion),
+			CurrentVer: currentVersion,
+			LatestVer:  rel.TagName,
+			Release:    rel,
+		})
 		return nil
 	}
-
-	_, _ = fmt.Fprintf(out, "Found new version: %s (current: %s)\n", rel.TagName, currentVersion)
 
 	// 1. Locate asset matching current OS and Architecture and locate checksums.txt
 	var targetAsset *ReleaseAsset
@@ -162,32 +249,102 @@ func (m *Manager) Upgrade(ctx context.Context, currentVersion string, out io.Wri
 	}
 
 	if targetAsset == nil {
-		return fmt.Errorf("no binary release found for %s/%s in release %s", runtime.GOOS, runtime.GOARCH, rel.TagName)
+		err := fmt.Errorf("no binary release found for %s/%s in release %s", runtime.GOOS, runtime.GOARCH, rel.TagName)
+		emit(UpgradeEvent{
+			Step:       StepFailed,
+			Message:    err.Error(),
+			CurrentVer: currentVersion,
+			LatestVer:  rel.TagName,
+			Release:    rel,
+			Err:        err,
+		})
+		return err
 	}
 
-	_, _ = fmt.Fprintf(out, "⬇️  Downloading %s (%.1f MB)...\n", targetAsset.Name, float64(targetAsset.Size)/(1024*1024))
+	emit(UpgradeEvent{
+		Step:       StepFound,
+		Message:    fmt.Sprintf("Found update %s (current: %s)", rel.TagName, currentVersion),
+		CurrentVer: currentVersion,
+		LatestVer:  rel.TagName,
+		Release:    rel,
+		Asset:      targetAsset,
+		TotalSize:  targetAsset.Size,
+	})
 
-	// 2. Download archive
+	// 2. Download archive with live streaming progress
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, targetAsset.BrowserDownloadURL, nil)
 	if err != nil {
+		emit(UpgradeEvent{
+			Step:    StepFailed,
+			Message: err.Error(),
+			Err:     err,
+		})
 		return err
 	}
 	req.Header.Set("User-Agent", "kizuna-cli-updater")
 
 	resp, err := m.httpClient.Do(req)
 	if err != nil {
-		return fmt.Errorf("download failed: %w", err)
+		err = fmt.Errorf("download failed: %w", err)
+		emit(UpgradeEvent{
+			Step:    StepFailed,
+			Message: err.Error(),
+			Err:     err,
+		})
+		return err
 	}
 	defer func() { _ = resp.Body.Close() }()
 
-	archiveBytes, err := io.ReadAll(resp.Body)
+	contentLength := resp.ContentLength
+	if contentLength <= 0 {
+		contentLength = targetAsset.Size
+	}
+
+	pr := &progressReader{
+		reader:   resp.Body,
+		total:    contentLength,
+		lastTime: time.Now(),
+		onProgress: func(current, total int64, speed float64) {
+			var pct float64
+			if total > 0 {
+				pct = float64(current) / float64(total) * 100
+			}
+			emit(UpgradeEvent{
+				Step:       StepDownloading,
+				Message:    fmt.Sprintf("Downloading %s...", targetAsset.Name),
+				CurrentVer: currentVersion,
+				LatestVer:  rel.TagName,
+				Release:    rel,
+				Asset:      targetAsset,
+				Downloaded: current,
+				TotalSize:  total,
+				Speed:      speed,
+				Percent:    pct,
+			})
+		},
+	}
+
+	archiveBytes, err := io.ReadAll(pr)
 	if err != nil {
-		return fmt.Errorf("failed to read download: %w", err)
+		err = fmt.Errorf("failed to read download: %w", err)
+		emit(UpgradeEvent{
+			Step:    StepFailed,
+			Message: err.Error(),
+			Err:     err,
+		})
+		return err
 	}
 
 	// 3. Cryptographic hash verification if checksums file exists
 	if checksumAsset != nil {
-		_, _ = fmt.Fprintln(out, "🔐 Verifying SHA256 checksum against "+checksumAsset.Name+"...")
+		emit(UpgradeEvent{
+			Step:       StepVerifying,
+			Message:    "Verifying cryptographic SHA256 checksum...",
+			CurrentVer: currentVersion,
+			LatestVer:  rel.TagName,
+			Release:    rel,
+			Asset:      targetAsset,
+		})
 		reqCheck, err := http.NewRequestWithContext(ctx, http.MethodGet, checksumAsset.BrowserDownloadURL, nil)
 		if err == nil {
 			reqCheck.Header.Set("User-Agent", "kizuna-cli-updater")
@@ -195,15 +352,29 @@ func (m *Manager) Upgrade(ctx context.Context, currentVersion string, out io.Wri
 				defer func() { _ = respCheck.Body.Close() }()
 				if checkBytes, err := io.ReadAll(respCheck.Body); err == nil {
 					if err := VerifyChecksum(archiveBytes, targetAsset.Name, string(checkBytes)); err != nil {
-						return fmt.Errorf("hash verification failed: %w", err)
+						err = fmt.Errorf("hash verification failed: %w", err)
+						emit(UpgradeEvent{
+							Step:    StepFailed,
+							Message: err.Error(),
+							Err:     err,
+						})
+						return err
 					}
-					_, _ = fmt.Fprintln(out, "✓ SHA256 checksum verified successfully")
 				}
 			}
 		}
 	}
 
 	// 4. Extract executable binary
+	emit(UpgradeEvent{
+		Step:       StepExtracting,
+		Message:    "Extracting binary archive...",
+		CurrentVer: currentVersion,
+		LatestVer:  rel.TagName,
+		Release:    rel,
+		Asset:      targetAsset,
+	})
+
 	binaryName := "kizuna"
 	if runtime.GOOS == "windows" {
 		binaryName = "kizuna.exe"
@@ -211,25 +382,95 @@ func (m *Manager) Upgrade(ctx context.Context, currentVersion string, out io.Wri
 
 	binaryData, err := extractBinary(archiveBytes, targetAsset.Name, binaryName)
 	if err != nil {
-		return fmt.Errorf("failed to extract %s from archive: %w", binaryName, err)
+		err = fmt.Errorf("failed to extract %s from archive: %w", binaryName, err)
+		emit(UpgradeEvent{
+			Step:    StepFailed,
+			Message: err.Error(),
+			Err:     err,
+		})
+		return err
 	}
 
-	// 4. Atomically replace currently running executable
+	// 5. Atomically replace currently running executable
+	emit(UpgradeEvent{
+		Step:       StepApplying,
+		Message:    "Atomically replacing executable...",
+		CurrentVer: currentVersion,
+		LatestVer:  rel.TagName,
+		Release:    rel,
+		Asset:      targetAsset,
+	})
+
 	execPath, err := os.Executable()
 	if err != nil {
-		return fmt.Errorf("unable to determine current executable path: %w", err)
+		err = fmt.Errorf("unable to determine current executable path: %w", err)
+		emit(UpgradeEvent{
+			Step:    StepFailed,
+			Message: err.Error(),
+			Err:     err,
+		})
+		return err
 	}
 	execPath, err = filepath.EvalSymlinks(execPath)
 	if err != nil {
-		return fmt.Errorf("unable to resolve symlinks for %s: %w", execPath, err)
+		err = fmt.Errorf("unable to resolve symlinks for %s: %w", execPath, err)
+		emit(UpgradeEvent{
+			Step:    StepFailed,
+			Message: err.Error(),
+			Err:     err,
+		})
+		return err
 	}
 
 	if err := applyBinaryUpdate(execPath, binaryData); err != nil {
-		return fmt.Errorf("failed to replace executable: %w", err)
+		err = fmt.Errorf("failed to replace executable: %w", err)
+		emit(UpgradeEvent{
+			Step:    StepFailed,
+			Message: err.Error(),
+			Err:     err,
+		})
+		return err
 	}
 
-	_, _ = fmt.Fprintf(out, "✓ Successfully upgraded kizuna to %s!\n", rel.TagName)
+	emit(UpgradeEvent{
+		Step:       StepComplete,
+		Message:    fmt.Sprintf("Successfully upgraded to %s!", rel.TagName),
+		CurrentVer: currentVersion,
+		LatestVer:  rel.TagName,
+		Release:    rel,
+		Asset:      targetAsset,
+		TargetExec: execPath,
+	})
 	return nil
+}
+
+// Upgrade performs self-update printing clean text lines to out
+func (m *Manager) Upgrade(ctx context.Context, currentVersion string, out io.Writer) error {
+	return m.UpgradeWithProgress(ctx, currentVersion, func(ev UpgradeEvent) {
+		switch ev.Step {
+		case StepChecking:
+			_, _ = fmt.Fprintln(out, "🔍 Checking for latest release...")
+		case StepUpToDate:
+			_, _ = fmt.Fprintf(out, "✓ kizuna is already up to date (%s)\n", ev.CurrentVer)
+		case StepFound:
+			_, _ = fmt.Fprintf(out, "Found new version: %s (current: %s)\n", ev.LatestVer, ev.CurrentVer)
+			if ev.Asset != nil {
+				_, _ = fmt.Fprintf(out, "⬇️  Downloading %s (%.1f MB)...\n", ev.Asset.Name, float64(ev.Asset.Size)/(1024*1024))
+			}
+		case StepVerifying:
+			_, _ = fmt.Fprintln(out, "🔐 Verifying SHA256 checksum...")
+		case StepExtracting:
+			_, _ = fmt.Fprintln(out, "⚡ Extracting binary archive...")
+		case StepApplying:
+			_, _ = fmt.Fprintln(out, "🔄 Applying binary update...")
+		case StepComplete:
+			_, _ = fmt.Fprintf(out, "✓ Successfully upgraded kizuna to %s!\n", ev.LatestVer)
+		case StepFailed:
+			if ev.Err != nil {
+				_, _ = fmt.Fprintf(out, "✖ Upgrade failed: %v\n", ev.Err)
+			}
+		}
+	})
 }
 
 func extractBinary(archiveData []byte, archiveName, binaryName string) ([]byte, error) {

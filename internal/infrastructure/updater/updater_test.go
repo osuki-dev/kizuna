@@ -6,11 +6,13 @@ import (
 	"compress/gzip"
 	"context"
 	"encoding/json"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 )
 
 func TestIsNewerVersion(t *testing.T) {
@@ -86,27 +88,19 @@ func TestFetchLatestRelease(t *testing.T) {
 
 	mgr := &Manager{
 		repo:       "osuki-dev/kizuna",
+		apiBaseURL: server.URL,
 		httpClient: server.Client(),
 		cacheDir:   t.TempDir(),
 	}
 
-	// Override URL via custom client transport
-	req, _ := http.NewRequestWithContext(context.Background(), http.MethodGet, server.URL, nil)
-	resp, err := server.Client().Do(req)
+	rel, err := mgr.FetchLatestRelease(context.Background())
 	if err != nil {
-		t.Fatalf("mock request failed: %v", err)
-	}
-	defer func() { _ = resp.Body.Close() }()
-
-	var rel Release
-	if err := json.NewDecoder(resp.Body).Decode(&rel); err != nil {
-		t.Fatalf("decode failed: %v", err)
+		t.Fatalf("FetchLatestRelease failed: %v", err)
 	}
 
 	if rel.TagName != "v0.2.0" {
 		t.Errorf("rel.TagName = %q; expected 'v0.2.0'", rel.TagName)
 	}
-	_ = mgr
 }
 
 func TestApplyBinaryUpdate(t *testing.T) {
@@ -158,5 +152,67 @@ func TestVerifyChecksum(t *testing.T) {
 	err = VerifyChecksum(data, "kizuna_unknown_platform.tar.gz", checksums)
 	if err == nil {
 		t.Errorf("expected error for missing asset in checksums, got nil")
+	}
+}
+
+func TestProgressReader(t *testing.T) {
+	data := []byte("hello world progress test data 1234567890")
+	buf := bytes.NewReader(data)
+	var progressCalled bool
+	pr := &progressReader{
+		reader:   buf,
+		total:    int64(len(data)),
+		lastTime: time.Now(),
+		onProgress: func(current, total int64, speed float64) {
+			progressCalled = true
+		},
+	}
+	out, err := io.ReadAll(pr)
+	if err != nil {
+		t.Fatalf("unexpected read error: %v", err)
+	}
+	if string(out) != string(data) {
+		t.Errorf("read content = %q; expected %q", string(out), string(data))
+	}
+	if !progressCalled {
+		t.Errorf("expected onProgress callback to be called")
+	}
+}
+
+func TestUpgradeWithProgress_UpToDate(t *testing.T) {
+	mockRelease := Release{
+		TagName: "v0.2.0",
+		Name:    "Kizuna v0.2.0",
+	}
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(mockRelease)
+	}))
+	defer server.Close()
+
+	mgr := &Manager{
+		repo:       "osuki-dev/kizuna",
+		apiBaseURL: server.URL,
+		httpClient: server.Client(),
+		cacheDir:   t.TempDir(),
+	}
+
+	var events []UpgradeStep
+	err := mgr.UpgradeWithProgress(context.Background(), "v0.2.0", func(ev UpgradeEvent) {
+		events = append(events, ev.Step)
+	})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	if len(events) < 2 {
+		t.Fatalf("expected at least 2 events, got %d", len(events))
+	}
+	if events[0] != StepChecking {
+		t.Errorf("first event should be StepChecking, got %v", events[0])
+	}
+	if events[1] != StepUpToDate {
+		t.Errorf("second event should be StepUpToDate, got %v", events[1])
 	}
 }

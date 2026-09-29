@@ -22,6 +22,7 @@ import (
 
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
+	"github.com/mattn/go-isatty"
 	"github.com/osuki-dev/kizuna/internal/adapter/api"
 	"github.com/osuki-dev/kizuna/internal/adapter/client"
 	"github.com/osuki-dev/kizuna/internal/adapter/config"
@@ -2212,6 +2213,45 @@ func newUpgradeCmd() *cobra.Command {
 		Short: "Upgrade kizuna to the latest release from GitHub",
 		RunE: func(cmd *cobra.Command, args []string) error {
 			mgr := updater.NewManager("", "")
+
+			if flagJSON {
+				var finalEv updater.UpgradeEvent
+				err := mgr.UpgradeWithProgress(cmd.Context(), version, func(ev updater.UpgradeEvent) {
+					if ev.Step == updater.StepComplete || ev.Step == updater.StepUpToDate || ev.Step == updater.StepFailed {
+						finalEv = ev
+					}
+				})
+				if err != nil {
+					return presenter.PrintJSON(os.Stdout, map[string]any{
+						"success": false,
+						"error":   err.Error(),
+					})
+				}
+				return presenter.PrintJSON(os.Stdout, map[string]any{
+					"success": true,
+					"status":  finalEv.Step,
+					"from":    version,
+					"to":      finalEv.LatestVer,
+					"message": finalEv.Message,
+				})
+			}
+
+			// Interactive terminal: launch animated Charm Bubble Tea TUI
+			if isatty.IsTerminal(os.Stdout.Fd()) || isatty.IsCygwinTerminal(os.Stdout.Fd()) {
+				themeName := ""
+				cfgPath := flagConfig
+				if cfgPath == "" {
+					cfgPath, _ = config.FindConfigFile()
+				}
+				if cfgPath != "" {
+					if proj, err := config.LoadProjectWithEnv(cfgPath, flagEnv); err == nil && proj.Theme != "" {
+						themeName = proj.Theme
+					}
+				}
+				return presenter.RunUpgradeTUI(cmd.Context(), mgr, version, themeName)
+			}
+
+			// Non-interactive fallback: clean text log
 			return mgr.Upgrade(cmd.Context(), version, os.Stdout)
 		},
 	}
