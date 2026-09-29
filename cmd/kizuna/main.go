@@ -735,7 +735,7 @@ func newNodeCmd() *cobra.Command {
 			defer func() { _ = meshGw.Close() }()
 			cli := client.NewMeshClient(meshGw)
 
-			ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+			ctx, cancel := context.WithTimeout(context.Background(), 6*time.Second)
 			defer cancel()
 
 			syncErr := cli.UpdateNodeMeta(ctx, node, entity.NodeMetaUpdate{
@@ -808,7 +808,7 @@ func newNodeCmd() *cobra.Command {
 			defer func() { _ = meshGw.Close() }()
 			cli := client.NewMeshClient(meshGw)
 
-			ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+			ctx, cancel := context.WithTimeout(context.Background(), 6*time.Second)
 			defer cancel()
 
 			syncErr := cli.UpdateNodeMeta(ctx, node, entity.NodeMetaUpdate{
@@ -874,7 +874,7 @@ func newNodeCmd() *cobra.Command {
 			defer func() { _ = meshGw.Close() }()
 			cli := client.NewMeshClient(meshGw)
 
-			ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+			ctx, cancel := context.WithTimeout(context.Background(), 6*time.Second)
 			defer cancel()
 			_ = cli.RevokeClient(ctx, node, node.Name)
 
@@ -1088,12 +1088,15 @@ func listNodes() error {
 			wg.Add(1)
 			go func(idx int, target *entity.Node) {
 				defer wg.Done()
-				ctx, cancel := context.WithTimeout(context.Background(), 1200*time.Millisecond)
+				ctx, cancel := context.WithTimeout(context.Background(), 6*time.Second)
 				defer cancel()
 
 				nCopy := *target
 				upNode, _, err := cli.GetStatus(ctx, target)
 				if err != nil {
+					if os.Getenv("KIZUNA_DEBUG") != "" {
+						fmt.Fprintf(os.Stderr, "DEBUG GetStatus error: %v\n", err)
+					}
 					nCopy.IsOnline = false
 					nCopy.Status = "dead"
 					nCopy.GossipState = entity.GossipStateDead
