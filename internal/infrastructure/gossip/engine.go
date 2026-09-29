@@ -1,0 +1,1001 @@
+package gossip
+
+import (
+	"context"
+	"fmt"
+	"math/rand"
+	"os"
+	"runtime"
+	"sync"
+	"time"
+
+	"github.com/osuki-dev/kizuna/internal/domain"
+	"github.com/osuki-dev/kizuna/internal/domain/entity"
+	"github.com/osuki-dev/kizuna/internal/infrastructure/telemetry"
+)
+
+// Config holds initialization options for the Gossip Engine
+type Config struct {
+	NodeID         string
+	NodeName       string
+	MeshAddr       string
+	Host           string
+	IP             string
+	Tags           []string
+	Interval       time.Duration // Periodic gossip ping interval (default: 2s)
+	SuspectTimeout time.Duration // Time in suspect state before marking dead (default: 5s)
+	SyncInterval   time.Duration // Anti-entropy full state sync interval (default: 20s)
+	Transport      Transport
+	Repo           domain.NodeRepository
+	Seeds          []*entity.Node
+}
+
+// Engine implements a decentralized, SWIM-based Gossip membership and state synchronization engine
+type Engine struct {
+	mu            sync.RWMutex
+	self          *entity.Node
+	members       map[string]*entity.Node    // Keyed by Node.ID
+	nameToID      map[string]string          // Maps Node.Name to Node.ID
+	suspectTimers map[string]*time.Timer     // Keyed by Node.ID
+	recentUpdates []*entity.GossipUpdate     // Piggybacked update queue
+	transport     Transport
+	repo          domain.NodeRepository
+	interval      time.Duration
+	suspectPeriod time.Duration
+	syncInterval  time.Duration
+	ctx           context.Context
+	cancel        context.CancelFunc
+	running       bool
+	stats         struct {
+		Sent   uint64
+		Recv   uint64
+		Rounds uint64
+	}
+}
+
+// NewEngine creates and initializes a new Gossip Engine
+func NewEngine(cfg Config) *Engine {
+	if cfg.Interval <= 0 {
+		cfg.Interval = 2 * time.Second
+	}
+	if cfg.SuspectTimeout <= 0 {
+		cfg.SuspectTimeout = 5 * time.Second
+	}
+	if cfg.SyncInterval <= 0 {
+		cfg.SyncInterval = 20 * time.Second
+	}
+	if cfg.NodeName == "" {
+		cfg.NodeName, _ = os.Hostname()
+		if cfg.NodeName == "" {
+			cfg.NodeName = "kizuna-node"
+		}
+	}
+	if cfg.NodeID == "" {
+		cfg.NodeID = "node_" + cfg.NodeName
+	}
+
+	self := &entity.Node{
+		ID:          cfg.NodeID,
+		Name:        cfg.NodeName,
+		Addr:        cfg.MeshAddr,
+		Host:        cfg.Host,
+		IP:          cfg.IP,
+		Tags:        cfg.Tags,
+		OS:          runtime.GOOS,
+		Arch:        runtime.GOARCH,
+		IsOnline:    true,
+		GossipState: entity.GossipStateAlive,
+		Incarnation: 1,
+		LastSeen:    time.Now(),
+	}
+
+	e := &Engine{
+		self:          self,
+		members:       make(map[string]*entity.Node),
+		nameToID:      make(map[string]string),
+		suspectTimers: make(map[string]*time.Timer),
+		recentUpdates: make([]*entity.GossipUpdate, 0, 50),
+		transport:     cfg.Transport,
+		repo:          cfg.Repo,
+		interval:      cfg.Interval,
+		suspectPeriod: cfg.SuspectTimeout,
+		syncInterval:  cfg.SyncInterval,
+	}
+
+	// Register self
+	e.members[self.ID] = self
+	e.nameToID[self.Name] = self.ID
+
+	// Load seeds from config or repository
+	for _, seed := range cfg.Seeds {
+		if seed != nil && seed.ID != self.ID && seed.Name != self.Name {
+			sCopy := *seed
+			if sCopy.GossipState == "" {
+				sCopy.GossipState = entity.GossipStateAlive
+			}
+			e.members[sCopy.ID] = &sCopy
+			e.nameToID[sCopy.Name] = sCopy.ID
+		}
+	}
+
+	if cfg.Repo != nil {
+		if nodes, err := cfg.Repo.ListNodes(); err == nil {
+			for _, n := range nodes {
+				if n != nil && n.ID != self.ID && n.Name != self.Name {
+					nCopy := *n
+					if nCopy.GossipState == "" {
+						nCopy.GossipState = entity.GossipStateAlive
+					}
+					e.members[nCopy.ID] = &nCopy
+					e.nameToID[nCopy.Name] = nCopy.ID
+				}
+			}
+		}
+	}
+
+	return e
+}
+
+// Start launches background gossip workers
+func (e *Engine) Start(ctx context.Context) error {
+	e.mu.Lock()
+	if e.running {
+		e.mu.Unlock()
+		return nil
+	}
+	e.ctx, e.cancel = context.WithCancel(ctx)
+	e.running = true
+	e.mu.Unlock()
+
+	// Initial metrics refresh
+	e.refreshTelemetry()
+
+	// Worker 1: Periodic Gossip Round (Ping / Failure Detection)
+	go e.runGossipLoop()
+
+	// Worker 2: Anti-Entropy Full State Sync
+	go e.runAntiEntropyLoop()
+
+	// Worker 3: Periodic Telemetry Metrics Update
+	go e.runTelemetryLoop()
+
+	return nil
+}
+
+// Stop gracefully shuts down the Gossip Engine
+func (e *Engine) Stop() error {
+	e.mu.Lock()
+	if !e.running {
+		e.mu.Unlock()
+		return nil
+	}
+	e.running = false
+	if e.cancel != nil {
+		e.cancel()
+	}
+
+	for _, timer := range e.suspectTimers {
+		timer.Stop()
+	}
+	e.suspectTimers = make(map[string]*time.Timer)
+	e.self.GossipState = entity.GossipStateLeft
+	e.self.IsOnline = false
+	e.mu.Unlock()
+
+	return nil
+}
+
+// UpdateLocalMeta updates self tags, host, IP, increments incarnation and queues broadcast
+func (e *Engine) UpdateLocalMeta(meta *entity.NodeMetaUpdate) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+
+	if meta == nil {
+		return
+	}
+
+	e.self.Incarnation++
+	e.self.LastSeen = time.Now()
+	if len(meta.Tags) > 0 {
+		e.self.Tags = meta.Tags
+	}
+	if meta.Host != "" {
+		e.self.Host = meta.Host
+	}
+	if meta.IP != "" {
+		e.self.IP = meta.IP
+	}
+
+	update := &entity.GossipUpdate{
+		Node:        e.cloneNode(e.self),
+		State:       entity.GossipStateAlive,
+		Incarnation: e.self.Incarnation,
+		Timestamp:   time.Now(),
+	}
+	e.queueUpdateLocked(update)
+}
+
+// BroadcastUpdate queues an update for dissemination and applies locally
+func (e *Engine) BroadcastUpdate(node *entity.Node) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+
+	if node == nil {
+		return
+	}
+	update := &entity.GossipUpdate{
+		Node:        e.cloneNode(node),
+		State:       node.GossipState,
+		Incarnation: node.Incarnation,
+		Timestamp:   time.Now(),
+	}
+	e.applyUpdateLocked(update)
+}
+
+// GetMembers returns all known members in the cluster
+func (e *Engine) GetMembers() []*entity.Node {
+	e.mu.RLock()
+	defer e.mu.RUnlock()
+
+	list := make([]*entity.Node, 0, len(e.members))
+	for _, n := range e.members {
+		list = append(list, e.cloneNode(n))
+	}
+	return list
+}
+
+// GetMember retrieves a single member by ID or Name
+func (e *Engine) GetMember(nameOrID string) (*entity.Node, bool) {
+	e.mu.RLock()
+	defer e.mu.RUnlock()
+
+	if n, ok := e.members[nameOrID]; ok {
+		return e.cloneNode(n), true
+	}
+	if id, ok := e.nameToID[nameOrID]; ok {
+		if n, ok := e.members[id]; ok {
+			return e.cloneNode(n), true
+		}
+	}
+	return nil, false
+}
+
+// GetStatus returns the diagnostic health and statistics of the Gossip engine
+func (e *Engine) GetStatus() entity.GossipEngineStatus {
+	e.mu.RLock()
+	defer e.mu.RUnlock()
+
+	var alive, suspect, dead int
+	members := make([]*entity.Node, 0, len(e.members))
+
+	for _, n := range e.members {
+		members = append(members, e.cloneNode(n))
+		switch n.GossipState {
+		case entity.GossipStateAlive:
+			alive++
+		case entity.GossipStateSuspect:
+			suspect++
+		case entity.GossipStateDead, entity.GossipStateLeft:
+			dead++
+		}
+	}
+
+	return entity.GossipEngineStatus{
+		NodeID:       e.self.ID,
+		NodeName:     e.self.Name,
+		MeshAddr:     e.self.Addr,
+		State:        e.self.GossipState,
+		Incarnation:  e.self.Incarnation,
+		Protocol:     "SWIM+AntiEntropy/v1",
+		TotalMembers: len(e.members),
+		AliveCount:   alive,
+		SuspectCount: suspect,
+		DeadCount:    dead,
+		IntervalMs:   e.interval.Milliseconds(),
+		Members:      members,
+	}
+}
+
+// HandleMessage handles an incoming GossipMessage and returns the response
+func (e *Engine) HandleMessage(msg *entity.GossipMessage) (*entity.GossipMessage, error) {
+	if msg == nil {
+		return nil, fmt.Errorf("nil gossip message")
+	}
+
+	e.mu.Lock()
+	e.stats.Recv++
+	e.mu.Unlock()
+
+	switch msg.Type {
+	case entity.GossipMsgPing:
+		return e.handlePing(msg)
+	case entity.GossipMsgAck:
+		return e.handleAck(msg)
+	case entity.GossipMsgIndirectPing:
+		return e.handleIndirectPing(msg)
+	case entity.GossipMsgSyncReq:
+		return e.handleSyncReq(msg)
+	case entity.GossipMsgSyncResp:
+		return e.handleSyncResp(msg)
+	case entity.GossipMsgUpdate:
+		return e.handleUpdate(msg)
+	default:
+		return nil, fmt.Errorf("unknown gossip message type: %s", msg.Type)
+	}
+}
+
+func (e *Engine) handlePing(msg *entity.GossipMessage) (*entity.GossipMessage, error) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+
+	// Update sender as alive
+	e.registerOrTouchSenderLocked(msg)
+
+	// Process piggybacked updates
+	for _, u := range msg.Updates {
+		e.applyUpdateLocked(u)
+	}
+
+	// Prepare Ack with piggybacked updates known to us
+	updatesToSend := e.getPiggybackedUpdatesLocked(8)
+
+	reply := &entity.GossipMessage{
+		Type:        entity.GossipMsgAck,
+		SenderID:    e.self.ID,
+		SenderName:  e.self.Name,
+		SenderAddr:  e.self.Addr,
+		Incarnation: e.self.Incarnation,
+		Updates:     updatesToSend,
+	}
+	return reply, nil
+}
+
+func (e *Engine) handleAck(msg *entity.GossipMessage) (*entity.GossipMessage, error) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+
+	e.registerOrTouchSenderLocked(msg)
+	for _, u := range msg.Updates {
+		e.applyUpdateLocked(u)
+	}
+
+	return &entity.GossipMessage{
+		Type:       entity.GossipMsgAck,
+		SenderID:   e.self.ID,
+		SenderName: e.self.Name,
+	}, nil
+}
+
+func (e *Engine) handleIndirectPing(msg *entity.GossipMessage) (*entity.GossipMessage, error) {
+	targetID := msg.TargetID
+	if targetID == "" {
+		return nil, fmt.Errorf("missing target_id for indirect ping")
+	}
+
+	e.mu.RLock()
+	target, exists := e.members[targetID]
+	var targetCopy *entity.Node
+	if exists {
+		targetCopy = e.cloneNode(target)
+	}
+	e.mu.RUnlock()
+
+	if !exists || targetCopy == nil || targetCopy.Addr == "" {
+		return &entity.GossipMessage{
+			Type:       entity.GossipMsgAck,
+			SenderID:   e.self.ID,
+			SenderName: e.self.Name,
+			Updates: []*entity.GossipUpdate{
+				{
+					Node:        targetCopy,
+					State:       entity.GossipStateSuspect,
+					Incarnation: 0,
+					Timestamp:   time.Now(),
+				},
+			},
+		}, nil
+	}
+
+	// Ping target on behalf of sender
+	ctx, cancel := context.WithTimeout(context.Background(), 1200*time.Millisecond)
+	defer cancel()
+
+	pingMsg := &entity.GossipMessage{
+		Type:        entity.GossipMsgPing,
+		SenderID:    e.self.ID,
+		SenderName:  e.self.Name,
+		SenderAddr:  e.self.Addr,
+		Incarnation: e.self.Incarnation,
+	}
+
+	reply, err := e.transport.SendMessage(ctx, targetCopy.Addr, 19800, pingMsg)
+	if err == nil && reply != nil && reply.Type == entity.GossipMsgAck {
+		return &entity.GossipMessage{
+			Type:       entity.GossipMsgAck,
+			SenderID:   e.self.ID,
+			SenderName: e.self.Name,
+			Updates: []*entity.GossipUpdate{
+				{
+					Node:        targetCopy,
+					State:       entity.GossipStateAlive,
+					Incarnation: targetCopy.Incarnation,
+					Timestamp:   time.Now(),
+				},
+			},
+		}, nil
+	}
+
+	return &entity.GossipMessage{
+		Type:       entity.GossipMsgAck,
+		SenderID:   e.self.ID,
+		SenderName: e.self.Name,
+		Updates: []*entity.GossipUpdate{
+			{
+				Node:        targetCopy,
+				State:       entity.GossipStateSuspect,
+				Incarnation: targetCopy.Incarnation,
+				Timestamp:   time.Now(),
+			},
+		},
+	}, nil
+}
+
+func (e *Engine) handleSyncReq(msg *entity.GossipMessage) (*entity.GossipMessage, error) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+
+	e.registerOrTouchSenderLocked(msg)
+
+	digestMap := make(map[string]*entity.GossipDigest)
+	for _, d := range msg.Digest {
+		digestMap[d.NodeID] = d
+	}
+
+	var updatesToSend []*entity.GossipUpdate
+
+	// 1. Check local members against requester digest
+	for id, member := range e.members {
+		remoteDigest, inRemote := digestMap[id]
+		if !inRemote || member.Incarnation > remoteDigest.Incarnation ||
+			(member.Incarnation == remoteDigest.Incarnation && member.GossipState != remoteDigest.State) {
+			updatesToSend = append(updatesToSend, &entity.GossipUpdate{
+				Node:        e.cloneNode(member),
+				State:       member.GossipState,
+				Incarnation: member.Incarnation,
+				Timestamp:   time.Now(),
+			})
+		}
+	}
+
+	// 2. Prepare our own digest for requester to inspect
+	localDigest := make([]*entity.GossipDigest, 0, len(e.members))
+	for _, member := range e.members {
+		localDigest = append(localDigest, &entity.GossipDigest{
+			NodeID:      member.ID,
+			NodeName:    member.Name,
+			Incarnation: member.Incarnation,
+			State:       member.GossipState,
+		})
+	}
+
+	return &entity.GossipMessage{
+		Type:        entity.GossipMsgSyncResp,
+		SenderID:    e.self.ID,
+		SenderName:  e.self.Name,
+		SenderAddr:  e.self.Addr,
+		Incarnation: e.self.Incarnation,
+		Updates:     updatesToSend,
+		Digest:      localDigest,
+	}, nil
+}
+
+func (e *Engine) handleSyncResp(msg *entity.GossipMessage) (*entity.GossipMessage, error) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+
+	e.registerOrTouchSenderLocked(msg)
+	for _, u := range msg.Updates {
+		e.applyUpdateLocked(u)
+	}
+
+	return &entity.GossipMessage{
+		Type:       entity.GossipMsgAck,
+		SenderID:   e.self.ID,
+		SenderName: e.self.Name,
+	}, nil
+}
+
+func (e *Engine) handleUpdate(msg *entity.GossipMessage) (*entity.GossipMessage, error) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+
+	e.registerOrTouchSenderLocked(msg)
+	for _, u := range msg.Updates {
+		e.applyUpdateLocked(u)
+	}
+
+	return &entity.GossipMessage{
+		Type:       entity.GossipMsgAck,
+		SenderID:   e.self.ID,
+		SenderName: e.self.Name,
+	}, nil
+}
+
+func (e *Engine) registerOrTouchSenderLocked(msg *entity.GossipMessage) {
+	if msg.SenderID == "" || msg.SenderID == e.self.ID {
+		return
+	}
+
+	sender, exists := e.members[msg.SenderID]
+	if !exists {
+		sender = &entity.Node{
+			ID:          msg.SenderID,
+			Name:        msg.SenderName,
+			Addr:        msg.SenderAddr,
+			IsOnline:    true,
+			GossipState: entity.GossipStateAlive,
+			Incarnation: msg.Incarnation,
+			LastSeen:    time.Now(),
+		}
+		e.members[msg.SenderID] = sender
+		e.nameToID[msg.SenderName] = msg.SenderID
+
+		if e.repo != nil {
+			_ = e.repo.SaveNode(e.cloneNode(sender))
+		}
+	} else {
+		sender.IsOnline = true
+		sender.GossipState = entity.GossipStateAlive
+		sender.LastSeen = time.Now()
+		if msg.SenderAddr != "" {
+			sender.Addr = msg.SenderAddr
+		}
+		if msg.Incarnation > sender.Incarnation {
+			sender.Incarnation = msg.Incarnation
+		}
+		if timer, ok := e.suspectTimers[msg.SenderID]; ok {
+			timer.Stop()
+			delete(e.suspectTimers, msg.SenderID)
+		}
+	}
+}
+
+func (e *Engine) applyUpdateLocked(u *entity.GossipUpdate) {
+	if u == nil || u.Node == nil || u.Node.ID == "" {
+		return
+	}
+
+	// 1. If update is about self
+	if u.Node.ID == e.self.ID {
+		if u.State == entity.GossipStateSuspect || u.State == entity.GossipStateDead {
+			// We are alive! Refute suspect rumor by incrementing incarnation
+			if u.Incarnation >= e.self.Incarnation {
+				e.self.Incarnation = u.Incarnation + 1
+			} else {
+				e.self.Incarnation++
+			}
+			e.self.GossipState = entity.GossipStateAlive
+			e.self.IsOnline = true
+			e.self.LastSeen = time.Now()
+
+			refute := &entity.GossipUpdate{
+				Node:        e.cloneNode(e.self),
+				State:       entity.GossipStateAlive,
+				Incarnation: e.self.Incarnation,
+				Timestamp:   time.Now(),
+			}
+			e.queueUpdateLocked(refute)
+		}
+		return
+	}
+
+	// 2. If update is about a peer
+	existing, exists := e.members[u.Node.ID]
+	if !exists {
+		// Newly discovered peer via gossip!
+		newNode := e.cloneNode(u.Node)
+		newNode.GossipState = u.State
+		newNode.Incarnation = u.Incarnation
+		newNode.LastSeen = time.Now()
+		if u.State == entity.GossipStateAlive {
+			newNode.IsOnline = true
+		} else {
+			newNode.IsOnline = false
+		}
+
+		e.members[newNode.ID] = newNode
+		e.nameToID[newNode.Name] = newNode.ID
+
+		if e.repo != nil {
+			_ = e.repo.SaveNode(e.cloneNode(newNode))
+		}
+		e.queueUpdateLocked(u)
+		return
+	}
+
+	// Conflict resolution via SWIM rules:
+	// A higher incarnation always supersedes a lower incarnation.
+	if u.Incarnation > existing.Incarnation {
+		existing.Incarnation = u.Incarnation
+		existing.GossipState = u.State
+		existing.LastSeen = time.Now()
+		if u.State == entity.GossipStateAlive {
+			existing.IsOnline = true
+			if t, ok := e.suspectTimers[existing.ID]; ok {
+				t.Stop()
+				delete(e.suspectTimers, existing.ID)
+			}
+		} else if u.State == entity.GossipStateSuspect {
+			existing.IsOnline = false
+			e.startSuspectTimerLocked(existing.ID)
+		} else if u.State == entity.GossipStateDead {
+			existing.IsOnline = false
+		}
+
+		// Merge metadata & metrics
+		e.mergeNodeMetadata(existing, u.Node)
+		if e.repo != nil {
+			_ = e.repo.SaveNode(e.cloneNode(existing))
+		}
+		e.queueUpdateLocked(u)
+	} else if u.Incarnation == existing.Incarnation {
+		// Priority for equal incarnation: Dead > Suspect > Alive
+		if existing.GossipState == entity.GossipStateAlive && u.State == entity.GossipStateSuspect {
+			existing.GossipState = entity.GossipStateSuspect
+			existing.IsOnline = false
+			e.startSuspectTimerLocked(existing.ID)
+			e.queueUpdateLocked(u)
+		} else if existing.GossipState == entity.GossipStateSuspect && u.State == entity.GossipStateDead {
+			existing.GossipState = entity.GossipStateDead
+			existing.IsOnline = false
+			if t, ok := e.suspectTimers[existing.ID]; ok {
+				t.Stop()
+				delete(e.suspectTimers, existing.ID)
+			}
+			e.queueUpdateLocked(u)
+		}
+		e.mergeNodeMetadata(existing, u.Node)
+		if e.repo != nil {
+			_ = e.repo.SaveNode(e.cloneNode(existing))
+		}
+	}
+}
+
+func (e *Engine) mergeNodeMetadata(dest, src *entity.Node) {
+	if src == nil || dest == nil {
+		return
+	}
+	if len(src.Tags) > 0 {
+		dest.Tags = src.Tags
+	}
+	if src.Host != "" {
+		dest.Host = src.Host
+	}
+	if src.IP != "" {
+		dest.IP = src.IP
+	}
+	if src.OS != "" {
+		dest.OS = src.OS
+	}
+	if src.Arch != "" {
+		dest.Arch = src.Arch
+	}
+	if src.Addr != "" {
+		dest.Addr = src.Addr
+	}
+	if src.CPUUsage > 0 {
+		dest.CPUUsage = src.CPUUsage
+		dest.MemoryUsage = src.MemoryUsage
+		dest.DiskUsage = src.DiskUsage
+		dest.Load1 = src.Load1
+		dest.Uptime = src.Uptime
+		dest.CPUCores = src.CPUCores
+	}
+}
+
+func (e *Engine) startSuspectTimerLocked(nodeID string) {
+	if timer, ok := e.suspectTimers[nodeID]; ok {
+		timer.Stop()
+	}
+
+	e.suspectTimers[nodeID] = time.AfterFunc(e.suspectPeriod, func() {
+		e.mu.Lock()
+		defer e.mu.Unlock()
+
+		delete(e.suspectTimers, nodeID)
+		if node, ok := e.members[nodeID]; ok && node.GossipState == entity.GossipStateSuspect {
+			node.GossipState = entity.GossipStateDead
+			node.IsOnline = false
+
+			deadUpdate := &entity.GossipUpdate{
+				Node:        e.cloneNode(node),
+				State:       entity.GossipStateDead,
+				Incarnation: node.Incarnation,
+				Timestamp:   time.Now(),
+			}
+			e.queueUpdateLocked(deadUpdate)
+		}
+	})
+}
+
+func (e *Engine) queueUpdateLocked(u *entity.GossipUpdate) {
+	if u == nil {
+		return
+	}
+	if len(e.recentUpdates) >= 50 {
+		e.recentUpdates = e.recentUpdates[1:]
+	}
+	e.recentUpdates = append(e.recentUpdates, u)
+}
+
+func (e *Engine) getPiggybackedUpdatesLocked(max int) []*entity.GossipUpdate {
+	if len(e.recentUpdates) == 0 {
+		return nil
+	}
+	if len(e.recentUpdates) <= max {
+		cp := make([]*entity.GossipUpdate, len(e.recentUpdates))
+		copy(cp, e.recentUpdates)
+		return cp
+	}
+	start := len(e.recentUpdates) - max
+	cp := make([]*entity.GossipUpdate, max)
+	copy(cp, e.recentUpdates[start:])
+	return cp
+}
+
+func (e *Engine) runGossipLoop() {
+	ticker := time.NewTicker(e.interval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-e.ctx.Done():
+			return
+		case <-ticker.C:
+			e.performGossipRound()
+		}
+	}
+}
+
+func (e *Engine) performGossipRound() {
+	if e.transport == nil {
+		return
+	}
+
+	peer := e.selectRandomPeer()
+	if peer == nil {
+		return
+	}
+
+	e.mu.Lock()
+	e.stats.Rounds++
+	e.stats.Sent++
+	updates := e.getPiggybackedUpdatesLocked(8)
+	pingMsg := &entity.GossipMessage{
+		Type:        entity.GossipMsgPing,
+		SenderID:    e.self.ID,
+		SenderName:  e.self.Name,
+		SenderAddr:  e.self.Addr,
+		Incarnation: e.self.Incarnation,
+		Updates:     updates,
+	}
+	e.mu.Unlock()
+
+	start := time.Now()
+	ctx, cancel := context.WithTimeout(e.ctx, 1200*time.Millisecond)
+	reply, err := e.transport.SendMessage(ctx, peer.Addr, 19800, pingMsg)
+	cancel()
+
+	latency := time.Since(start).Milliseconds()
+
+	if err == nil && reply != nil && reply.Type == entity.GossipMsgAck {
+		// Ping succeeded
+		e.mu.Lock()
+		if n, ok := e.members[peer.ID]; ok {
+			n.IsOnline = true
+			n.GossipState = entity.GossipStateAlive
+			n.LastSeen = time.Now()
+			n.LatencyMs = latency
+			if timer, exists := e.suspectTimers[peer.ID]; exists {
+				timer.Stop()
+				delete(e.suspectTimers, peer.ID)
+			}
+		}
+		for _, u := range reply.Updates {
+			e.applyUpdateLocked(u)
+		}
+		e.mu.Unlock()
+		return
+	}
+
+	// Direct ping failed -> Try indirect ping via another peer
+	indirectHelper := e.selectRandomPeerExcluding(peer.ID)
+	if indirectHelper != nil {
+		indCtx, indCancel := context.WithTimeout(e.ctx, 1800*time.Millisecond)
+		indMsg := &entity.GossipMessage{
+			Type:        entity.GossipMsgIndirectPing,
+			SenderID:    e.self.ID,
+			SenderName:  e.self.Name,
+			SenderAddr:  e.self.Addr,
+			TargetID:    peer.ID,
+			Incarnation: e.self.Incarnation,
+		}
+		indReply, indErr := e.transport.SendMessage(indCtx, indirectHelper.Addr, 19800, indMsg)
+		indCancel()
+
+		if indErr == nil && indReply != nil {
+			for _, u := range indReply.Updates {
+				if u.Node != nil && u.Node.ID == peer.ID && u.State == entity.GossipStateAlive {
+					// Indirect ping succeeded! Peer is alive through helper
+					e.mu.Lock()
+					if n, ok := e.members[peer.ID]; ok {
+						n.IsOnline = true
+						n.GossipState = entity.GossipStateAlive
+						n.LastSeen = time.Now()
+					}
+					e.mu.Unlock()
+					return
+				}
+			}
+		}
+	}
+
+	// Both direct and indirect ping failed -> Node enters Suspect state
+	e.mu.Lock()
+	if n, ok := e.members[peer.ID]; ok && n.GossipState == entity.GossipStateAlive {
+		n.GossipState = entity.GossipStateSuspect
+		n.IsOnline = false
+		e.startSuspectTimerLocked(peer.ID)
+
+		suspectUpdate := &entity.GossipUpdate{
+			Node:        e.cloneNode(n),
+			State:       entity.GossipStateSuspect,
+			Incarnation: n.Incarnation,
+			Timestamp:   time.Now(),
+		}
+		e.queueUpdateLocked(suspectUpdate)
+	}
+	e.mu.Unlock()
+}
+
+func (e *Engine) runAntiEntropyLoop() {
+	ticker := time.NewTicker(e.syncInterval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-e.ctx.Done():
+			return
+		case <-ticker.C:
+			e.performAntiEntropySync()
+		}
+	}
+}
+
+func (e *Engine) performAntiEntropySync() {
+	if e.transport == nil {
+		return
+	}
+
+	peer := e.selectRandomPeer()
+	if peer == nil {
+		return
+	}
+
+	e.mu.RLock()
+	localDigest := make([]*entity.GossipDigest, 0, len(e.members))
+	for _, m := range e.members {
+		localDigest = append(localDigest, &entity.GossipDigest{
+			NodeID:      m.ID,
+			NodeName:    m.Name,
+			Incarnation: m.Incarnation,
+			State:       m.GossipState,
+		})
+	}
+	req := &entity.GossipMessage{
+		Type:        entity.GossipMsgSyncReq,
+		SenderID:    e.self.ID,
+		SenderName:  e.self.Name,
+		SenderAddr:  e.self.Addr,
+		Incarnation: e.self.Incarnation,
+		Digest:      localDigest,
+	}
+	e.mu.RUnlock()
+
+	ctx, cancel := context.WithTimeout(e.ctx, 2500*time.Millisecond)
+	resp, err := e.transport.SendMessage(ctx, peer.Addr, 19800, req)
+	cancel()
+
+	if err == nil && resp != nil && resp.Type == entity.GossipMsgSyncResp {
+		e.mu.Lock()
+		for _, u := range resp.Updates {
+			e.applyUpdateLocked(u)
+		}
+		e.mu.Unlock()
+	}
+}
+
+func (e *Engine) runTelemetryLoop() {
+	ticker := time.NewTicker(10 * time.Second)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-e.ctx.Done():
+			return
+		case <-ticker.C:
+			e.refreshTelemetry()
+		}
+	}
+}
+
+func (e *Engine) refreshTelemetry() {
+	col := telemetry.NewCollector()
+	metrics, err := col.Collect(context.Background())
+	if err != nil || metrics == nil {
+		return
+	}
+
+	e.mu.Lock()
+	defer e.mu.Unlock()
+
+	e.self.CPUUsage = metrics.CPUUsage
+	e.self.MemoryUsage = metrics.MemoryUsage
+	e.self.DiskUsage = metrics.DiskUsage
+	e.self.TotalMemory = metrics.TotalMemory
+	e.self.UsedMemory = metrics.UsedMemory
+	e.self.TotalDisk = metrics.TotalDisk
+	e.self.UsedDisk = metrics.UsedDisk
+	e.self.CPUCores = metrics.CPUCores
+	e.self.Uptime = metrics.Uptime
+	e.self.Load1 = metrics.Load1
+	e.self.LastSeen = time.Now()
+}
+
+func (e *Engine) selectRandomPeer() *entity.Node {
+	e.mu.RLock()
+	defer e.mu.RUnlock()
+
+	var candidates []*entity.Node
+	for _, m := range e.members {
+		if m.ID != e.self.ID && m.Addr != "" && m.GossipState != entity.GossipStateDead {
+			candidates = append(candidates, m)
+		}
+	}
+
+	if len(candidates) == 0 {
+		return nil
+	}
+	idx := rand.Intn(len(candidates))
+	return e.cloneNode(candidates[idx])
+}
+
+func (e *Engine) selectRandomPeerExcluding(excludeID string) *entity.Node {
+	e.mu.RLock()
+	defer e.mu.RUnlock()
+
+	var candidates []*entity.Node
+	for _, m := range e.members {
+		if m.ID != e.self.ID && m.ID != excludeID && m.Addr != "" && m.GossipState == entity.GossipStateAlive {
+			candidates = append(candidates, m)
+		}
+	}
+
+	if len(candidates) == 0 {
+		return nil
+	}
+	idx := rand.Intn(len(candidates))
+	return e.cloneNode(candidates[idx])
+}
+
+func (e *Engine) cloneNode(n *entity.Node) *entity.Node {
+	if n == nil {
+		return nil
+	}
+	cp := *n
+	if len(n.Tags) > 0 {
+		cp.Tags = make([]string, len(n.Tags))
+		copy(cp.Tags, n.Tags)
+	}
+	return &cp
+}

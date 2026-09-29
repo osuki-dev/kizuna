@@ -34,6 +34,7 @@ type Styles struct {
 	PillInfo      lipgloss.Style
 	MutedText     lipgloss.Style
 	HighlightText lipgloss.Style
+	WarningText   lipgloss.Style
 	GaugeLow      lipgloss.Style
 	GaugeMed      lipgloss.Style
 	GaugeHigh     lipgloss.Style
@@ -118,6 +119,7 @@ func NewStyles(theme *entity.Theme) Styles {
 			Bold(true),
 		MutedText:     lipgloss.NewStyle().Foreground(mCol),
 		HighlightText: lipgloss.NewStyle().Foreground(sCol).Bold(true),
+		WarningText:   lipgloss.NewStyle().Foreground(wCol).Bold(true),
 		GaugeLow: lipgloss.NewStyle().
 			Foreground(sCol).
 			Bold(true),
@@ -1049,8 +1051,8 @@ func (m *DashboardModel) renderNodesTab(width int) string {
 	divider := m.styles.Divider.Render(strings.Repeat("─", width)) + "\n"
 
 	if width >= 105 {
-		header := fmt.Sprintf("  %-2s %-18s %-24s %-16s %-12s %-16s %-12s\n",
-			" ", "NAME", "MESH ADDR", "STATUS", "LATENCY", "OS / ARCH", "CPU / RAM")
+		header := fmt.Sprintf("  %-2s %-16s %-18s %-16s %-14s %-10s %-14s %-10s\n",
+			" ", "NAME", "HOST / IP", "TAGS", "STATUS", "LATENCY", "OS / ARCH", "CPU/RAM")
 		sb.WriteString(header)
 		sb.WriteString(divider)
 
@@ -1066,21 +1068,44 @@ func (m *DashboardModel) renderNodesTab(width int) string {
 			osArchStr := n.OS + "/" + n.Arch
 			cpuMemStr := "-"
 
+			hostStr := n.Host
+			if hostStr == "" {
+				hostStr = n.IP
+			}
+			if hostStr == "" {
+				hostStr = truncate(n.Addr, 17)
+			}
+
+			tagsStr := "-"
+			if len(n.Tags) > 0 {
+				tagsStr = strings.Join(n.Tags, ",")
+			}
+
+			if n.GossipState == entity.GossipStateSuspect {
+				statusStr = m.styles.WarningText.Render("▲ Suspect")
+			} else if n.GossipState == entity.GossipStateDead {
+				statusStr = m.styles.StatusFailed
+			}
+
 			if st != nil {
 				if st.IsProbing {
 					statusStr = m.styles.StatusProbing
 				} else if st.IsOnline {
-					statusStr = m.styles.StatusRunning
+					if n.GossipState == "" || n.GossipState == entity.GossipStateAlive {
+						statusStr = m.styles.StatusRunning
+					}
 					if st.Latency > 0 {
 						latencyStr = fmt.Sprintf("%dms", st.Latency.Milliseconds())
 					} else {
-						latencyStr = "<1ms (local)"
+						latencyStr = "<1ms"
 					}
 					if st.Node != nil && st.Node.CPUUsage > 0 {
-						cpuMemStr = fmt.Sprintf("%.0f%% / %.0f%%", st.Node.CPUUsage, st.Node.MemoryUsage)
+						cpuMemStr = fmt.Sprintf("%.0f%%/%.0f%%", st.Node.CPUUsage, st.Node.MemoryUsage)
 					}
 				} else {
-					statusStr = m.styles.StatusFailed
+					if n.GossipState != entity.GossipStateSuspect {
+						statusStr = m.styles.StatusFailed
+					}
 					latencyStr = "Timeout"
 				}
 			}
@@ -1089,10 +1114,11 @@ func (m *DashboardModel) renderNodesTab(width int) string {
 				osArchStr = "unknown"
 			}
 
-			row := fmt.Sprintf("  %-2s %-18s %-24s %-16s %-12s %-16s %-12s\n",
+			row := fmt.Sprintf("  %-2s %-16s %-18s %-16s %-14s %-10s %-14s %-10s\n",
 				cursor,
-				truncate(n.Name, 17),
-				truncate(n.Addr, 23),
+				truncate(n.Name, 15),
+				truncate(hostStr, 17),
+				truncate(tagsStr, 15),
 				statusStr,
 				latencyStr,
 				osArchStr,
@@ -1107,8 +1133,8 @@ func (m *DashboardModel) renderNodesTab(width int) string {
 		}
 	} else if width >= 85 {
 		// Medium view: omit OS/ARCH
-		header := fmt.Sprintf("  %-2s %-18s %-20s %-16s %-12s %-10s\n",
-			" ", "NAME", "MESH ADDR", "STATUS", "LATENCY", "CPU/RAM")
+		header := fmt.Sprintf("  %-2s %-16s %-18s %-14s %-14s %-10s %-10s\n",
+			" ", "NAME", "HOST / IP", "TAGS", "STATUS", "LATENCY", "CPU/RAM")
 		sb.WriteString(header)
 		sb.WriteString(divider)
 
@@ -1123,11 +1149,32 @@ func (m *DashboardModel) renderNodesTab(width int) string {
 			latencyStr := "-"
 			cpuMemStr := "-"
 
+			hostStr := n.Host
+			if hostStr == "" {
+				hostStr = n.IP
+			}
+			if hostStr == "" {
+				hostStr = truncate(n.Addr, 17)
+			}
+
+			tagsStr := "-"
+			if len(n.Tags) > 0 {
+				tagsStr = strings.Join(n.Tags, ",")
+			}
+
+			if n.GossipState == entity.GossipStateSuspect {
+				statusStr = m.styles.WarningText.Render("▲ Suspect")
+			} else if n.GossipState == entity.GossipStateDead {
+				statusStr = m.styles.StatusFailed
+			}
+
 			if st != nil {
 				if st.IsProbing {
 					statusStr = m.styles.StatusProbing
 				} else if st.IsOnline {
-					statusStr = m.styles.StatusRunning
+					if n.GossipState == "" || n.GossipState == entity.GossipStateAlive {
+						statusStr = m.styles.StatusRunning
+					}
 					if st.Latency > 0 {
 						latencyStr = fmt.Sprintf("%dms", st.Latency.Milliseconds())
 					} else {
@@ -1137,15 +1184,18 @@ func (m *DashboardModel) renderNodesTab(width int) string {
 						cpuMemStr = fmt.Sprintf("%.0f%%/%.0f%%", st.Node.CPUUsage, st.Node.MemoryUsage)
 					}
 				} else {
-					statusStr = m.styles.StatusFailed
+					if n.GossipState != entity.GossipStateSuspect {
+						statusStr = m.styles.StatusFailed
+					}
 					latencyStr = "Timeout"
 				}
 			}
 
-			row := fmt.Sprintf("  %-2s %-18s %-20s %-16s %-12s %-10s\n",
+			row := fmt.Sprintf("  %-2s %-16s %-18s %-14s %-14s %-10s %-10s\n",
 				cursor,
-				truncate(n.Name, 17),
-				truncate(n.Addr, 19),
+				truncate(n.Name, 15),
+				truncate(hostStr, 17),
+				truncate(tagsStr, 13),
 				statusStr,
 				latencyStr,
 				cpuMemStr,
@@ -1158,9 +1208,9 @@ func (m *DashboardModel) renderNodesTab(width int) string {
 			}
 		}
 	} else {
-		// Compact view: NAME, MESH ADDR, STATUS, CPU/RAM
-		header := fmt.Sprintf("  %-2s %-16s %-18s %-16s %-10s\n",
-			" ", "NAME", "MESH ADDR", "STATUS", "CPU/RAM")
+		// Compact view: NAME, HOST / IP, STATUS, CPU/RAM
+		header := fmt.Sprintf("  %-2s %-16s %-18s %-14s %-10s\n",
+			" ", "NAME", "HOST / IP", "STATUS", "CPU/RAM")
 		sb.WriteString(header)
 		sb.WriteString(divider)
 
@@ -1174,23 +1224,41 @@ func (m *DashboardModel) renderNodesTab(width int) string {
 			statusStr := m.styles.StatusStopped
 			cpuMemStr := "-"
 
+			hostStr := n.Host
+			if hostStr == "" {
+				hostStr = n.IP
+			}
+			if hostStr == "" {
+				hostStr = truncate(n.Addr, 17)
+			}
+
+			if n.GossipState == entity.GossipStateSuspect {
+				statusStr = m.styles.WarningText.Render("▲ Suspect")
+			} else if n.GossipState == entity.GossipStateDead {
+				statusStr = m.styles.StatusFailed
+			}
+
 			if st != nil {
 				if st.IsProbing {
 					statusStr = m.styles.StatusProbing
 				} else if st.IsOnline {
-					statusStr = m.styles.StatusRunning
+					if n.GossipState == "" || n.GossipState == entity.GossipStateAlive {
+						statusStr = m.styles.StatusRunning
+					}
 					if st.Node != nil && st.Node.CPUUsage > 0 {
 						cpuMemStr = fmt.Sprintf("%.0f%%/%.0f%%", st.Node.CPUUsage, st.Node.MemoryUsage)
 					}
 				} else {
-					statusStr = m.styles.StatusFailed
+					if n.GossipState != entity.GossipStateSuspect {
+						statusStr = m.styles.StatusFailed
+					}
 				}
 			}
 
-			row := fmt.Sprintf("  %-2s %-16s %-18s %-16s %-10s\n",
+			row := fmt.Sprintf("  %-2s %-16s %-18s %-14s %-10s\n",
 				cursor,
 				truncate(n.Name, 15),
-				truncate(n.Addr, 17),
+				truncate(hostStr, 17),
 				statusStr,
 				cpuMemStr,
 			)
@@ -1209,17 +1277,48 @@ func (m *DashboardModel) renderNodesTab(width int) string {
 		st := m.nodeStates[sn.Name]
 		sb.WriteString("\n" + m.styles.Subtitle.Render("🔎 SELECTED NODE DETAILS") + "\n")
 		sb.WriteString(m.styles.Divider.Render(strings.Repeat("─", width)) + "\n")
-		fmt.Fprintf(&sb, "  Node ID:     %s\n", sn.ID)
-		fmt.Fprintf(&sb, "  Mesh Addr:   %s\n", sn.Addr)
+		fmt.Fprintf(&sb, "  Node ID:      %s\n", sn.ID)
+		fmt.Fprintf(&sb, "  Mesh Addr:    %s\n", sn.Addr)
+
+		hostVal := sn.Host
+		if hostVal == "" {
+			hostVal = sn.IP
+		}
+		if hostVal == "" {
+			hostVal = "-"
+		}
+		fmt.Fprintf(&sb, "  Host / IP:    %s\n", hostVal)
+
+		tagsVal := "-"
+		if len(sn.Tags) > 0 {
+			tagsVal = strings.Join(sn.Tags, ", ")
+		}
+		fmt.Fprintf(&sb, "  Tags:         %s\n", tagsVal)
+
+		gossipState := string(sn.GossipState)
+		if gossipState == "" {
+			if st != nil && st.IsOnline {
+				gossipState = "alive"
+			} else {
+				gossipState = "offline"
+			}
+		}
+		fmt.Fprintf(&sb, "  Gossip State: %s (Incarnation: %d)\n", strings.ToUpper(gossipState), sn.Incarnation)
+
+		if sn.CPUUsage > 0 || sn.MemoryUsage > 0 {
+			fmt.Fprintf(&sb, "  Telemetry:    CPU: %.1f%% | RAM: %.1f%% | Disk: %.1f%% | Load: %.2f\n",
+				sn.CPUUsage, sn.MemoryUsage, sn.DiskUsage, sn.Load1)
+		}
+
 		if st != nil && !st.IsOnline && st.Error != "" {
-			fmt.Fprintf(&sb, "  Error:       %s\n", m.styles.MutedText.Render(st.Error))
+			fmt.Fprintf(&sb, "  Error:        %s\n", m.styles.MutedText.Render(st.Error))
 		}
 		if st != nil && len(st.Services) > 0 {
 			var svcNames []string
 			for _, sv := range st.Services {
 				svcNames = append(svcNames, sv.Name)
 			}
-			fmt.Fprintf(&sb, "  Workloads:   %s\n", strings.Join(svcNames, ", "))
+			fmt.Fprintf(&sb, "  Workloads:    %s\n", strings.Join(svcNames, ", "))
 		}
 	}
 

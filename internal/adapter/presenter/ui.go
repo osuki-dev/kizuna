@@ -170,6 +170,51 @@ func (u *UI) RenderServerStart(meshAddr, pin string) string {
 	return u.CardStyle.Render(content)
 }
 
+// GossipPill returns an indicator badge for gossip state
+func (u *UI) GossipPill(state entity.GossipState, isOnline bool) string {
+	if NoColor {
+		if state != "" {
+			return "[" + string(state) + "]"
+		}
+		if isOnline {
+			return "[Online]"
+		}
+		return "[Offline]"
+	}
+
+	switch state {
+	case entity.GossipStateAlive:
+		return lipgloss.NewStyle().
+			Bold(true).
+			Foreground(lipgloss.Color("#FFFFFF")).
+			Background(lipgloss.Color(u.Theme.Secondary)).
+			Padding(0, 1).
+			Render("● Alive")
+	case entity.GossipStateSuspect:
+		return lipgloss.NewStyle().
+			Bold(true).
+			Foreground(lipgloss.Color("#000000")).
+			Background(lipgloss.Color(u.Theme.Warning)).
+			Padding(0, 1).
+			Render("▲ Suspect")
+	case entity.GossipStateDead:
+		return lipgloss.NewStyle().
+			Bold(true).
+			Foreground(lipgloss.Color("#FFFFFF")).
+			Background(lipgloss.Color(u.Theme.Danger)).
+			Padding(0, 1).
+			Render("✖ Dead")
+	case entity.GossipStateLeft:
+		return lipgloss.NewStyle().
+			Foreground(lipgloss.Color("#FFFFFF")).
+			Background(lipgloss.Color(u.Theme.Muted)).
+			Padding(0, 1).
+			Render("○ Left")
+	default:
+		return u.StatusPill(isOnline)
+	}
+}
+
 // RenderNodeTable formats paired nodes into a Lipgloss table
 func (u *UI) RenderNodeTable(nodes []*entity.Node) string {
 	if len(nodes) == 0 {
@@ -201,13 +246,87 @@ func (u *UI) RenderNodeTable(nodes []*entity.Node) string {
 			hostStr = n.IP
 		}
 
+		statusBadge := u.GossipPill(n.GossipState, n.IsOnline)
+
 		rows = append(rows, []string{
 			u.BoldStyle.Render(n.Name),
-			u.StatusPill(n.IsOnline),
+			statusBadge,
 			tagsStr,
 			hostStr,
 			osArch,
 			u.MutedStyle.Render(lastSeen),
+		})
+	}
+
+	t := table.New().
+		Border(lipgloss.RoundedBorder()).
+		BorderStyle(lipgloss.NewStyle().Foreground(lipgloss.Color(u.Theme.Primary))).
+		Headers(headers...).
+		Rows(rows...)
+
+	return t.Render()
+}
+
+// RenderGossipStatus formats GossipEngineStatus into a styled summary card
+func (u *UI) RenderGossipStatus(st *entity.GossipEngineStatus) string {
+	if st == nil {
+		return u.MutedStyle.Render("Gossip engine inactive")
+	}
+
+	var sb strings.Builder
+	sb.WriteString(u.SecondaryStyle.Bold(true).Render("📡 GOSSIP CLUSTER (SWIM PROTOCOL)") + "\n\n")
+
+	sb.WriteString(fmt.Sprintf("  Node Name:     %s (%s)\n", u.BoldStyle.Render(st.NodeName), st.NodeID))
+	sb.WriteString(fmt.Sprintf("  Mesh Addr:     %s\n", st.MeshAddr))
+	sb.WriteString(fmt.Sprintf("  State:         %s  (Incarnation: %d)\n", u.GossipPill(st.State, true), st.Incarnation))
+	sb.WriteString(fmt.Sprintf("  Protocol:      %s\n", st.Protocol))
+	sb.WriteString(fmt.Sprintf("  Ping Interval: %dms\n", st.IntervalMs))
+	sb.WriteString(fmt.Sprintf("  Cluster Size:  %d nodes (%s, %s, %s)\n",
+		st.TotalMembers,
+		u.SecondaryStyle.Render(fmt.Sprintf("%d alive", st.AliveCount)),
+		u.WarningStyle.Render(fmt.Sprintf("%d suspect", st.SuspectCount)),
+		u.DangerStyle.Render(fmt.Sprintf("%d dead", st.DeadCount)),
+	))
+
+	return u.CardStyle.Render(sb.String())
+}
+
+// RenderGossipMembersTable formats gossip cluster members into a Lipgloss table
+func (u *UI) RenderGossipMembersTable(members []*entity.Node) string {
+	if len(members) == 0 {
+		return u.MutedStyle.Render("No gossip members found in cluster.")
+	}
+
+	headers := []string{"MEMBER", "GOSSIP STATE", "INCARNATION", "TAGS", "HOST / IP", "LATENCY"}
+	rows := [][]string{}
+
+	for _, m := range members {
+		tagsStr := u.MutedStyle.Render("-")
+		if len(m.Tags) > 0 {
+			tagsStr = strings.Join(m.Tags, ", ")
+		}
+
+		hostStr := u.MutedStyle.Render("-")
+		if m.Host != "" {
+			hostStr = m.Host
+		} else if m.IP != "" {
+			hostStr = m.IP
+		}
+
+		latencyStr := "-"
+		if m.LatencyMs > 0 {
+			latencyStr = fmt.Sprintf("%dms", m.LatencyMs)
+		} else if m.IsOnline {
+			latencyStr = "<1ms (local)"
+		}
+
+		rows = append(rows, []string{
+			u.BoldStyle.Render(m.Name),
+			u.GossipPill(m.GossipState, m.IsOnline),
+			fmt.Sprintf("%d", m.Incarnation),
+			tagsStr,
+			hostStr,
+			latencyStr,
 		})
 	}
 

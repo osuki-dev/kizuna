@@ -17,12 +17,21 @@ import (
 	"github.com/osuki-dev/kizuna/internal/infrastructure/telemetry"
 )
 
+// GossipEngine defines the interface required by API Server to interact with the Gossip subsystem
+type GossipEngine interface {
+	HandleMessage(msg *entity.GossipMessage) (*entity.GossipMessage, error)
+	GetMembers() []*entity.Node
+	GetStatus() entity.GossipEngineStatus
+	UpdateLocalMeta(meta *entity.NodeMetaUpdate)
+}
+
 // Server handles incoming RPC requests to the Agent over mesh or local TCP
 type Server struct {
 	auth     domain.AuthManager
 	workload domain.WorkloadRunner
 	ingress  domain.IngressManager
 	backup   domain.BackupManager
+	gossip   GossipEngine
 	nodeID   string
 	nodeName string
 	mu       sync.RWMutex
@@ -56,6 +65,13 @@ func NewServer(
 	return s
 }
 
+// SetGossipEngine attaches an active Gossip engine to the API Server
+func (s *Server) SetGossipEngine(g GossipEngine) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.gossip = g
+}
+
 func (s *Server) loadMeta() {
 	if data, err := os.ReadFile(s.metaPath); err == nil {
 		_ = json.Unmarshal(data, &s.meta)
@@ -85,6 +101,11 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("/api/v1/backup", s.withAuth(s.handleBackup))
 	mux.HandleFunc("/api/v1/node/meta", s.withAuth(s.handleNodeMeta))
 	mux.HandleFunc("/api/v1/auth/revoke", s.withAuth(s.handleRevoke))
+
+	// Gossip mesh endpoints
+	mux.HandleFunc("/api/v1/gossip/message", s.handleGossipMessage)
+	mux.HandleFunc("/api/v1/gossip/status", s.handleGossipStatus)
+	mux.HandleFunc("/api/v1/gossip/members", s.handleGossipMembers)
 
 	return mux
 }
@@ -234,6 +255,14 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 	node.Tags = s.meta.Tags
 	node.Host = s.meta.Host
 	node.IP = s.meta.IP
+	if s.gossip != nil {
+		node.GossipState = entity.GossipStateAlive
+		st := s.gossip.GetStatus()
+		node.Incarnation = st.Incarnation
+	} else {
+		node.GossipState = entity.GossipStateAlive
+		node.Incarnation = 1
+	}
 	s.mu.RUnlock()
 
 	resp := map[string]any{
@@ -314,7 +343,12 @@ func (s *Server) handleNodeMeta(w http.ResponseWriter, r *http.Request) {
 		}
 		_ = s.saveMetaLocked()
 		currentMeta := s.meta
+		ge := s.gossip
 		s.mu.Unlock()
+
+		if ge != nil {
+			ge.UpdateLocalMeta(&currentMeta)
+		}
 
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(map[string]any{
@@ -397,4 +431,65 @@ func (l *singleConnListener) Addr() net.Addr {
 		return l.conn.LocalAddr()
 	}
 	return nil
+}
+
+func (s *Server) handleGossipMessage(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	s.mu.RLock()
+	ge := s.gossip
+	s.mu.RUnlock()
+
+	if ge == nil {
+		http.Error(w, "gossip engine not active", http.StatusServiceUnavailable)
+		return
+	}
+
+	var msg entity.GossipMessage
+	if err := json.NewDecoder(r.Body).Decode(&msg); err != nil {
+		http.Error(w, "invalid gossip message payload", http.StatusBadRequest)
+		return
+	}
+
+	reply, err := ge.HandleMessage(&msg)
+	if err != nil {
+		http.Error(w, fmt.Sprintf("gossip error: %v", err), http.StatusInternalServerError)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(reply)
+}
+
+func (s *Server) handleGossipStatus(w http.ResponseWriter, r *http.Request) {
+	s.mu.RLock()
+	ge := s.gossip
+	s.mu.RUnlock()
+
+	if ge == nil {
+		http.Error(w, "gossip engine not active", http.StatusServiceUnavailable)
+		return
+	}
+
+	status := ge.GetStatus()
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(status)
+}
+
+func (s *Server) handleGossipMembers(w http.ResponseWriter, r *http.Request) {
+	s.mu.RLock()
+	ge := s.gossip
+	s.mu.RUnlock()
+
+	if ge == nil {
+		http.Error(w, "gossip engine not active", http.StatusServiceUnavailable)
+		return
+	}
+
+	members := ge.GetMembers()
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(members)
 }

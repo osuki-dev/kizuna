@@ -192,28 +192,96 @@ type ServiceOverride struct {
 
 // Node represents a remote machine in the mesh
 type Node struct {
-	ID          string    `json:"id"`
-	Name        string    `json:"name"`
-	Addr        string    `json:"addr"` // Tailcat mesh address
-	AuthToken   string    `json:"auth_token"`
-	IsOnline    bool      `json:"is_online"`
-	LastSeen    time.Time `json:"last_seen"`
-	OS          string    `json:"os"`
-	Arch        string    `json:"arch"`
-	Tags        []string  `json:"tags,omitempty" yaml:"tags,omitempty"`
-	Host        string    `json:"host,omitempty" yaml:"host,omitempty"` // Hostname, domain, or IP (e.g. mac-mini.local or 10.0.0.9)
-	IP          string    `json:"ip,omitempty" yaml:"ip,omitempty"`     // Legacy/convenience alias for Host
-	CPUUsage    float64   `json:"cpu_usage"`
-	MemoryUsage float64   `json:"memory_usage"`
-	DiskUsage   float64   `json:"disk_usage"`
-	TotalMemory uint64    `json:"total_memory,omitempty"`
-	UsedMemory  uint64    `json:"used_memory,omitempty"`
-	TotalDisk   uint64    `json:"total_disk,omitempty"`
-	UsedDisk    uint64    `json:"used_disk,omitempty"`
-	CPUCores    int       `json:"cpu_cores,omitempty"`
-	Uptime      uint64    `json:"uptime,omitempty"`
-	Load1       float64   `json:"load1,omitempty"`
-	LatencyMs   int64     `json:"latency_ms,omitempty"`
+	ID          string      `json:"id"`
+	Name        string      `json:"name"`
+	Addr        string      `json:"addr"` // Tailcat mesh address
+	AuthToken   string      `json:"auth_token,omitempty"`
+	IsOnline    bool        `json:"is_online"`
+	LastSeen    time.Time   `json:"last_seen"`
+	OS          string      `json:"os"`
+	Arch        string      `json:"arch"`
+	Tags        []string    `json:"tags,omitempty" yaml:"tags,omitempty"`
+	Host        string      `json:"host,omitempty" yaml:"host,omitempty"` // Hostname, domain, or IP (e.g. mac-mini.local or 10.0.0.9)
+	IP          string      `json:"ip,omitempty" yaml:"ip,omitempty"`     // Legacy/convenience alias for Host
+	GossipState GossipState `json:"gossip_state,omitempty" yaml:"gossip_state,omitempty"` // "alive", "suspect", "dead", "left"
+	Incarnation uint64      `json:"incarnation,omitempty" yaml:"incarnation,omitempty"`
+	CPUUsage    float64     `json:"cpu_usage"`
+	MemoryUsage float64     `json:"memory_usage"`
+	DiskUsage   float64     `json:"disk_usage"`
+	TotalMemory uint64      `json:"total_memory,omitempty"`
+	UsedMemory  uint64      `json:"used_memory,omitempty"`
+	TotalDisk   uint64      `json:"total_disk,omitempty"`
+	UsedDisk    uint64      `json:"used_disk,omitempty"`
+	CPUCores    int         `json:"cpu_cores,omitempty"`
+	Uptime      uint64      `json:"uptime,omitempty"`
+	Load1       float64     `json:"load1,omitempty"`
+	LatencyMs   int64       `json:"latency_ms,omitempty"`
+}
+
+// GossipState represents node membership lifecycle in the Gossip cluster
+type GossipState string
+
+const (
+	GossipStateAlive   GossipState = "alive"
+	GossipStateSuspect GossipState = "suspect"
+	GossipStateDead    GossipState = "dead"
+	GossipStateLeft    GossipState = "left"
+)
+
+// GossipMessageType represents the type of Gossip protocol message
+type GossipMessageType string
+
+const (
+	GossipMsgPing         GossipMessageType = "ping"
+	GossipMsgAck          GossipMessageType = "ack"
+	GossipMsgIndirectPing GossipMessageType = "indirect_ping"
+	GossipMsgSyncReq      GossipMessageType = "sync_req"
+	GossipMsgSyncResp     GossipMessageType = "sync_resp"
+	GossipMsgUpdate       GossipMessageType = "update"
+)
+
+// GossipMessage is the protocol envelope for peer-to-peer gossip exchanges
+type GossipMessage struct {
+	Type        GossipMessageType `json:"type"`
+	SenderID    string            `json:"sender_id"`
+	SenderName  string            `json:"sender_name"`
+	SenderAddr  string            `json:"sender_addr"`
+	TargetID    string            `json:"target_id,omitempty"` // Used for indirect ping
+	Incarnation uint64            `json:"incarnation"`
+	Updates     []*GossipUpdate   `json:"updates,omitempty"`
+	Digest      []*GossipDigest   `json:"digest,omitempty"`
+}
+
+// GossipUpdate carries a membership or metadata state change event
+type GossipUpdate struct {
+	Node        *Node       `json:"node"`
+	State       GossipState `json:"state"`
+	Incarnation uint64      `json:"incarnation"`
+	Timestamp   time.Time   `json:"timestamp"`
+}
+
+// GossipDigest summarizes node state for anti-entropy full synchronization
+type GossipDigest struct {
+	NodeID      string      `json:"node_id"`
+	NodeName    string      `json:"node_name"`
+	Incarnation uint64      `json:"incarnation"`
+	State       GossipState `json:"state"`
+}
+
+// GossipEngineStatus represents diagnostic status of the local Gossip engine
+type GossipEngineStatus struct {
+	NodeID       string         `json:"node_id"`
+	NodeName     string         `json:"node_name"`
+	MeshAddr     string         `json:"mesh_addr"`
+	State        GossipState    `json:"state"`
+	Incarnation  uint64         `json:"incarnation"`
+	Protocol     string         `json:"protocol"`
+	TotalMembers int            `json:"total_members"`
+	AliveCount   int            `json:"alive_count"`
+	SuspectCount int            `json:"suspect_count"`
+	DeadCount    int            `json:"dead_count"`
+	IntervalMs   int64          `json:"interval_ms"`
+	Members      []*Node        `json:"members,omitempty"`
 }
 
 // NodeMetaUpdate represents a payload to update node metadata
