@@ -71,6 +71,15 @@ cross-compile:
 	@echo "==> Cross-compiling for macOS (amd64, arm64)"
 	CGO_ENABLED=0 GOOS=darwin GOARCH=amd64 go build -ldflags="$(LDFLAGS)" -trimpath -o $(BUILD_DIR)/$(BINARY_NAME)-darwin-amd64 ./cmd/kizuna
 	CGO_ENABLED=0 GOOS=darwin GOARCH=arm64 go build -ldflags="$(LDFLAGS)" -trimpath -o $(BUILD_DIR)/$(BINARY_NAME)-darwin-arm64 ./cmd/kizuna
+	@if command -v rcodesign >/dev/null 2>&1; then \
+		echo "==> Signing macOS binaries with rcodesign"; \
+		rcodesign sign $(BUILD_DIR)/$(BINARY_NAME)-darwin-amd64; \
+		rcodesign sign $(BUILD_DIR)/$(BINARY_NAME)-darwin-arm64; \
+	elif command -v codesign >/dev/null 2>&1; then \
+		echo "==> Signing macOS binaries with codesign"; \
+		codesign --force --deep -s - $(BUILD_DIR)/$(BINARY_NAME)-darwin-amd64; \
+		codesign --force --deep -s - $(BUILD_DIR)/$(BINARY_NAME)-darwin-arm64; \
+	fi
 	@echo "==> Cross-compiling for Windows (amd64)"
 	CGO_ENABLED=0 GOOS=windows GOARCH=amd64 go build -ldflags="$(LDFLAGS)" -trimpath -o $(BUILD_DIR)/$(BINARY_NAME)-windows-amd64.exe ./cmd/kizuna
 	@echo "==> Cross-compilation complete! Binaries located in $(BUILD_DIR)/"

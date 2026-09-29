@@ -13,6 +13,7 @@ import (
 	"io"
 	"net/http"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"runtime"
 	"strings"
@@ -300,6 +301,12 @@ func applyBinaryUpdate(targetPath string, newBinary []byte) error {
 			_ = os.Remove(tmpPath)
 			return err
 		}
+	}
+
+	// On macOS (darwin), re-apply ad-hoc codesign and clear quarantine to avoid AMFI SIGKILL
+	if runtime.GOOS == "darwin" {
+		_ = exec.Command("xattr", "-cr", targetPath).Run()
+		_ = exec.Command("codesign", "--force", "--deep", "-s", "-", targetPath).Run()
 	}
 
 	return nil

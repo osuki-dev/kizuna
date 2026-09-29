@@ -75,7 +75,7 @@ if [ -z "${VERSION}" ]; then
         VERSION="$(echo "${LATEST_JSON}" | grep -o '"tag_name": *"[^"]*"' | head -n1 | cut -d'"' -f4)"
     fi
     if [ -z "${VERSION}" ]; then
-        VERSION="v0.1.1"
+        VERSION="v0.2.0"
         warn "Could not fetch latest release from GitHub API, falling back to default ${VERSION}"
     fi
 fi
@@ -169,6 +169,17 @@ fi
 ${USE_SUDO} mkdir -p "$(dirname "${TARGET_PATH}")"
 ${USE_SUDO} cp -f "${SRC_BIN}" "${TARGET_PATH}"
 ${USE_SUDO} chmod +x "${TARGET_PATH}"
+
+# macOS Security & Code Signing Handling:
+# On Apple Silicon (darwin/arm64), binaries cross-compiled on Linux or downloaded from the internet
+# get killed with SIGKILL (Killed: 9) unless quarantine flags are cleared and an ad-hoc signature is applied.
+if [ "${OS}" = "darwin" ]; then
+    info "Configuring macOS security attributes and ad-hoc code signature..."
+    ${USE_SUDO} xattr -cr "${TARGET_PATH}" 2>/dev/null || true
+    if command -v codesign >/dev/null 2>&1; then
+        ${USE_SUDO} codesign --force --deep -s - "${TARGET_PATH}" 2>/dev/null || true
+    fi
+fi
 
 success "Successfully installed ${TARGET_PATH}"
 "${TARGET_PATH}" --version || true
