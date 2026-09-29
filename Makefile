@@ -6,7 +6,7 @@ VERSION ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo "v0.
 COMMIT ?= $(shell git rev-parse --short HEAD 2>/dev/null || echo "unknown")
 BUILD_TIME ?= $(shell date -u '+%Y-%m-%dT%H:%M:%SZ')
 
-LDFLAGS := -s -w \
+LDFLAGS := -s -w -buildid= \
 	-X 'main.version=$(VERSION)' \
 	-X 'main.commit=$(COMMIT)' \
 	-X 'main.buildTime=$(BUILD_TIME)'
@@ -19,7 +19,7 @@ all: lint test build
 build:
 	@echo "==> Building $(BINARY_NAME) ($(VERSION))"
 	@mkdir -p $(BUILD_DIR)
-	go build -ldflags="$(LDFLAGS)" -trimpath -o $(BUILD_DIR)/$(BINARY_NAME) ./cmd/kizuna
+	CGO_ENABLED=0 go build -ldflags="$(LDFLAGS)" -trimpath -o $(BUILD_DIR)/$(BINARY_NAME) ./cmd/kizuna
 	@echo "==> Successfully built $(BUILD_DIR)/$(BINARY_NAME)"
 
 ## test: Run unit tests with race detection
