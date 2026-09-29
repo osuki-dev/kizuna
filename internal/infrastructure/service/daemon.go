@@ -89,8 +89,23 @@ func (m *Manager) Restart() error {
 	return m.svc.Start()
 }
 
+func (m *Manager) preInstallDirs() {
+	if m.config.UserService {
+		home, err := os.UserHomeDir()
+		if err == nil && home != "" {
+			switch runtime.GOOS {
+			case "darwin":
+				_ = os.MkdirAll(filepath.Join(home, "Library", "LaunchAgents"), 0755)
+			case "linux":
+				_ = os.MkdirAll(filepath.Join(home, ".config", "systemd", "user"), 0755)
+			}
+		}
+	}
+}
+
 // Install registers the service with the OS init system (systemd/launchd/windows service)
 func (m *Manager) Install() error {
+	m.preInstallDirs()
 	return m.svc.Install()
 }
 

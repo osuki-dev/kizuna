@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 
 	"github.com/osuki-dev/kizuna/internal/domain"
@@ -41,11 +42,15 @@ func (r *FileNodeRepository) GetNode(name string) (*entity.Node, error) {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 
-	node, ok := r.nodes[name]
-	if !ok {
-		return nil, fmt.Errorf("node '%s' not found", name)
+	if node, ok := r.nodes[name]; ok {
+		return node, nil
 	}
-	return node, nil
+	for _, n := range r.nodes {
+		if n.ID == name || strings.EqualFold(n.Name, name) || n.Host == name {
+			return n, nil
+		}
+	}
+	return nil, fmt.Errorf("node '%s' not found", name)
 }
 
 func (r *FileNodeRepository) SaveNode(node *entity.Node) error {
@@ -72,6 +77,11 @@ func (r *FileNodeRepository) DeleteNode(name string) error {
 	defer r.mu.Unlock()
 
 	delete(r.nodes, name)
+	for k, n := range r.nodes {
+		if n.ID == name || strings.EqualFold(n.Name, name) {
+			delete(r.nodes, k)
+		}
+	}
 	return r.saveLocked()
 }
 

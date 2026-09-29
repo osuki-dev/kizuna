@@ -3,9 +3,11 @@ package api_test
 import (
 	"bytes"
 	"encoding/json"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"testing"
+	"time"
 
 	"github.com/osuki-dev/kizuna/internal/adapter/api"
 	"github.com/osuki-dev/kizuna/internal/domain/entity"
@@ -90,5 +92,41 @@ func TestNodeMetaEndpoints(t *testing.T) {
 
 	if rrUnauthorized.Code != http.StatusUnauthorized {
 		t.Errorf("expected status 401 Unauthorized for revoked token, got %d", rrUnauthorized.Code)
+	}
+}
+
+func TestServeConnLifecycle(t *testing.T) {
+	tempDir := t.TempDir()
+	t.Setenv("HOME", tempDir)
+
+	authStore, err := auth.NewAuthStore(tempDir)
+	if err != nil {
+		t.Fatalf("failed to create auth store: %v", err)
+	}
+
+	srv := api.NewServer(authStore, nil, nil, nil, "node_test_1", "test-node")
+
+	clientConn, serverConn := net.Pipe()
+
+	done := make(chan struct{})
+	go func() {
+		srv.ServeConn(serverConn)
+		close(done)
+	}()
+
+	// Send an HTTP request from client side
+	reqText := "GET /api/v1/node/members HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n"
+	go func() {
+		_, _ = clientConn.Write([]byte(reqText))
+		buf := make([]byte, 1024)
+		_, _ = clientConn.Read(buf)
+		_ = clientConn.Close()
+	}()
+
+	select {
+	case <-done:
+		// Succeeded: ServeConn cleanly returned upon connection close!
+	case <-time.After(2 * time.Second):
+		t.Fatal("ServeConn deadlocked or leaked: did not exit after client connection was closed")
 	}
 }

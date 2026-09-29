@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 	"time"
@@ -235,13 +236,17 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 		Name:        s.nodeName,
 		IsOnline:    true,
 		LastSeen:    time.Now(),
-		OS:          "linux",
-		Arch:        "amd64",
+		OS:          runtime.GOOS,
+		Arch:        runtime.GOARCH,
 	}
 
 	if metrics != nil {
-		node.OS = metrics.OS
-		node.Arch = metrics.Arch
+		if metrics.OS != "" {
+			node.OS = metrics.OS
+		}
+		if metrics.Arch != "" {
+			node.Arch = metrics.Arch
+		}
 		node.CPUUsage = metrics.CPUUsage
 		node.MemoryUsage = metrics.MemoryUsage
 		node.DiskUsage = metrics.DiskUsage
@@ -258,6 +263,9 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 	node.Tags = s.meta.Tags
 	node.Host = s.meta.Host
 	node.IP = s.meta.IP
+	if node.Host == "" {
+		node.Host = s.nodeName
+	}
 	if s.gossip != nil {
 		node.GossipState = entity.GossipStateAlive
 		st := s.gossip.GetStatus()
@@ -397,18 +405,43 @@ func (s *Server) handleRevoke(w http.ResponseWriter, r *http.Request) {
 	_ = json.NewEncoder(w).Encode(map[string]any{"success": true})
 }
 
+// trackingConn calls onClose when the connection is closed
+type trackingConn struct {
+	net.Conn
+	closeOnce sync.Once
+	onClose   func()
+}
+
+func (c *trackingConn) Close() error {
+	var err error
+	c.closeOnce.Do(func() {
+		if c.onClose != nil {
+			c.onClose()
+		}
+		err = c.Conn.Close()
+	})
+	return err
+}
+
 // singleConnListener allows serving an http.Server over a single net.Conn
 type singleConnListener struct {
 	conn      net.Conn
 	done      bool
 	closeChan chan struct{}
+	closeOnce sync.Once
 }
 
 func newSingleConnListener(conn net.Conn) *singleConnListener {
-	return &singleConnListener{
-		conn:      conn,
+	l := &singleConnListener{
 		closeChan: make(chan struct{}),
 	}
+	l.conn = &trackingConn{
+		Conn: conn,
+		onClose: func() {
+			_ = l.Close()
+		},
+	}
+	return l
 }
 
 func (l *singleConnListener) Accept() (net.Conn, error) {
@@ -421,11 +454,9 @@ func (l *singleConnListener) Accept() (net.Conn, error) {
 }
 
 func (l *singleConnListener) Close() error {
-	select {
-	case <-l.closeChan:
-	default:
+	l.closeOnce.Do(func() {
 		close(l.closeChan)
-	}
+	})
 	return nil
 }
 

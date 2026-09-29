@@ -101,15 +101,20 @@ func (s *MeshStrategy) resolveNode(target *entity.TargetHost) (*entity.Node, err
 		if node, err := s.nodeRepo.GetNode(target.Host); err == nil {
 			return node, nil
 		}
-		// Fallback to first paired node if any
 		if nodes, err := s.nodeRepo.ListNodes(); err == nil && len(nodes) > 0 {
 			for _, n := range nodes {
-				if n.Name == target.Host || n.Addr == target.Host {
+				if n.Name == target.Host || n.Addr == target.Host || n.ID == target.Host {
 					return n, nil
 				}
 			}
-			return nodes[0], nil
+			if target.Host == "" || target.Host == "default" {
+				return nodes[0], nil
+			}
 		}
+	}
+
+	if target.Host == "" || target.Host == "default" {
+		return nil, fmt.Errorf("no mesh nodes available")
 	}
 
 	// Ad-hoc node

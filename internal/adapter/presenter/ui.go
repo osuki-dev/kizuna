@@ -240,10 +240,14 @@ func (u *UI) RenderNodeTable(nodes []*entity.Node) string {
 		}
 
 		hostStr := u.MutedStyle.Render("-")
-		if n.Host != "" {
+		if n.Host != "" && n.IP != "" && n.Host != n.IP {
+			hostStr = fmt.Sprintf("%s (%s)", n.Host, n.IP)
+		} else if n.Host != "" {
 			hostStr = n.Host
 		} else if n.IP != "" {
 			hostStr = n.IP
+		} else if n.Addr != "" {
+			hostStr = n.Addr
 		}
 
 		statusBadge := u.GossipPill(n.GossipState, n.IsOnline)

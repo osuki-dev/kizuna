@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"math/rand"
+	"net"
 	"os"
 	"runtime"
 	"sync"
@@ -55,6 +56,27 @@ type Engine struct {
 	}
 }
 
+// DetectOutboundIP determines the preferred local outbound IP for gossip/metadata
+func DetectOutboundIP() string {
+	conn, err := net.Dial("udp", "8.8.8.8:80")
+	if err != nil {
+		if addrs, err := net.InterfaceAddrs(); err == nil {
+			for _, addr := range addrs {
+				if ipNet, ok := addr.(*net.IPNet); ok && !ipNet.IP.IsLoopback() && ipNet.IP.To4() != nil {
+					return ipNet.IP.String()
+				}
+			}
+		}
+		return ""
+	}
+	defer func() { _ = conn.Close() }()
+	localAddr, ok := conn.LocalAddr().(*net.UDPAddr)
+	if !ok || localAddr.IP == nil {
+		return ""
+	}
+	return localAddr.IP.String()
+}
+
 // NewEngine creates and initializes a new Gossip Engine
 func NewEngine(cfg Config) *Engine {
 	if cfg.Interval <= 0 {
@@ -74,6 +96,12 @@ func NewEngine(cfg Config) *Engine {
 	}
 	if cfg.NodeID == "" {
 		cfg.NodeID = "node_" + cfg.NodeName
+	}
+	if cfg.Host == "" {
+		cfg.Host = cfg.NodeName
+	}
+	if cfg.IP == "" {
+		cfg.IP = DetectOutboundIP()
 	}
 
 	self := &entity.Node{
@@ -493,6 +521,11 @@ func (e *Engine) handleIndirectPing(msg *entity.GossipMessage) (*entity.GossipMe
 
 	e.mu.RLock()
 	target, exists := e.members[targetID]
+	if !exists {
+		if id, ok := e.nameToID[targetID]; ok {
+			target, exists = e.members[id]
+		}
+	}
 	var targetCopy *entity.Node
 	if exists {
 		targetCopy = e.cloneNode(target)
@@ -516,7 +549,7 @@ func (e *Engine) handleIndirectPing(msg *entity.GossipMessage) (*entity.GossipMe
 	}
 
 	// Ping target on behalf of sender
-	ctx, cancel := context.WithTimeout(context.Background(), 1200*time.Millisecond)
+	ctx, cancel := context.WithTimeout(context.Background(), 4500*time.Millisecond)
 	defer cancel()
 
 	pingMsg := &entity.GossipMessage{
@@ -657,6 +690,14 @@ func (e *Engine) registerOrTouchSenderLocked(msg *entity.GossipMessage) {
 
 	sender, exists := e.members[msg.SenderID]
 	if !exists {
+		if oldID, ok := e.nameToID[msg.SenderName]; ok && oldID != msg.SenderID {
+			delete(e.members, oldID)
+			delete(e.failCount, oldID)
+			if t, ok := e.suspectTimers[oldID]; ok {
+				t.Stop()
+				delete(e.suspectTimers, oldID)
+			}
+		}
 		sender = &entity.Node{
 			ID:          msg.SenderID,
 			Name:        msg.SenderName,
@@ -731,6 +772,14 @@ func (e *Engine) applyUpdateLocked(u *entity.GossipUpdate) {
 	existing, exists := e.members[u.Node.ID]
 	if !exists {
 		// Newly discovered peer via gossip!
+		if oldID, ok := e.nameToID[u.Node.Name]; ok && oldID != u.Node.ID {
+			delete(e.members, oldID)
+			delete(e.failCount, oldID)
+			if t, ok := e.suspectTimers[oldID]; ok {
+				t.Stop()
+				delete(e.suspectTimers, oldID)
+			}
+		}
 		newNode := e.cloneNode(u.Node)
 		newNode.GossipState = u.State
 		newNode.Incarnation = u.Incarnation
@@ -1013,8 +1062,20 @@ func (e *Engine) runAntiEntropyLoop() {
 		case <-e.ctx.Done():
 			return
 		case <-ticker.C:
+			e.cleanupTombstones()
 			e.reloadFromRepo()
 			e.performAntiEntropySync()
+		}
+	}
+}
+
+func (e *Engine) cleanupTombstones() {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	now := time.Now()
+	for k, t := range e.tombstones {
+		if now.Sub(t) > 24*time.Hour {
+			delete(e.tombstones, k)
 		}
 	}
 }
@@ -1116,7 +1177,7 @@ func (e *Engine) performAntiEntropySync() {
 	}
 	e.mu.RUnlock()
 
-	ctx, cancel := context.WithTimeout(e.ctx, 2500*time.Millisecond)
+	ctx, cancel := context.WithTimeout(e.ctx, 5000*time.Millisecond)
 	resp, err := e.transport.SendMessage(ctx, peer.Addr, 19800, req)
 	cancel()
 
@@ -1172,7 +1233,7 @@ func (e *Engine) selectRandomPeer() *entity.Node {
 
 	var candidates []*entity.Node
 	for _, m := range e.members {
-		if m.ID != e.self.ID && m.Addr != "" && m.GossipState != entity.GossipStateDead {
+		if m.ID != e.self.ID && (e.self.Name == "" || m.Name != e.self.Name) && m.Addr != "" && m.GossipState != entity.GossipStateDead {
 			if _, dead := e.tombstones[m.ID]; dead {
 				continue
 			}
@@ -1196,7 +1257,7 @@ func (e *Engine) selectRandomPeerExcluding(excludeID string) *entity.Node {
 
 	var candidates []*entity.Node
 	for _, m := range e.members {
-		if m.ID != e.self.ID && m.ID != excludeID && m.Addr != "" && m.GossipState == entity.GossipStateAlive {
+		if m.ID != e.self.ID && (e.self.Name == "" || m.Name != e.self.Name) && m.ID != excludeID && m.Addr != "" && m.GossipState == entity.GossipStateAlive {
 			if _, dead := e.tombstones[m.ID]; dead {
 				continue
 			}

@@ -75,7 +75,7 @@ if [ -z "${VERSION}" ]; then
         VERSION="$(echo "${LATEST_JSON}" | grep -o '"tag_name": *"[^"]*"' | head -n1 | cut -d'"' -f4)"
     fi
     if [ -z "${VERSION}" ]; then
-        VERSION="v0.2.1"
+        VERSION="v0.2.2"
         warn "Could not fetch latest release from GitHub API, falling back to default ${VERSION}"
     fi
 fi

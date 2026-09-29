@@ -100,25 +100,36 @@ func (m *TailcatMesh) Listen(ctx context.Context, port uint16, handler func(net.
 				return handler
 			}
 			if p == 22 {
-				// 1. Check if local OpenSSH daemon is reachable
-				localConn, err := net.DialTimeout("tcp", "127.0.0.1:22", 150*time.Millisecond)
-				if err == nil {
-					_ = localConn.Close()
-					return func(c net.Conn) {
-						defer func() { _ = c.Close() }()
-						target, err := net.Dial("tcp", "127.0.0.1:22")
-						if err != nil {
-							return
-						}
-						defer func() { _ = target.Close() }()
-						go func() { _, _ = io.Copy(target, c) }()
-						_, _ = io.Copy(c, target)
-					}
-				}
-				// 2. Fallback to embedded tailcat SSH server (zero external dependency)
-				return s.SSHConnHandler(tailcat.SSHOptions{
+				fallbackSSH := s.SSHConnHandler(tailcat.SSHOptions{
 					Shell: true,
 				})
+				return func(c net.Conn) {
+					// 1. Check if local OpenSSH daemon is reachable dynamically
+					target, err := net.DialTimeout("tcp", "127.0.0.1:22", 200*time.Millisecond)
+					if err == nil {
+						defer func() { _ = c.Close() }()
+						defer func() { _ = target.Close() }()
+						errCh := make(chan struct{}, 2)
+						go func() {
+							_, _ = io.Copy(target, c)
+							if cw, ok := target.(interface{ CloseWrite() error }); ok {
+								_ = cw.CloseWrite()
+							}
+							errCh <- struct{}{}
+						}()
+						go func() {
+							_, _ = io.Copy(c, target)
+							if cw, ok := c.(interface{ CloseWrite() error }); ok {
+								_ = cw.CloseWrite()
+							}
+							errCh <- struct{}{}
+						}()
+						<-errCh
+						return
+					}
+					// 2. Fallback to embedded tailcat SSH server (zero external dependency)
+					fallbackSSH(c)
+				}
 			}
 			return nil
 		},

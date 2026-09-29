@@ -516,6 +516,8 @@ func runServer() error {
 		NodeID:    nodeID,
 		NodeName:  nodeName,
 		MeshAddr:  addr,
+		Host:      nodeName,
+		IP:        gossip.DetectOutboundIP(),
 		Transport: gossipTransport,
 		Repo:      nodeRepo,
 		Seeds:     seeds,
@@ -637,19 +639,32 @@ func newNodeCmd() *cobra.Command {
 			if err != nil {
 				return err
 			}
+			node, _ := resolveNode(nodeName)
+			realName := nodeName
+			id := nodeName
+			if node != nil {
+				if node.Name != "" {
+					realName = node.Name
+				}
+				if node.ID != "" {
+					id = node.ID
+				}
+				_ = repo.DeleteNode(node.Name)
+				_ = repo.DeleteNode(node.ID)
+			}
 			_ = repo.DeleteNode(nodeName)
 
 			// Notify running daemon to drop from memory & active gossip
 			clientHTTP := &http.Client{Timeout: 1500 * time.Millisecond}
-			reqBody, _ := json.Marshal(map[string]string{"name": nodeName})
+			reqBody, _ := json.Marshal(map[string]string{"name": realName, "id": id})
 			if resp, err := clientHTTP.Post("http://127.0.0.1:19800/api/v1/node/remove", "application/json", bytes.NewReader(reqBody)); err == nil {
 				_ = resp.Body.Close()
 			}
 
 			if flagJSON {
-				return presenter.PrintJSON(os.Stdout, map[string]any{"success": true, "removed": nodeName})
+				return presenter.PrintJSON(os.Stdout, map[string]any{"success": true, "removed": realName})
 			}
-			fmt.Printf("✓ Removed node '%s'\n", nodeName)
+			fmt.Printf("✓ Removed node '%s'\n", realName)
 			return nil
 		},
 	}
@@ -664,7 +679,7 @@ func newNodeCmd() *cobra.Command {
 			if err != nil {
 				return err
 			}
-			node, err := repo.GetNode(nodeName)
+			node, err := resolveNode(nodeName)
 			if err != nil {
 				return fmt.Errorf("node '%s' not found: %w", nodeName, err)
 			}
@@ -746,6 +761,14 @@ func newNodeCmd() *cobra.Command {
 				return fmt.Errorf("failed to save node locally: %w", err)
 			}
 
+			// Notify running daemon if active
+			clientHTTP := &http.Client{Timeout: 1200 * time.Millisecond}
+			if reqBody, err := json.Marshal(node); err == nil {
+				if resp, err := clientHTTP.Post("http://127.0.0.1:19800/api/v1/node/add", "application/json", bytes.NewReader(reqBody)); err == nil {
+					_ = resp.Body.Close()
+				}
+			}
+
 			// 2. Sync to remote node via Mesh
 			meshGw := mesh.NewMeshGateway()
 			defer func() { _ = meshGw.Close() }()
@@ -793,7 +816,7 @@ func newNodeCmd() *cobra.Command {
 			if err != nil {
 				return err
 			}
-			node, err := repo.GetNode(nodeName)
+			node, err := resolveNode(nodeName)
 			if err != nil {
 				return fmt.Errorf("node '%s' not found: %w", nodeName, err)
 			}
@@ -817,6 +840,14 @@ func newNodeCmd() *cobra.Command {
 
 			if err := repo.SaveNode(node); err != nil {
 				return fmt.Errorf("failed to save node locally: %w", err)
+			}
+
+			// Notify running daemon if active
+			clientHTTP := &http.Client{Timeout: 1200 * time.Millisecond}
+			if reqBody, err := json.Marshal(node); err == nil {
+				if resp, err := clientHTTP.Post("http://127.0.0.1:19800/api/v1/node/add", "application/json", bytes.NewReader(reqBody)); err == nil {
+					_ = resp.Body.Close()
+				}
 			}
 
 			// Sync to remote
@@ -873,7 +904,7 @@ func newNodeCmd() *cobra.Command {
 			if err != nil {
 				return err
 			}
-			node, err := repo.GetNode(nodeName)
+			node, err := resolveNode(nodeName)
 			if err != nil {
 				return fmt.Errorf("node '%s' not found: %w", nodeName, err)
 			}
@@ -895,21 +926,21 @@ func newNodeCmd() *cobra.Command {
 			_ = cli.RevokeClient(ctx, node, node.Name)
 
 			// 3. Remove from repository
-			if err := repo.DeleteNode(nodeName); err != nil {
-				return fmt.Errorf("failed to delete node from repository: %w", err)
-			}
+			_ = repo.DeleteNode(node.Name)
+			_ = repo.DeleteNode(node.ID)
+			_ = repo.DeleteNode(nodeName)
 
 			// 4. Notify local daemon to remove from memory and active gossip
 			clientHTTP := &http.Client{Timeout: 1500 * time.Millisecond}
-			reqBody, _ := json.Marshal(map[string]string{"name": nodeName, "id": node.ID})
+			reqBody, _ := json.Marshal(map[string]string{"name": node.Name, "id": node.ID})
 			if resp, err := clientHTTP.Post("http://127.0.0.1:19800/api/v1/node/remove", "application/json", bytes.NewReader(reqBody)); err == nil {
 				_ = resp.Body.Close()
 			}
 
 			if flagJSON {
-				return presenter.PrintJSON(os.Stdout, map[string]any{"success": true, "kicked": nodeName})
+				return presenter.PrintJSON(os.Stdout, map[string]any{"success": true, "kicked": node.Name})
 			}
-			fmt.Printf("✓ Kicked node '%s': token revoked and node removed from local mesh registry.\n", nodeName)
+			fmt.Printf("✓ Kicked node '%s': token revoked and node removed from local mesh registry.\n", node.Name)
 			return nil
 		},
 	}
@@ -945,11 +976,7 @@ Examples:
 				nodeName = parts[1]
 			}
 
-			repo, err := config.NewNodeRepository("")
-			if err != nil {
-				return err
-			}
-			node, err := repo.GetNode(nodeName)
+			node, err := resolveNode(nodeName)
 			if err != nil {
 				return fmt.Errorf("node '%s' not found: %w", nodeName, err)
 			}
@@ -1008,11 +1035,7 @@ Examples:
 				_, _ = fmt.Sscanf(args[1], "%d", &port)
 			}
 
-			repo, err := config.NewNodeRepository("")
-			if err != nil {
-				return err
-			}
-			node, err := repo.GetNode(nodeName)
+			node, err := resolveNode(nodeName)
 			if err != nil {
 				return fmt.Errorf("node '%s' not found: %w", nodeName, err)
 			}
@@ -1072,6 +1095,35 @@ func parseTags(args []string) []string {
 		}
 	}
 	return result
+}
+
+func resolveNode(nameOrID string) (*entity.Node, error) {
+	if nameOrID == "" {
+		return nil, fmt.Errorf("node name or ID is required")
+	}
+	repo, err := config.NewNodeRepository("")
+	if err == nil {
+		if node, err := repo.GetNode(nameOrID); err == nil {
+			return node, nil
+		}
+	}
+
+	// Fallback to querying running local daemon members
+	clientHTTP := &http.Client{Timeout: 1200 * time.Millisecond}
+	resp, httpErr := clientHTTP.Get("http://127.0.0.1:19800/api/v1/node/members")
+	if httpErr == nil && resp.StatusCode == http.StatusOK {
+		defer func() { _ = resp.Body.Close() }()
+		var gm []*entity.Node
+		if json.NewDecoder(resp.Body).Decode(&gm) == nil {
+			for _, n := range gm {
+				if n != nil && (n.ID == nameOrID || strings.EqualFold(n.Name, nameOrID) || n.Host == nameOrID) {
+					return n, nil
+				}
+			}
+		}
+	}
+
+	return nil, fmt.Errorf("node '%s' not found", nameOrID)
 }
 
 func listNodes() error {
@@ -1763,18 +1815,18 @@ func newTunnelCmd() *cobra.Command {
 				localPort = remotePort
 			}
 
-			repo, err := config.NewNodeRepository("")
-			if err != nil {
-				return err
-			}
 			var targetNode *entity.Node
 			if targetNodeName != "" {
-				targetNode, err = repo.GetNode(targetNodeName)
+				targetNode, err = resolveNode(targetNodeName)
 				if err != nil {
 					return err
 				}
 			} else {
-				nodes, _ := repo.ListNodes()
+				repo, _ := config.NewNodeRepository("")
+				var nodes []*entity.Node
+				if repo != nil {
+					nodes, _ = repo.ListNodes()
+				}
 				if len(nodes) > 0 {
 					targetNode = nodes[0]
 				} else {
@@ -1813,8 +1865,22 @@ func newTunnelCmd() *cobra.Command {
 					}
 					defer func() { _ = remoteConn.Close() }()
 
-					go func() { _, _ = io.Copy(remoteConn, c) }()
-					_, _ = io.Copy(c, remoteConn)
+					errCh := make(chan struct{}, 2)
+					go func() {
+						_, _ = io.Copy(remoteConn, c)
+						if cw, ok := remoteConn.(interface{ CloseWrite() error }); ok {
+							_ = cw.CloseWrite()
+						}
+						errCh <- struct{}{}
+					}()
+					go func() {
+						_, _ = io.Copy(c, remoteConn)
+						if cw, ok := c.(interface{ CloseWrite() error }); ok {
+							_ = cw.CloseWrite()
+						}
+						errCh <- struct{}{}
+					}()
+					<-errCh
 				}(localConn)
 			}
 		},
