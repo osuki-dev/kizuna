@@ -59,10 +59,10 @@ func NewEngine(cfg Config) *Engine {
 		cfg.Interval = 2 * time.Second
 	}
 	if cfg.SuspectTimeout <= 0 {
-		cfg.SuspectTimeout = 5 * time.Second
+		cfg.SuspectTimeout = 10 * time.Second
 	}
 	if cfg.SyncInterval <= 0 {
-		cfg.SyncInterval = 20 * time.Second
+		cfg.SyncInterval = 15 * time.Second
 	}
 	if cfg.NodeName == "" {
 		cfg.NodeName, _ = os.Hostname()
@@ -782,7 +782,7 @@ func (e *Engine) performGossipRound() {
 	e.mu.Unlock()
 
 	start := time.Now()
-	ctx, cancel := context.WithTimeout(e.ctx, 1200*time.Millisecond)
+	ctx, cancel := context.WithTimeout(e.ctx, 3500*time.Millisecond)
 	reply, err := e.transport.SendMessage(ctx, peer.Addr, 19800, pingMsg)
 	cancel()
 
@@ -811,7 +811,7 @@ func (e *Engine) performGossipRound() {
 	// Direct ping failed -> Try indirect ping via another peer
 	indirectHelper := e.selectRandomPeerExcluding(peer.ID)
 	if indirectHelper != nil {
-		indCtx, indCancel := context.WithTimeout(e.ctx, 1800*time.Millisecond)
+		indCtx, indCancel := context.WithTimeout(e.ctx, 4000*time.Millisecond)
 		indMsg := &entity.GossipMessage{
 			Type:        entity.GossipMsgIndirectPing,
 			SenderID:    e.self.ID,
@@ -867,7 +867,40 @@ func (e *Engine) runAntiEntropyLoop() {
 		case <-e.ctx.Done():
 			return
 		case <-ticker.C:
+			e.reloadFromRepo()
 			e.performAntiEntropySync()
+		}
+	}
+}
+
+func (e *Engine) reloadFromRepo() {
+	if e.repo == nil {
+		return
+	}
+	nodes, err := e.repo.ListNodes()
+	if err != nil {
+		return
+	}
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	for _, n := range nodes {
+		if n == nil || n.ID == e.self.ID || n.Name == e.self.Name {
+			continue
+		}
+		if existing, ok := e.members[n.ID]; ok {
+			if n.Addr != "" && existing.Addr != n.Addr {
+				existing.Addr = n.Addr
+			}
+			if len(n.Tags) > 0 {
+				existing.Tags = n.Tags
+			}
+		} else {
+			nCopy := *n
+			if nCopy.GossipState == "" {
+				nCopy.GossipState = entity.GossipStateAlive
+			}
+			e.members[nCopy.ID] = &nCopy
+			e.nameToID[nCopy.Name] = nCopy.ID
 		}
 	}
 }

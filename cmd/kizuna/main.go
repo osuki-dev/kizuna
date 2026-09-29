@@ -891,7 +891,147 @@ func newNodeCmd() *cobra.Command {
 		},
 	}
 
-	nodeCmd.AddCommand(addCmd, listCmd, rmCmd, tagCmd, setCmd, kickCmd)
+	var sshUser string
+	var sshPort uint16
+
+	sshCmd := &cobra.Command{
+		Use:   "ssh <[user@]node-name> [flags] [-- <ssh-arguments...>]",
+		Short: "Connect to a mesh node via encrypted SSH tunnel",
+		Long: `Connect directly to a mesh node using OpenSSH through the encrypted WireGuard mesh tunnel.
+Traverses NAT, firewalls, and works without open public ports.
+
+Examples:
+  kizuna node ssh worker-1
+  kizuna node ssh root@worker-1
+  kizuna node ssh worker-1 -u root
+  kizuna node ssh worker-1 -- uptime
+  kizuna node ssh worker-1 -- -L 8080:localhost:8080`,
+		Args: cobra.MinimumNArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			rawTarget := args[0]
+			var extraArgs []string
+			if len(args) > 1 {
+				extraArgs = args[1:]
+			}
+
+			user := sshUser
+			nodeName := rawTarget
+			if strings.Contains(rawTarget, "@") {
+				parts := strings.SplitN(rawTarget, "@", 2)
+				user = parts[0]
+				nodeName = parts[1]
+			}
+
+			repo, err := config.NewNodeRepository("")
+			if err != nil {
+				return err
+			}
+			node, err := repo.GetNode(nodeName)
+			if err != nil {
+				return fmt.Errorf("node '%s' not found: %w", nodeName, err)
+			}
+
+			sshBin, err := exec.LookPath("ssh")
+			if err != nil {
+				return fmt.Errorf("ssh binary not found in PATH: please install openssh-client or use 'kizuna tunnel %d -n %s'", sshPort, nodeName)
+			}
+
+			exePath, err := os.Executable()
+			if err != nil || exePath == "" {
+				exePath = "kizuna"
+			}
+
+			// Build proxy command that tunnels stdio to the remote mesh port
+			proxyCmdStr := fmt.Sprintf("%q node proxy %s %d", exePath, node.Name, sshPort)
+
+			sshArgs := []string{
+				"-o", "ProxyCommand=" + proxyCmdStr,
+				"-o", "StrictHostKeyChecking=accept-new",
+			}
+
+			target := node.Name
+			if user != "" {
+				target = fmt.Sprintf("%s@%s", user, node.Name)
+			}
+			sshArgs = append(sshArgs, target)
+			sshArgs = append(sshArgs, extraArgs...)
+
+			c := exec.Command(sshBin, sshArgs...)
+			c.Stdin = os.Stdin
+			c.Stdout = os.Stdout
+			c.Stderr = os.Stderr
+
+			if err := c.Run(); err != nil {
+				if exitErr, ok := err.(*exec.ExitError); ok {
+					os.Exit(exitErr.ExitCode())
+				}
+				return err
+			}
+			return nil
+		},
+	}
+	sshCmd.Flags().StringVarP(&sshUser, "user", "u", "", "SSH remote username")
+	sshCmd.Flags().Uint16VarP(&sshPort, "port", "p", 22, "SSH remote port (default 22)")
+
+	proxyCmd := &cobra.Command{
+		Use:    "proxy <node-name> [port]",
+		Short:  "Pipe stdin/stdout directly to a remote mesh node port (for SSH ProxyCommand)",
+		Hidden: true,
+		Args:   cobra.RangeArgs(1, 2),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			nodeName := args[0]
+			var port uint16 = 22
+			if len(args) > 1 {
+				_, _ = fmt.Sscanf(args[1], "%d", &port)
+			}
+
+			repo, err := config.NewNodeRepository("")
+			if err != nil {
+				return err
+			}
+			node, err := repo.GetNode(nodeName)
+			if err != nil {
+				return fmt.Errorf("node '%s' not found: %w", nodeName, err)
+			}
+
+			meshGw := mesh.NewMeshGateway()
+			defer func() { _ = meshGw.Close() }()
+
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+
+			conn, err := meshGw.Dial(ctx, node.Addr, port)
+			if err != nil {
+				return fmt.Errorf("failed to dial node '%s' on port %d: %w", nodeName, port, err)
+			}
+			defer func() { _ = conn.Close() }()
+
+			errCh := make(chan error, 2)
+			go func() {
+				_, err := io.Copy(conn, os.Stdin)
+				if cw, ok := conn.(interface{ CloseWrite() error }); ok {
+					_ = cw.CloseWrite()
+				}
+				errCh <- err
+			}()
+			go func() {
+				_, err := io.Copy(os.Stdout, conn)
+				errCh <- err
+			}()
+
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			case err := <-errCh:
+				if err == io.EOF {
+					return nil
+				}
+				return err
+			}
+		},
+	}
+
+	nodeCmd.AddCommand(addCmd, listCmd, rmCmd, tagCmd, setCmd, kickCmd, sshCmd, proxyCmd)
 	return nodeCmd
 }
 
