@@ -221,3 +221,62 @@ func (c *MeshClient) TriggerBackup(ctx context.Context, node *entity.Node, servi
 	}
 	return &record, nil
 }
+
+// UpdateNodeMeta updates remote node's metadata (tags, host, ip)
+func (c *MeshClient) UpdateNodeMeta(ctx context.Context, node *entity.Node, meta entity.NodeMetaUpdate) error {
+	client := c.getHTTPClient(ctx, node.Addr, 19800)
+
+	bodyBytes, err := json.Marshal(meta)
+	if err != nil {
+		return err
+	}
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, "http://node/api/v1/node/meta", bytes.NewReader(bodyBytes))
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer "+node.AuthToken)
+
+	resp, err := client.Do(req)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	if resp.StatusCode != http.StatusOK {
+		respBody, _ := io.ReadAll(resp.Body)
+		return fmt.Errorf("remote update failed (status %d): %s", resp.StatusCode, strings.TrimSpace(string(respBody)))
+	}
+	return nil
+}
+
+// RevokeClient requests the remote node to revoke a client's access
+func (c *MeshClient) RevokeClient(ctx context.Context, node *entity.Node, nameOrID string) error {
+	client := c.getHTTPClient(ctx, node.Addr, 19800)
+
+	payload := map[string]string{"name_or_id": nameOrID}
+	bodyBytes, err := json.Marshal(payload)
+	if err != nil {
+		return err
+	}
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, "http://node/api/v1/auth/revoke", bytes.NewReader(bodyBytes))
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer "+node.AuthToken)
+
+	resp, err := client.Do(req)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	if resp.StatusCode != http.StatusOK {
+		respBody, _ := io.ReadAll(resp.Body)
+		return fmt.Errorf("revocation failed (status %d): %s", resp.StatusCode, strings.TrimSpace(string(respBody)))
+	}
+	return nil
+}

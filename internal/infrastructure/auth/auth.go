@@ -65,7 +65,7 @@ func (s *Store) GetActivePIN() (string, bool) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
-	if time.Now().After(s.pinExpiresAt) {
+	if time.Now().After(s.pinExpiresAt) || s.activePIN == "" {
 		return "", false
 	}
 	return s.activePIN, true
@@ -112,6 +112,42 @@ func (s *Store) ValidateToken(token string) bool {
 
 	_, exists := s.clients[token]
 	return exists
+}
+
+// RevokeClient revokes all tokens belonging to a client by ID or Name
+func (s *Store) RevokeClient(nameOrID string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	var tokensToDelete []string
+	for token, c := range s.clients {
+		if c.Name == nameOrID || c.ID == nameOrID {
+			tokensToDelete = append(tokensToDelete, token)
+		}
+	}
+
+	if len(tokensToDelete) == 0 {
+		return fmt.Errorf("no authorized client found matching '%s'", nameOrID)
+	}
+
+	for _, token := range tokensToDelete {
+		delete(s.clients, token)
+	}
+
+	return s.saveLocked()
+}
+
+// RevokeToken revokes a specific token
+func (s *Store) RevokeToken(token string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if _, exists := s.clients[token]; !exists {
+		return fmt.Errorf("token not found")
+	}
+
+	delete(s.clients, token)
+	return s.saveLocked()
 }
 
 func (s *Store) load() error {

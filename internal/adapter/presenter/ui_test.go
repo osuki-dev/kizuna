@@ -39,6 +39,8 @@ func TestRenderTables(t *testing.T) {
 			IsOnline: true,
 			OS:       "linux",
 			Arch:     "amd64",
+			Tags:     []string{"home", "prod"},
+			Host:     "10.0.0.2",
 			LastSeen: time.Now(),
 		},
 	}
@@ -46,6 +48,12 @@ func TestRenderTables(t *testing.T) {
 	tbl := ui.RenderNodeTable(nodes)
 	if !strings.Contains(tbl, "home-server") {
 		t.Errorf("expected node table to contain home-server")
+	}
+	if !strings.Contains(tbl, "home, prod") {
+		t.Errorf("expected node table to contain tags 'home, prod'")
+	}
+	if !strings.Contains(tbl, "10.0.0.2") {
+		t.Errorf("expected node table to contain host '10.0.0.2'")
 	}
 
 	services := []*entity.Service{

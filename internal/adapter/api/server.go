@@ -6,7 +6,10 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"os"
+	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/osuki-dev/kizuna/internal/domain"
@@ -22,6 +25,9 @@ type Server struct {
 	backup   domain.BackupManager
 	nodeID   string
 	nodeName string
+	mu       sync.RWMutex
+	metaPath string
+	meta     entity.NodeMetaUpdate
 }
 
 // NewServer initializes the Agent API HTTP Server
@@ -32,14 +38,36 @@ func NewServer(
 	backup domain.BackupManager,
 	nodeID, nodeName string,
 ) *Server {
-	return &Server{
+	home, _ := os.UserHomeDir()
+	configDir := filepath.Join(home, ".kizuna")
+	_ = os.MkdirAll(configDir, 0700)
+	metaPath := filepath.Join(configDir, "node_meta.json")
+
+	s := &Server{
 		auth:     auth,
 		workload: workload,
 		ingress:  ingress,
 		backup:   backup,
 		nodeID:   nodeID,
 		nodeName: nodeName,
+		metaPath: metaPath,
 	}
+	s.loadMeta()
+	return s
+}
+
+func (s *Server) loadMeta() {
+	if data, err := os.ReadFile(s.metaPath); err == nil {
+		_ = json.Unmarshal(data, &s.meta)
+	}
+}
+
+func (s *Server) saveMetaLocked() error {
+	data, err := json.MarshalIndent(s.meta, "", "  ")
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(s.metaPath, data, 0600)
 }
 
 // Handler returns the HTTP handler with all registered routes and auth middleware
@@ -55,6 +83,8 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("/api/v1/status", s.withAuth(s.handleStatus))
 	mux.HandleFunc("/api/v1/logs", s.withAuth(s.handleLogs))
 	mux.HandleFunc("/api/v1/backup", s.withAuth(s.handleBackup))
+	mux.HandleFunc("/api/v1/node/meta", s.withAuth(s.handleNodeMeta))
+	mux.HandleFunc("/api/v1/auth/revoke", s.withAuth(s.handleRevoke))
 
 	return mux
 }
@@ -200,6 +230,12 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 		node.Load1 = metrics.Load1
 	}
 
+	s.mu.RLock()
+	node.Tags = s.meta.Tags
+	node.Host = s.meta.Host
+	node.IP = s.meta.IP
+	s.mu.RUnlock()
+
 	resp := map[string]any{
 		"node":     node,
 		"services": services,
@@ -238,6 +274,90 @@ func (s *Server) handleBackup(w http.ResponseWriter, r *http.Request) {
 
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(record)
+}
+
+func (s *Server) handleNodeMeta(w http.ResponseWriter, r *http.Request) {
+	switch r.Method {
+	case http.MethodGet:
+		s.mu.RLock()
+		defer s.mu.RUnlock()
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"node_id":   s.nodeID,
+			"node_name": s.nodeName,
+			"tags":      s.meta.Tags,
+			"host":      s.meta.Host,
+			"ip":        s.meta.IP,
+		})
+	case http.MethodPost:
+		var update entity.NodeMetaUpdate
+		if err := json.NewDecoder(r.Body).Decode(&update); err != nil {
+			http.Error(w, "invalid request body", http.StatusBadRequest)
+			return
+		}
+
+		s.mu.Lock()
+		if update.Tags != nil {
+			s.meta.Tags = update.Tags
+		}
+		if update.Host != "" {
+			s.meta.Host = update.Host
+			if s.meta.IP == "" {
+				s.meta.IP = update.Host
+			}
+		}
+		if update.IP != "" {
+			s.meta.IP = update.IP
+			if s.meta.Host == "" {
+				s.meta.Host = update.IP
+			}
+		}
+		_ = s.saveMetaLocked()
+		currentMeta := s.meta
+		s.mu.Unlock()
+
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"success": true,
+			"meta":    currentMeta,
+		})
+	default:
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+	}
+}
+
+func (s *Server) handleRevoke(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	var req struct {
+		NameOrID string `json:"name_or_id"`
+		Token    string `json:"token"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "invalid request body", http.StatusBadRequest)
+		return
+	}
+
+	var err error
+	if req.Token != "" {
+		err = s.auth.RevokeToken(req.Token)
+	} else if req.NameOrID != "" {
+		err = s.auth.RevokeClient(req.NameOrID)
+	} else {
+		http.Error(w, "name_or_id or token is required", http.StatusBadRequest)
+		return
+	}
+
+	if err != nil {
+		http.Error(w, fmt.Sprintf("revoke failed: %v", err), http.StatusBadRequest)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(map[string]any{"success": true})
 }
 
 // singleConnListener allows serving an http.Server over a single net.Conn

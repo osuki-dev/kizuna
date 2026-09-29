@@ -200,6 +200,9 @@ type Node struct {
 	LastSeen    time.Time `json:"last_seen"`
 	OS          string    `json:"os"`
 	Arch        string    `json:"arch"`
+	Tags        []string  `json:"tags,omitempty" yaml:"tags,omitempty"`
+	Host        string    `json:"host,omitempty" yaml:"host,omitempty"` // Hostname, domain, or IP (e.g. mac-mini.local or 10.0.0.9)
+	IP          string    `json:"ip,omitempty" yaml:"ip,omitempty"`     // Legacy/convenience alias for Host
 	CPUUsage    float64   `json:"cpu_usage"`
 	MemoryUsage float64   `json:"memory_usage"`
 	DiskUsage   float64   `json:"disk_usage"`
@@ -211,6 +214,13 @@ type Node struct {
 	Uptime      uint64    `json:"uptime,omitempty"`
 	Load1       float64   `json:"load1,omitempty"`
 	LatencyMs   int64     `json:"latency_ms,omitempty"`
+}
+
+// NodeMetaUpdate represents a payload to update node metadata
+type NodeMetaUpdate struct {
+	Tags []string `json:"tags,omitempty"`
+	Host string   `json:"host,omitempty"`
+	IP   string   `json:"ip,omitempty"`
 }
 
 // PairingPayload represents pairing credentials

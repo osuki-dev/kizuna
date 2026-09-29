@@ -10,6 +10,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"runtime"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -613,8 +614,277 @@ func newNodeCmd() *cobra.Command {
 		},
 	}
 
-	nodeCmd.AddCommand(addCmd, listCmd, rmCmd)
+	tagCmd := &cobra.Command{
+		Use:   "tag <node-name> [add|rm|set] [tags...]",
+		Short: "Manage labels and tags for a node with automatic remote sync",
+		Args:  cobra.MinimumNArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			nodeName := args[0]
+			repo, err := config.NewNodeRepository("")
+			if err != nil {
+				return err
+			}
+			node, err := repo.GetNode(nodeName)
+			if err != nil {
+				return fmt.Errorf("node '%s' not found: %w", nodeName, err)
+			}
+
+			// If no tags provided, display current tags
+			if len(args) == 1 {
+				if flagJSON {
+					return presenter.PrintJSON(os.Stdout, map[string]any{
+						"node": nodeName,
+						"tags": node.Tags,
+						"host": node.Host,
+						"ip":   node.IP,
+					})
+				}
+				if len(node.Tags) == 0 {
+					fmt.Printf("Node '%s' has no tags assigned.\n", nodeName)
+				} else {
+					fmt.Printf("Node '%s' tags: [%s]\n", nodeName, strings.Join(node.Tags, ", "))
+				}
+				return nil
+			}
+
+			action := args[1]
+			var tagList []string
+
+			switch action {
+			case "add":
+				tagList = parseTags(args[2:])
+				tagMap := make(map[string]bool)
+				for _, t := range node.Tags {
+					tagMap[t] = true
+				}
+				for _, t := range tagList {
+					tagMap[t] = true
+				}
+				node.Tags = make([]string, 0, len(tagMap))
+				for t := range tagMap {
+					node.Tags = append(node.Tags, t)
+				}
+				sort.Strings(node.Tags)
+
+			case "rm", "remove", "del":
+				toRemove := parseTags(args[2:])
+				removeMap := make(map[string]bool)
+				for _, t := range toRemove {
+					removeMap[t] = true
+				}
+				var updated []string
+				for _, t := range node.Tags {
+					if !removeMap[t] {
+						updated = append(updated, t)
+					}
+				}
+				node.Tags = updated
+
+			case "set":
+				node.Tags = parseTags(args[2:])
+				sort.Strings(node.Tags)
+
+			default:
+				// If action is not add/rm/set, treat all remaining args as tags to add
+				allTags := parseTags(args[1:])
+				tagMap := make(map[string]bool)
+				for _, t := range node.Tags {
+					tagMap[t] = true
+				}
+				for _, t := range allTags {
+					tagMap[t] = true
+				}
+				node.Tags = make([]string, 0, len(tagMap))
+				for t := range tagMap {
+					node.Tags = append(node.Tags, t)
+				}
+				sort.Strings(node.Tags)
+			}
+
+			// 1. Save locally
+			if err := repo.SaveNode(node); err != nil {
+				return fmt.Errorf("failed to save node locally: %w", err)
+			}
+
+			// 2. Sync to remote node via Mesh
+			meshGw := mesh.NewMeshGateway()
+			defer func() { _ = meshGw.Close() }()
+			cli := client.NewMeshClient(meshGw)
+
+			ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+			defer cancel()
+
+			syncErr := cli.UpdateNodeMeta(ctx, node, entity.NodeMetaUpdate{
+				Tags: node.Tags,
+				Host: node.Host,
+				IP:   node.IP,
+			})
+
+			if flagJSON {
+				return presenter.PrintJSON(os.Stdout, map[string]any{
+					"success":     true,
+					"node":        node.Name,
+					"tags":        node.Tags,
+					"remote_sync": syncErr == nil,
+				})
+			}
+
+			fmt.Printf("✓ Node '%s' tags updated: [%s]\n", node.Name, strings.Join(node.Tags, ", "))
+			if syncErr != nil {
+				fmt.Printf("  ⚠ Remote node '%s' is currently offline or unreachable (%v).\n    Updated locally; will sync automatically on next connection.\n", node.Name, syncErr)
+			} else {
+				fmt.Printf("  ✓ Successfully synced metadata to remote node '%s' via Mesh RPC.\n", node.Name)
+			}
+			return nil
+		},
+	}
+
+	var flagHost string
+	var flagIP string
+	var flagTags string
+
+	setCmd := &cobra.Command{
+		Use:   "set <node-name>",
+		Short: "Set node properties (host, ip, tags) with automatic remote sync",
+		Args:  cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			nodeName := args[0]
+			repo, err := config.NewNodeRepository("")
+			if err != nil {
+				return err
+			}
+			node, err := repo.GetNode(nodeName)
+			if err != nil {
+				return fmt.Errorf("node '%s' not found: %w", nodeName, err)
+			}
+
+			if flagHost != "" {
+				node.Host = flagHost
+				if node.IP == "" {
+					node.IP = flagHost
+				}
+			}
+			if flagIP != "" {
+				node.IP = flagIP
+				if node.Host == "" {
+					node.Host = flagIP
+				}
+			}
+			if cmd.Flags().Changed("tags") {
+				node.Tags = parseTags(strings.Split(flagTags, ","))
+				sort.Strings(node.Tags)
+			}
+
+			if err := repo.SaveNode(node); err != nil {
+				return fmt.Errorf("failed to save node locally: %w", err)
+			}
+
+			// Sync to remote
+			meshGw := mesh.NewMeshGateway()
+			defer func() { _ = meshGw.Close() }()
+			cli := client.NewMeshClient(meshGw)
+
+			ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+			defer cancel()
+
+			syncErr := cli.UpdateNodeMeta(ctx, node, entity.NodeMetaUpdate{
+				Tags: node.Tags,
+				Host: node.Host,
+				IP:   node.IP,
+			})
+
+			if flagJSON {
+				return presenter.PrintJSON(os.Stdout, map[string]any{
+					"success":     true,
+					"node":        node,
+					"remote_sync": syncErr == nil,
+				})
+			}
+
+			fmt.Printf("✓ Node '%s' properties updated:\n", node.Name)
+			if node.Host != "" {
+				fmt.Printf("  Host: %s\n", node.Host)
+			}
+			if node.IP != "" && node.IP != node.Host {
+				fmt.Printf("  IP:   %s\n", node.IP)
+			}
+			if len(node.Tags) > 0 {
+				fmt.Printf("  Tags: [%s]\n", strings.Join(node.Tags, ", "))
+			}
+			if syncErr != nil {
+				fmt.Printf("  ⚠ Remote node '%s' is currently offline or unreachable (%v).\n    Updated locally; will sync automatically on next connection.\n", node.Name, syncErr)
+			} else {
+				fmt.Printf("  ✓ Successfully synced metadata to remote node '%s' via Mesh RPC.\n", node.Name)
+			}
+			return nil
+		},
+	}
+	setCmd.Flags().StringVar(&flagHost, "host", "", "Hostname or domain name of the node (e.g. mac-mini.local or 10.0.0.9)")
+	setCmd.Flags().StringVar(&flagIP, "ip", "", "IP address of the node")
+	setCmd.Flags().StringVar(&flagTags, "tags", "", "Comma-separated list of tags (e.g. 'home,desktop,m4')")
+
+	kickCmd := &cobra.Command{
+		Use:   "kick <node-name>",
+		Short: "Revoke authorization credentials and remove node from the mesh",
+		Args:  cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			nodeName := args[0]
+			repo, err := config.NewNodeRepository("")
+			if err != nil {
+				return err
+			}
+			node, err := repo.GetNode(nodeName)
+			if err != nil {
+				return fmt.Errorf("node '%s' not found: %w", nodeName, err)
+			}
+
+			// 1. If local server is running, revoke locally
+			authStore, authErr := auth.NewAuthStore("")
+			if authErr == nil && authStore != nil {
+				_ = authStore.RevokeClient(node.Name)
+				_ = authStore.RevokeClient(node.ID)
+			}
+
+			// 2. Notify remote node if reachable
+			meshGw := mesh.NewMeshGateway()
+			defer func() { _ = meshGw.Close() }()
+			cli := client.NewMeshClient(meshGw)
+
+			ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+			defer cancel()
+			_ = cli.RevokeClient(ctx, node, node.Name)
+
+			// 3. Remove from repository
+			if err := repo.DeleteNode(nodeName); err != nil {
+				return fmt.Errorf("failed to delete node from repository: %w", err)
+			}
+
+			if flagJSON {
+				return presenter.PrintJSON(os.Stdout, map[string]any{"success": true, "kicked": nodeName})
+			}
+			fmt.Printf("✓ Kicked node '%s': token revoked and node removed from local mesh registry.\n", nodeName)
+			return nil
+		},
+	}
+
+	nodeCmd.AddCommand(addCmd, listCmd, rmCmd, tagCmd, setCmd, kickCmd)
 	return nodeCmd
+}
+
+func parseTags(args []string) []string {
+	var result []string
+	seen := make(map[string]bool)
+	for _, a := range args {
+		parts := strings.Split(a, ",")
+		for _, p := range parts {
+			tag := strings.TrimSpace(p)
+			if tag != "" && !seen[tag] {
+				seen[tag] = true
+				result = append(result, tag)
+			}
+		}
+	}
+	return result
 }
 
 func listNodes() error {

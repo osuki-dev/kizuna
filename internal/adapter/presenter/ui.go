@@ -176,7 +176,7 @@ func (u *UI) RenderNodeTable(nodes []*entity.Node) string {
 		return u.MutedStyle.Render("No paired nodes found. Pair one with: kizuna node add <mesh-addr> --pin <pin>")
 	}
 
-	headers := []string{"NAME", "NODE ID", "STATUS", "OS / ARCH", "LAST SEEN"}
+	headers := []string{"NAME", "STATUS", "TAGS", "HOST / IP", "OS / ARCH", "LAST SEEN"}
 	rows := [][]string{}
 
 	for _, n := range nodes {
@@ -189,10 +189,23 @@ func (u *UI) RenderNodeTable(nodes []*entity.Node) string {
 			lastSeen = n.LastSeen.Format("15:04:05")
 		}
 
+		tagsStr := u.MutedStyle.Render("-")
+		if len(n.Tags) > 0 {
+			tagsStr = strings.Join(n.Tags, ", ")
+		}
+
+		hostStr := u.MutedStyle.Render("-")
+		if n.Host != "" {
+			hostStr = n.Host
+		} else if n.IP != "" {
+			hostStr = n.IP
+		}
+
 		rows = append(rows, []string{
 			u.BoldStyle.Render(n.Name),
-			u.MutedStyle.Render(n.ID),
 			u.StatusPill(n.IsOnline),
+			tagsStr,
+			hostStr,
 			osArch,
 			u.MutedStyle.Render(lastSeen),
 		})
