@@ -281,8 +281,8 @@ func (c *MeshClient) RevokeClient(ctx context.Context, node *entity.Node, nameOr
 	return nil
 }
 
-// SendGossipMessage sends a gossip message to remote node
-func (c *MeshClient) SendGossipMessage(ctx context.Context, node *entity.Node, msg *entity.GossipMessage) (*entity.GossipMessage, error) {
+// SendNodeSync sends mesh synchronization payload to remote node
+func (c *MeshClient) SendNodeSync(ctx context.Context, node *entity.Node, msg *entity.GossipMessage) (*entity.GossipMessage, error) {
 	client := c.getHTTPClient(ctx, node.Addr, 19800)
 
 	bodyBytes, err := json.Marshal(msg)
@@ -290,7 +290,7 @@ func (c *MeshClient) SendGossipMessage(ctx context.Context, node *entity.Node, m
 		return nil, err
 	}
 
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, "http://node/api/v1/gossip/message", bytes.NewReader(bodyBytes))
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, "http://node/api/v1/node/sync", bytes.NewReader(bodyBytes))
 	if err != nil {
 		return nil, err
 	}
@@ -307,7 +307,7 @@ func (c *MeshClient) SendGossipMessage(ctx context.Context, node *entity.Node, m
 
 	if resp.StatusCode != http.StatusOK {
 		respBody, _ := io.ReadAll(resp.Body)
-		return nil, fmt.Errorf("gossip message failed (status %d): %s", resp.StatusCode, strings.TrimSpace(string(respBody)))
+		return nil, fmt.Errorf("sync failed (status %d): %s", resp.StatusCode, strings.TrimSpace(string(respBody)))
 	}
 
 	var reply entity.GossipMessage
@@ -317,11 +317,11 @@ func (c *MeshClient) SendGossipMessage(ctx context.Context, node *entity.Node, m
 	return &reply, nil
 }
 
-// GetGossipStatus fetches gossip engine status from node
-func (c *MeshClient) GetGossipStatus(ctx context.Context, node *entity.Node) (*entity.GossipEngineStatus, error) {
+// GetNodeMembers fetches all cluster members discovered by remote node
+func (c *MeshClient) GetNodeMembers(ctx context.Context, node *entity.Node) ([]*entity.Node, error) {
 	client := c.getHTTPClient(ctx, node.Addr, 19800)
 
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, "http://node/api/v1/gossip/status", nil)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, "http://node/api/v1/node/members", nil)
 	if err != nil {
 		return nil, err
 	}
@@ -336,36 +336,7 @@ func (c *MeshClient) GetGossipStatus(ctx context.Context, node *entity.Node) (*e
 	defer func() { _ = resp.Body.Close() }()
 
 	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("failed to get gossip status (status %d)", resp.StatusCode)
-	}
-
-	var st entity.GossipEngineStatus
-	if err := json.NewDecoder(resp.Body).Decode(&st); err != nil {
-		return nil, err
-	}
-	return &st, nil
-}
-
-// GetGossipMembers fetches all cluster members known to node via gossip
-func (c *MeshClient) GetGossipMembers(ctx context.Context, node *entity.Node) ([]*entity.Node, error) {
-	client := c.getHTTPClient(ctx, node.Addr, 19800)
-
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, "http://node/api/v1/gossip/members", nil)
-	if err != nil {
-		return nil, err
-	}
-	if node.AuthToken != "" {
-		req.Header.Set("Authorization", "Bearer "+node.AuthToken)
-	}
-
-	resp, err := client.Do(req)
-	if err != nil {
-		return nil, err
-	}
-	defer func() { _ = resp.Body.Close() }()
-
-	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("failed to get gossip members (status %d)", resp.StatusCode)
+		return nil, fmt.Errorf("failed to get node members (status %d)", resp.StatusCode)
 	}
 
 	var members []*entity.Node

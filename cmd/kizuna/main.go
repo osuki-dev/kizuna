@@ -100,7 +100,6 @@ func main() {
 	// Mesh & Services Infrastructure
 	rootCmd.AddCommand(newServiceCmd())
 	rootCmd.AddCommand(newNodeCmd())
-	rootCmd.AddCommand(newGossipCmd())
 
 	// Configuration & Utilities
 	rootCmd.AddCommand(newInitCmd())
@@ -534,7 +533,7 @@ func runServer() error {
 			"node_name":    nodeName,
 			"mesh_address": addr,
 			"pairing_pin":  pin,
-			"gossip":       gossipEng.GetStatus(),
+			"mesh_peers":   len(gossipEng.GetMembers()),
 		})
 	} else {
 		fmt.Println(ui.RenderServerStart(addr, pin))
@@ -892,7 +891,7 @@ func newNodeCmd() *cobra.Command {
 		},
 	}
 
-	nodeCmd.AddCommand(addCmd, listCmd, rmCmd, tagCmd, setCmd, kickCmd, newGossipCmd())
+	nodeCmd.AddCommand(addCmd, listCmd, rmCmd, tagCmd, setCmd, kickCmd)
 	return nodeCmd
 }
 
@@ -922,21 +921,21 @@ func listNodes() error {
 		return err
 	}
 
-	// 1. Check if local daemon is running and has live Gossip members
-	var gossipNodes []*entity.Node
+	// 1. Check if local daemon is running and has live mesh members
+	var meshNodes []*entity.Node
 	clientHTTP := &http.Client{Timeout: 800 * time.Millisecond}
-	resp, httpErr := clientHTTP.Get("http://127.0.0.1:19800/api/v1/gossip/members")
+	resp, httpErr := clientHTTP.Get("http://127.0.0.1:19800/api/v1/node/members")
 	if httpErr == nil && resp.StatusCode == http.StatusOK {
 		defer func() { _ = resp.Body.Close() }()
 		var gm []*entity.Node
 		if json.NewDecoder(resp.Body).Decode(&gm) == nil && len(gm) > 0 {
-			gossipNodes = gm
+			meshNodes = gm
 		}
 	}
 
 	var finalNodes []*entity.Node
-	if len(gossipNodes) > 0 {
-		finalNodes = gossipNodes
+	if len(meshNodes) > 0 {
+		finalNodes = meshNodes
 	} else {
 		meshGw := mesh.NewMeshGateway()
 		defer func() { _ = meshGw.Close() }()
@@ -956,17 +955,20 @@ func listNodes() error {
 				upNode, _, err := cli.GetStatus(ctx, target)
 				if err != nil {
 					nCopy.IsOnline = false
+					nCopy.Status = "dead"
 					nCopy.GossipState = entity.GossipStateDead
 					probed[idx] = &nCopy
 				} else {
 					if upNode != nil {
 						upNode.IsOnline = true
-						if upNode.GossipState == "" {
-							upNode.GossipState = entity.GossipStateAlive
+						if upNode.Status == "" {
+							upNode.Status = "alive"
 						}
+						upNode.GossipState = entity.GossipStateAlive
 						probed[idx] = upNode
 					} else {
 						nCopy.IsOnline = true
+						nCopy.Status = "alive"
 						nCopy.GossipState = entity.GossipStateAlive
 						probed[idx] = &nCopy
 					}
@@ -977,6 +979,19 @@ func listNodes() error {
 		finalNodes = probed
 	}
 
+	// Guarantee Status is populated on all returned nodes
+	for _, n := range finalNodes {
+		if n.Status == "" {
+			if n.GossipState != "" {
+				n.Status = string(n.GossipState)
+			} else if n.IsOnline {
+				n.Status = "alive"
+			} else {
+				n.Status = "offline"
+			}
+		}
+	}
+
 	if flagJSON {
 		return presenter.PrintJSON(os.Stdout, finalNodes)
 	}
@@ -984,94 +999,6 @@ func listNodes() error {
 	ui := presenter.NewUI("")
 	fmt.Println(ui.RenderNodeTable(finalNodes))
 	return nil
-}
-
-func newGossipCmd() *cobra.Command {
-	cmd := &cobra.Command{
-		Use:   "gossip",
-		Short: "Inspect and monitor the decentralized Gossip mesh cluster",
-	}
-
-	statusCmd := &cobra.Command{
-		Use:   "status",
-		Short: "Display local Gossip protocol engine status and cluster health",
-		RunE: func(cmd *cobra.Command, args []string) error {
-			clientHTTP := &http.Client{Timeout: 1200 * time.Millisecond}
-			resp, err := clientHTTP.Get("http://127.0.0.1:19800/api/v1/gossip/status")
-			if err != nil || resp.StatusCode != http.StatusOK {
-				repo, _ := config.NewNodeRepository("")
-				var total int
-				var members []*entity.Node
-				if repo != nil {
-					members, _ = repo.ListNodes()
-					total = len(members)
-				}
-				nodeName, _ := os.Hostname()
-				if nodeName == "" {
-					nodeName = "local"
-				}
-				st := entity.GossipEngineStatus{
-					NodeID:       "node_" + nodeName,
-					NodeName:     nodeName,
-					MeshAddr:     "standalone",
-					State:        entity.GossipStateAlive,
-					Incarnation:  1,
-					Protocol:     "SWIM+AntiEntropy/v1",
-					TotalMembers: total + 1,
-					AliveCount:   1,
-					IntervalMs:   2000,
-					Members:      members,
-				}
-				if flagJSON {
-					return presenter.PrintJSON(os.Stdout, st)
-				}
-				ui := presenter.NewUI("")
-				fmt.Println(ui.RenderGossipStatus(&st))
-				return nil
-			}
-			defer func() { _ = resp.Body.Close() }()
-
-			var st entity.GossipEngineStatus
-			if err := json.NewDecoder(resp.Body).Decode(&st); err != nil {
-				return fmt.Errorf("failed to decode gossip status: %w", err)
-			}
-
-			if flagJSON {
-				return presenter.PrintJSON(os.Stdout, st)
-			}
-			ui := presenter.NewUI("")
-			fmt.Println(ui.RenderGossipStatus(&st))
-			return nil
-		},
-	}
-
-	membersCmd := &cobra.Command{
-		Use:   "members",
-		Short: "List all known members in the Gossip cluster",
-		RunE: func(cmd *cobra.Command, args []string) error {
-			clientHTTP := &http.Client{Timeout: 1200 * time.Millisecond}
-			resp, err := clientHTTP.Get("http://127.0.0.1:19800/api/v1/gossip/members")
-			if err != nil || resp.StatusCode != http.StatusOK {
-				return listNodes()
-			}
-			defer func() { _ = resp.Body.Close() }()
-
-			var members []*entity.Node
-			if err := json.NewDecoder(resp.Body).Decode(&members); err != nil {
-				return fmt.Errorf("failed to decode gossip members: %w", err)
-			}
-
-			if flagJSON {
-				return presenter.PrintJSON(os.Stdout, members)
-			}
-			ui := presenter.NewUI("")
-			fmt.Println(ui.RenderGossipMembersTable(members))
-			return nil
-		},
-	}
-
-	cmd.AddCommand(statusCmd, membersCmd)
-	return cmd
 }
 
 func newDeployCmd() *cobra.Command {

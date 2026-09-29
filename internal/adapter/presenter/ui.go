@@ -267,77 +267,7 @@ func (u *UI) RenderNodeTable(nodes []*entity.Node) string {
 	return t.Render()
 }
 
-// RenderGossipStatus formats GossipEngineStatus into a styled summary card
-func (u *UI) RenderGossipStatus(st *entity.GossipEngineStatus) string {
-	if st == nil {
-		return u.MutedStyle.Render("Gossip engine inactive")
-	}
 
-	var sb strings.Builder
-	sb.WriteString(u.SecondaryStyle.Bold(true).Render("📡 GOSSIP CLUSTER (SWIM PROTOCOL)") + "\n\n")
-
-	sb.WriteString(fmt.Sprintf("  Node Name:     %s (%s)\n", u.BoldStyle.Render(st.NodeName), st.NodeID))
-	sb.WriteString(fmt.Sprintf("  Mesh Addr:     %s\n", st.MeshAddr))
-	sb.WriteString(fmt.Sprintf("  State:         %s  (Incarnation: %d)\n", u.GossipPill(st.State, true), st.Incarnation))
-	sb.WriteString(fmt.Sprintf("  Protocol:      %s\n", st.Protocol))
-	sb.WriteString(fmt.Sprintf("  Ping Interval: %dms\n", st.IntervalMs))
-	sb.WriteString(fmt.Sprintf("  Cluster Size:  %d nodes (%s, %s, %s)\n",
-		st.TotalMembers,
-		u.SecondaryStyle.Render(fmt.Sprintf("%d alive", st.AliveCount)),
-		u.WarningStyle.Render(fmt.Sprintf("%d suspect", st.SuspectCount)),
-		u.DangerStyle.Render(fmt.Sprintf("%d dead", st.DeadCount)),
-	))
-
-	return u.CardStyle.Render(sb.String())
-}
-
-// RenderGossipMembersTable formats gossip cluster members into a Lipgloss table
-func (u *UI) RenderGossipMembersTable(members []*entity.Node) string {
-	if len(members) == 0 {
-		return u.MutedStyle.Render("No gossip members found in cluster.")
-	}
-
-	headers := []string{"MEMBER", "GOSSIP STATE", "INCARNATION", "TAGS", "HOST / IP", "LATENCY"}
-	rows := [][]string{}
-
-	for _, m := range members {
-		tagsStr := u.MutedStyle.Render("-")
-		if len(m.Tags) > 0 {
-			tagsStr = strings.Join(m.Tags, ", ")
-		}
-
-		hostStr := u.MutedStyle.Render("-")
-		if m.Host != "" {
-			hostStr = m.Host
-		} else if m.IP != "" {
-			hostStr = m.IP
-		}
-
-		latencyStr := "-"
-		if m.LatencyMs > 0 {
-			latencyStr = fmt.Sprintf("%dms", m.LatencyMs)
-		} else if m.IsOnline {
-			latencyStr = "<1ms (local)"
-		}
-
-		rows = append(rows, []string{
-			u.BoldStyle.Render(m.Name),
-			u.GossipPill(m.GossipState, m.IsOnline),
-			fmt.Sprintf("%d", m.Incarnation),
-			tagsStr,
-			hostStr,
-			latencyStr,
-		})
-	}
-
-	t := table.New().
-		Border(lipgloss.RoundedBorder()).
-		BorderStyle(lipgloss.NewStyle().Foreground(lipgloss.Color(u.Theme.Primary))).
-		Headers(headers...).
-		Rows(rows...)
-
-	return t.Render()
-}
 
 // RenderServicesTable formats running services into a Lipgloss table
 func (u *UI) RenderServicesTable(services []*entity.Service) string {

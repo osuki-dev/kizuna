@@ -1295,15 +1295,18 @@ func (m *DashboardModel) renderNodesTab(width int) string {
 		}
 		fmt.Fprintf(&sb, "  Tags:         %s\n", tagsVal)
 
-		gossipState := string(sn.GossipState)
-		if gossipState == "" {
+		nodeStatus := sn.Status
+		if nodeStatus == "" {
+			nodeStatus = string(sn.GossipState)
+		}
+		if nodeStatus == "" {
 			if st != nil && st.IsOnline {
-				gossipState = "alive"
+				nodeStatus = "alive"
 			} else {
-				gossipState = "offline"
+				nodeStatus = "offline"
 			}
 		}
-		fmt.Fprintf(&sb, "  Gossip State: %s (Incarnation: %d)\n", strings.ToUpper(gossipState), sn.Incarnation)
+		fmt.Fprintf(&sb, "  Health:       %s (Epoch: %d)\n", strings.ToUpper(nodeStatus), sn.Incarnation)
 
 		if sn.CPUUsage > 0 || sn.MemoryUsage > 0 {
 			fmt.Fprintf(&sb, "  Telemetry:    CPU: %.1f%% | RAM: %.1f%% | Disk: %.1f%% | Load: %.2f\n",

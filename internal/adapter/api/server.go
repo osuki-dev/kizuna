@@ -102,10 +102,9 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("/api/v1/node/meta", s.withAuth(s.handleNodeMeta))
 	mux.HandleFunc("/api/v1/auth/revoke", s.withAuth(s.handleRevoke))
 
-	// Gossip mesh endpoints
-	mux.HandleFunc("/api/v1/gossip/message", s.handleGossipMessage)
-	mux.HandleFunc("/api/v1/gossip/status", s.handleGossipStatus)
-	mux.HandleFunc("/api/v1/gossip/members", s.handleGossipMembers)
+	// Internal node mesh synchronization & member discovery
+	mux.HandleFunc("/api/v1/node/sync", s.handleNodeSync)
+	mux.HandleFunc("/api/v1/node/members", s.handleNodeMembers)
 
 	return mux
 }
@@ -433,7 +432,7 @@ func (l *singleConnListener) Addr() net.Addr {
 	return nil
 }
 
-func (s *Server) handleGossipMessage(w http.ResponseWriter, r *http.Request) {
+func (s *Server) handleNodeSync(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
@@ -444,19 +443,19 @@ func (s *Server) handleGossipMessage(w http.ResponseWriter, r *http.Request) {
 	s.mu.RUnlock()
 
 	if ge == nil {
-		http.Error(w, "gossip engine not active", http.StatusServiceUnavailable)
+		http.Error(w, "mesh engine not active", http.StatusServiceUnavailable)
 		return
 	}
 
 	var msg entity.GossipMessage
 	if err := json.NewDecoder(r.Body).Decode(&msg); err != nil {
-		http.Error(w, "invalid gossip message payload", http.StatusBadRequest)
+		http.Error(w, "invalid sync message payload", http.StatusBadRequest)
 		return
 	}
 
 	reply, err := ge.HandleMessage(&msg)
 	if err != nil {
-		http.Error(w, fmt.Sprintf("gossip error: %v", err), http.StatusInternalServerError)
+		http.Error(w, fmt.Sprintf("mesh sync error: %v", err), http.StatusInternalServerError)
 		return
 	}
 
@@ -464,28 +463,13 @@ func (s *Server) handleGossipMessage(w http.ResponseWriter, r *http.Request) {
 	_ = json.NewEncoder(w).Encode(reply)
 }
 
-func (s *Server) handleGossipStatus(w http.ResponseWriter, r *http.Request) {
+func (s *Server) handleNodeMembers(w http.ResponseWriter, r *http.Request) {
 	s.mu.RLock()
 	ge := s.gossip
 	s.mu.RUnlock()
 
 	if ge == nil {
-		http.Error(w, "gossip engine not active", http.StatusServiceUnavailable)
-		return
-	}
-
-	status := ge.GetStatus()
-	w.Header().Set("Content-Type", "application/json")
-	_ = json.NewEncoder(w).Encode(status)
-}
-
-func (s *Server) handleGossipMembers(w http.ResponseWriter, r *http.Request) {
-	s.mu.RLock()
-	ge := s.gossip
-	s.mu.RUnlock()
-
-	if ge == nil {
-		http.Error(w, "gossip engine not active", http.StatusServiceUnavailable)
+		http.Error(w, "mesh engine not active", http.StatusServiceUnavailable)
 		return
 	}
 

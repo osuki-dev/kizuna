@@ -49,13 +49,13 @@ func (t *MeshTransport) SendMessage(ctx context.Context, targetAddr string, port
 		},
 	}
 
-	url := "http://node/api/v1/gossip/message"
+	url := "http://node/api/v1/node/sync"
 	if strings.Contains(targetAddr, ":") || strings.HasPrefix(targetAddr, "127.0.0.1") || strings.HasPrefix(targetAddr, "localhost") {
 		hostOnly := targetAddr
 		if strings.Contains(hostOnly, ":") {
 			hostOnly, _, _ = net.SplitHostPort(targetAddr)
 		}
-		url = fmt.Sprintf("http://%s:%d/api/v1/gossip/message", hostOnly, port)
+		url = fmt.Sprintf("http://%s:%d/api/v1/node/sync", hostOnly, port)
 	}
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(body))
