@@ -1,0 +1,54 @@
+version: "1"
+name: "fullstack-monorepo"
+target: "home-server"
+theme: "tokyonight" # Options: catppuccin (default), tokyonight, dracula, nord, or custom colors
+
+# Monorepo: Multiple projects with different frontend/backend requirements in one file
+services:
+  # 1. Frontend Web App (Bun / TypeScript / Vite)
+  web:
+    root: "./apps/web"
+    type: "bun" # bun | node | process | docker | compose
+    build:
+      local: "bun run build"
+      artifact: "./apps/web/dist"
+    deploy:
+      dest: "/opt/apps/monorepo/web"
+      command: "bun run preview --port 3000"
+      env:
+        NODE_ENV: "production"
+        PORT: "3000"
+    ingress:
+      provider: "caddy"
+      domain: "app.example.com"
+      auto_tls: true
+      upstream_port: 3000
+
+  # 2. Backend API Service (Docker with direct Dockerfile)
+  api:
+    root: "./apps/api"
+    type: "docker"
+    dockerfile: "Dockerfile"
+    ports:
+      - "8080:8080"
+    env:
+      PORT: "8080"
+      DATABASE_URL: "postgres://user:password@localhost:5432/db"
+    ingress:
+      provider: "caddy"
+      domain: "api.example.com"
+      auto_tls: true
+      upstream_port: 8080
+
+  # 3. Database & Cache (Docker Compose stack)
+  infrastructure:
+    type: "compose"
+    compose_file: "./docker-compose.yml"
+    backup:
+      paths:
+        - "./data/postgres"
+      schedule: "0 3 * * *" # Daily 3 AM
+      storage:
+        type: "s3"
+        bucket: "kizuna-backups"
+        endpoint: "https://s3.us-west-004.backblazeb2.com"

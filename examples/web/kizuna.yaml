@@ -1,0 +1,88 @@
+# Kizuna Multi-Environment Configuration for Bun React Web Application
+version: "1"
+name: "bun-web-app"
+target: "home-server"
+theme: "tokyonight"
+
+# Default Service Definition
+type: "docker"
+dockerfile: "Dockerfile"
+ports:
+  - "3015:3000"
+
+env:
+  NODE_ENV: "production"
+  PORT: "3000"
+
+ingress:
+  provider: "caddy"
+  domain: "bun-web.example.com"
+  auto_tls: true
+  upstream_port: 3015
+  headers:
+    response:
+      X-Frame-Options: "DENY"
+      X-Content-Type-Options: "nosniff"
+    request:
+      X-Real-IP: "{remote_host}"
+  proxy_options:
+    flush_interval: "-1" # Real-time SSE / AI streaming
+  custom:
+    - "encode gzip zstd"
+
+backup:
+  paths:
+    - "."
+  schedule: "0 2 * * *"
+  storage:
+    type: "local"
+
+# Environment Overrides: development, staging, production, test
+environments:
+  development:
+    target: "localhost"
+    ports:
+      - "3016:3000"
+    env:
+      NODE_ENV: "development"
+    ingress:
+      domain: "dev.bun-web.local"
+      auto_tls: false
+      upstream_port: 3016
+
+  staging:
+    target: "home-server"
+    ports:
+      - "3017:3000"
+    env:
+      NODE_ENV: "staging"
+    ingress:
+      domain: "staging.bun-web.example.com"
+      upstream_port: 3017
+
+  production:
+    # Scale-out cluster: synchronizes across multiple servers (agentless via SSH, no Kizuna install required on workers)
+    targets:
+      - "ssh://deploy@10.0.0.1:22"
+      - "ssh://deploy@10.0.0.2:22"
+      - "ssh://deploy@10.0.0.3:22"
+    ports:
+      - "3015:3000"
+    env:
+      NODE_ENV: "production"
+    ingress:
+      domain: "bun-web.example.com"
+      auto_tls: true
+      upstream_port: 3015
+      lb_policy: "round_robin"
+
+  test:
+    target: "localhost"
+    ports:
+      - "3018:3000"
+    env:
+      NODE_ENV: "test"
+    ingress:
+      domain: "test.bun-web.local"
+      auto_tls: false
+      upstream_port: 3018

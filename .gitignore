@@ -1,0 +1,29 @@
+# Binaries
+/kizuna
+/kizuna.exe
+/bin/
+/dist/
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+
+# Test & coverage
+*.out
+*.test
+
+# Go workspace
+go.work
+
+# OS & IDE
+.DS_Store
+.idea/
+.vscode/
+
+# Kizuna local runtime data
+.kizuna/
+workloads/
+logs/
+caddy/
+backups/

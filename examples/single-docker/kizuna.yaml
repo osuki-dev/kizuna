@@ -1,0 +1,26 @@
+version: "1"
+name: "my-docker-site"
+target: "vps-tokyo"
+theme: "catppuccin"
+
+type: "docker"
+dockerfile: "Dockerfile"
+ports:
+  - "3000:3000"
+
+env:
+  NODE_ENV: "production"
+  PORT: "3000"
+
+ingress:
+  provider: "caddy"
+  domain: "mysite.com"
+  auto_tls: true
+  upstream_port: 3000
+
+backup:
+  paths:
+    - "/var/data"
+  schedule: "0 2 * * *"
+  storage:
+    type: "local"
