@@ -34,6 +34,14 @@ type Styles struct {
 	PillInfo      lipgloss.Style
 	MutedText     lipgloss.Style
 	HighlightText lipgloss.Style
+	GaugeLow      lipgloss.Style
+	GaugeMed      lipgloss.Style
+	GaugeHigh     lipgloss.Style
+	GaugeEmpty    lipgloss.Style
+	Sparkline     lipgloss.Style
+	Divider       lipgloss.Style
+	TableHeader   lipgloss.Style
+	CardTitle     lipgloss.Style
 }
 
 // NewStyles constructs styles dynamically from a Theme entity
@@ -77,8 +85,9 @@ func NewStyles(theme *entity.Theme) Styles {
 			Padding(0, 1),
 		MetricCard: lipgloss.NewStyle().
 			Border(lipgloss.RoundedBorder()).
-			BorderForeground(borderCol).
-			Padding(0, 1),
+			BorderForeground(mCol).
+			Padding(0, 1).
+			Background(bgCol),
 		SelectedRow: lipgloss.NewStyle().
 			Bold(true).
 			Foreground(lipgloss.Color("#FFFFFF")).
@@ -109,6 +118,28 @@ func NewStyles(theme *entity.Theme) Styles {
 			Bold(true),
 		MutedText:     lipgloss.NewStyle().Foreground(mCol),
 		HighlightText: lipgloss.NewStyle().Foreground(sCol).Bold(true),
+		GaugeLow: lipgloss.NewStyle().
+			Foreground(sCol).
+			Bold(true),
+		GaugeMed: lipgloss.NewStyle().
+			Foreground(wCol).
+			Bold(true),
+		GaugeHigh: lipgloss.NewStyle().
+			Foreground(dCol).
+			Bold(true),
+		GaugeEmpty: lipgloss.NewStyle().
+			Foreground(mCol),
+		Sparkline: lipgloss.NewStyle().
+			Foreground(pCol).
+			Bold(true),
+		Divider: lipgloss.NewStyle().
+			Foreground(mCol),
+		TableHeader: lipgloss.NewStyle().
+			Bold(true).
+			Foreground(pCol),
+		CardTitle: lipgloss.NewStyle().
+			Bold(true).
+			Foreground(pCol),
 	}
 }
 
@@ -392,11 +423,11 @@ func (m *DashboardModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if msg.err == nil && msg.metrics != nil {
 			m.localMetrics = msg.metrics
 			m.cpuHistory = append(m.cpuHistory, msg.metrics.CPUUsage)
-			if len(m.cpuHistory) > 20 {
+			if len(m.cpuHistory) > 32 {
 				m.cpuHistory = m.cpuHistory[1:]
 			}
 			m.memHistory = append(m.memHistory, msg.metrics.MemoryUsage)
-			if len(m.memHistory) > 20 {
+			if len(m.memHistory) > 32 {
 				m.memHistory = m.memHistory[1:]
 			}
 		}
@@ -433,53 +464,84 @@ func (m *DashboardModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 func (m *DashboardModel) View() string {
 	var s strings.Builder
 
-	contentWidth := m.width - 4
-	if contentWidth < 80 {
-		contentWidth = 80
+	termWidth := m.width
+	if termWidth <= 0 {
+		termWidth = 100
+	}
+	if termWidth < 70 {
+		termWidth = 70
 	}
 
 	// 1. Header Banner
-	s.WriteString(m.renderHeader(contentWidth))
+	s.WriteString(m.renderHeader(termWidth))
 	s.WriteString("\n")
 
-	// 2. Navigation Tabs
-	tabs := []string{"[1] ⚡ Resource Manager", "[2] 🌐 Mesh Nodes", "[3] 📦 Workloads & Ingress", "[4] 📜 Real-time Logs", "[5] 💾 Backups"}
+	// 2. Navigation Tabs (Responsive based on terminal width)
+	var tabs []string
+	if termWidth >= 130 {
+		tabs = []string{"[1] ⚡ Resource Manager", "[2] 🌐 Mesh Nodes", "[3] 📦 Workloads & Ingress", "[4] 📜 Real-time Logs", "[5] 💾 Backups"}
+	} else if termWidth >= 100 {
+		tabs = []string{"[1] ⚡ Resources", "[2] 🌐 Nodes", "[3] 📦 Workloads", "[4] 📜 Logs", "[5] 💾 Backups"}
+	} else {
+		tabs = []string{"[1] Resources", "[2] Nodes", "[3] Services", "[4] Logs", "[5] Backups"}
+	}
+
+	tabStyle := m.styles.Tab
+	activeTabStyle := m.styles.ActiveTab
+	if termWidth < 110 {
+		tabStyle = tabStyle.Padding(0, 1)
+		activeTabStyle = activeTabStyle.Padding(0, 1)
+	}
+
 	var renderedTabs []string
 	for i, t := range tabs {
 		if tabIndex(i) == m.activeTab {
-			renderedTabs = append(renderedTabs, m.styles.ActiveTab.Render(t))
+			renderedTabs = append(renderedTabs, activeTabStyle.Render(t))
 		} else {
-			renderedTabs = append(renderedTabs, m.styles.Tab.Render(t))
+			renderedTabs = append(renderedTabs, tabStyle.Render(t))
 		}
 	}
 	s.WriteString(lipgloss.JoinHorizontal(lipgloss.Top, renderedTabs...))
 	s.WriteString("\n")
 
 	// 3. Tab Contents
+	// Total outer width target is termWidth - 2.
+	// m.styles.Box has Border (2) + Padding(1, 2) (4).
+	// When Box.Width(w) is called, rendered width is w + 2 (border).
+	// Inside Box, content area is w - 4 (padding).
+	// To make content area equal to innerWidth, we pass w = innerWidth + 4.
+	innerWidth := termWidth - 8
+	if innerWidth < 60 {
+		innerWidth = 60
+	}
+
 	var content string
 	switch m.activeTab {
 	case tabOverview:
-		content = m.renderOverviewTab(contentWidth)
+		content = m.renderOverviewTab(innerWidth)
 	case tabNodes:
-		content = m.renderNodesTab(contentWidth)
+		content = m.renderNodesTab(innerWidth)
 	case tabServices:
-		content = m.renderServicesTab(contentWidth)
+		content = m.renderServicesTab(innerWidth)
 	case tabLogs:
-		content = m.renderLogsTab(contentWidth)
+		content = m.renderLogsTab(innerWidth)
 	case tabBackups:
-		content = m.renderBackupsTab(contentWidth)
+		content = m.renderBackupsTab(innerWidth)
 	}
 
-	boxW := contentWidth - 4
-	if boxW < 40 {
-		boxW = 40
-	}
-	s.WriteString(m.styles.Box.Width(boxW).Render(content))
+	s.WriteString(m.styles.Box.Width(innerWidth + 4).Render(content))
 	s.WriteString("\n")
 
-	// 4. Footer shortcuts
-	footer := m.styles.MutedText.Render(" [1-5 / Tab] Switch Views  •  [↑/↓] Select Item  •  [r] Refresh Telemetry  •  [q] Quit")
-	s.WriteString(footer)
+	// 4. Footer shortcuts (Adaptive)
+	var footerText string
+	if termWidth >= 100 {
+		footerText = " [1-5 / Tab] Switch Views  •  [↑/↓] Select Item  •  [r] Refresh Telemetry  •  [q] Quit"
+	} else if termWidth >= 80 {
+		footerText = " [1-5/Tab] Views  •  [↑/↓] Select  •  [r] Refresh  •  [q] Quit"
+	} else {
+		footerText = " [1-5] Tab  •  [r] Refresh  •  [q] Quit"
+	}
+	s.WriteString(m.styles.MutedText.Render(footerText))
 
 	return s.String()
 }
@@ -489,13 +551,33 @@ func (m *DashboardModel) renderHeader(width int) string {
 	envBadge := m.styles.PillInfo.Render("ENV: " + strings.ToUpper(m.activeEnv))
 	themeBadge := m.styles.PillSuccess.Render("THEME: " + strings.ToUpper(m.theme.Name))
 
-	meshStatus := m.styles.HighlightText.Render("🔒 WireGuard Zero-Trust Mesh: Active")
-	ingressStatus := m.styles.HighlightText.Render("⚡ HTTP/3 (QUIC) Caddy: Enabled")
+	var topLine string
+	if width >= 75 {
+		topLine = fmt.Sprintf("%s   %s  %s", titleText, envBadge, themeBadge)
+	} else {
+		topLine = fmt.Sprintf("%s  %s", titleText, envBadge)
+	}
 
-	topLine := fmt.Sprintf("%s   %s  %s", titleText, envBadge, themeBadge)
-	subLine := fmt.Sprintf("%s   •   %s", meshStatus, ingressStatus)
+	var subLine string
+	if width >= 90 {
+		subLine = fmt.Sprintf("%s   •   %s",
+			m.styles.HighlightText.Render("🔒 WireGuard Zero-Trust Mesh: Active"),
+			m.styles.HighlightText.Render("⚡ HTTP/3 (QUIC) Caddy: Enabled"),
+		)
+	} else if width >= 75 {
+		subLine = fmt.Sprintf("%s  •  %s",
+			m.styles.HighlightText.Render("🔒 Mesh: Active"),
+			m.styles.HighlightText.Render("⚡ Ingress: Caddy"),
+		)
+	} else {
+		subLine = m.styles.HighlightText.Render("🔒 WireGuard Mesh: Active")
+	}
 
-	return m.styles.HeaderBox.Width(width - 4).Render(topLine + "\n" + subLine)
+	boxInnerW := width - 4
+	if boxInnerW < 40 {
+		boxInnerW = 40
+	}
+	return m.styles.HeaderBox.Width(boxInnerW).Render(topLine + "\n" + subLine)
 }
 
 func (m *DashboardModel) renderOverviewTab(width int) string {
@@ -511,66 +593,169 @@ func (m *DashboardModel) renderOverviewTab(width int) string {
 	totMemStr := formatBytes(m.localMetrics.TotalMemory)
 	usedSwapStr := formatBytes(m.localMetrics.UsedSwap)
 	totSwapStr := formatBytes(m.localMetrics.TotalSwap)
-
-	cpuTrend := renderSparkline(m.cpuHistory)
-	memTrend := renderSparkline(m.memHistory)
-
-	cardW := (width - 16) / 4
-	if cardW < 22 {
-		cardW = 22
-	}
-
-	cpuCard := fmt.Sprintf("CPU USAGE (%d Cores)\n[%s] %5.1f%%\nTrend: %s\nLoad: %.2f, %.2f, %.2f",
-		m.localMetrics.CPUCores,
-		renderBar(cpuP, 12),
-		cpuP,
-		cpuTrend,
-		m.localMetrics.Load1, m.localMetrics.Load5, m.localMetrics.Load15,
-	)
-
-	memCard := fmt.Sprintf("RAM MEMORY\n[%s] %5.1f%%\nTrend: %s\nUsed: %s / %s",
-		renderBar(memP, 12),
-		memP,
-		memTrend,
-		usedMemStr, totMemStr,
-	)
-
-	swapCard := fmt.Sprintf("SWAP MEMORY\n[%s] %5.1f%%\nFree: %s\nTotal: %s / %s",
-		renderBar(swapP, 12),
-		swapP,
-		formatBytes(m.localMetrics.FreeSwap),
-		usedSwapStr, totSwapStr,
-	)
-
 	rxRateStr := formatBytes(m.localMetrics.RxRate)
 	txRateStr := formatBytes(m.localMetrics.TxRate)
-	netCard := fmt.Sprintf("NETWORK I/O\nRate: ↓ %s/s\n      ↑ %s/s\nTotal: %s / %s",
-		rxRateStr, txRateStr,
-		formatBytes(m.localMetrics.BytesRecv),
-		formatBytes(m.localMetrics.BytesSent),
-	)
 
-	c1 := m.styles.MetricCard.Width(cardW).Render(cpuCard)
-	c2 := m.styles.MetricCard.Width(cardW).Render(memCard)
-	c3 := m.styles.MetricCard.Width(cardW).Render(swapCard)
-	c4 := m.styles.MetricCard.Width(cardW).Render(netCard)
+	// Top Cards: Adaptive Layout
+	if width >= 100 {
+		gap := 1
+		totalCardSpace := width - 3*gap
+		cardOuterW := totalCardSpace / 4
+		cardStyleW := cardOuterW - 2 // Lipgloss adds 2 for rounded border
+		cardContentW := cardStyleW - 2 // Minus 2 for padding(0, 1)
+		rem := totalCardSpace % 4
+		card4StyleW := cardStyleW + rem
 
-	sb.WriteString(lipgloss.JoinHorizontal(lipgloss.Top, c1, " ", c2, " ", c3, " ", c4))
+		barW := cardContentW - 9
+		if barW < 6 {
+			barW = 6
+		}
+		if barW > 30 {
+			barW = 30
+		}
+		sparkW := cardContentW - 8
+		if sparkW < 8 {
+			sparkW = 8
+		}
+		if sparkW > 30 {
+			sparkW = 30
+		}
+
+		cpuCard := fmt.Sprintf("%s\n%s %s\n%s %s\n%s %.2f, %.2f, %.2f",
+			m.styles.CardTitle.Render(fmt.Sprintf("⚡ CPU USAGE (%d Cores)", m.localMetrics.CPUCores)),
+			m.renderGauge(cpuP, barW), m.formatPercent(cpuP),
+			m.styles.MutedText.Render("Trend:"), m.renderSparkline(m.cpuHistory, sparkW),
+			m.styles.MutedText.Render("Load: "), m.localMetrics.Load1, m.localMetrics.Load5, m.localMetrics.Load15,
+		)
+
+		memCard := fmt.Sprintf("%s\n%s %s\n%s %s\n%s %s / %s",
+			m.styles.CardTitle.Render("🧠 RAM MEMORY"),
+			m.renderGauge(memP, barW), m.formatPercent(memP),
+			m.styles.MutedText.Render("Trend:"), m.renderSparkline(m.memHistory, sparkW),
+			m.styles.MutedText.Render("Used: "), usedMemStr, totMemStr,
+		)
+
+		swapCard := fmt.Sprintf("%s\n%s %s\n%s %s\n%s %s\n%s %s",
+			m.styles.CardTitle.Render("🔄 SWAP MEMORY"),
+			m.renderGauge(swapP, barW), m.formatPercent(swapP),
+			m.styles.MutedText.Render("Free: "), formatBytes(m.localMetrics.FreeSwap),
+			m.styles.MutedText.Render("Used: "), usedSwapStr,
+			m.styles.MutedText.Render("Total:"), totSwapStr,
+		)
+
+		netCard := fmt.Sprintf("%s\n%s ↓ %s/s\n%s ↑ %s/s\n%s %s\n%s %s",
+			m.styles.CardTitle.Render("🌐 NETWORK I/O"),
+			m.styles.GaugeLow.Render("RECEIVE: "), rxRateStr,
+			m.styles.GaugeMed.Render("TRANSMIT:"), txRateStr,
+			m.styles.MutedText.Render("Total Rx:"), formatBytes(m.localMetrics.BytesRecv),
+			m.styles.MutedText.Render("Total Tx:"), formatBytes(m.localMetrics.BytesSent),
+		)
+
+		c1 := m.styles.MetricCard.Width(cardStyleW).Render(cpuCard)
+		c2 := m.styles.MetricCard.Width(cardStyleW).Render(memCard)
+		c3 := m.styles.MetricCard.Width(cardStyleW).Render(swapCard)
+		c4 := m.styles.MetricCard.Width(card4StyleW).Render(netCard)
+
+		sb.WriteString(lipgloss.JoinHorizontal(lipgloss.Top, c1, " ", c2, " ", c3, " ", c4))
+	} else {
+		// 2x2 grid for narrow screens
+		halfSpace := width - 1
+		cardOuterW2 := halfSpace / 2
+		cardStyleW2 := cardOuterW2 - 2
+		cardContentW2 := cardStyleW2 - 2
+		rem2 := halfSpace % 2
+
+		barW := cardContentW2 - 9
+		if barW < 6 {
+			barW = 6
+		}
+		sparkW := cardContentW2 - 8
+		if sparkW < 6 {
+			sparkW = 6
+		}
+
+		cpuCard := fmt.Sprintf("%s\n%s %s\n%s %s\n%s %.2f, %.2f",
+			m.styles.CardTitle.Render(fmt.Sprintf("⚡ CPU (%d Cores)", m.localMetrics.CPUCores)),
+			m.renderGauge(cpuP, barW), m.formatPercent(cpuP),
+			m.styles.MutedText.Render("Trend:"), m.renderSparkline(m.cpuHistory, sparkW),
+			m.styles.MutedText.Render("Load: "), m.localMetrics.Load1, m.localMetrics.Load5,
+		)
+		memCard := fmt.Sprintf("%s\n%s %s\n%s %s\n%s %s / %s",
+			m.styles.CardTitle.Render("🧠 RAM MEMORY"),
+			m.renderGauge(memP, barW), m.formatPercent(memP),
+			m.styles.MutedText.Render("Trend:"), m.renderSparkline(m.memHistory, sparkW),
+			m.styles.MutedText.Render("Used: "), usedMemStr, totMemStr,
+		)
+		swapCard := fmt.Sprintf("%s\n%s %s\n%s %s\n%s %s",
+			m.styles.CardTitle.Render("🔄 SWAP MEMORY"),
+			m.renderGauge(swapP, barW), m.formatPercent(swapP),
+			m.styles.MutedText.Render("Free: "), formatBytes(m.localMetrics.FreeSwap),
+			m.styles.MutedText.Render("Total:"), totSwapStr,
+		)
+		netCard := fmt.Sprintf("%s\n%s ↓%s/s\n%s ↑%s/s\n%s %s",
+			m.styles.CardTitle.Render("🌐 NETWORK I/O"),
+			m.styles.GaugeLow.Render("Rx:"), rxRateStr,
+			m.styles.GaugeMed.Render("Tx:"), txRateStr,
+			m.styles.MutedText.Render("Tot:"), formatBytes(m.localMetrics.BytesRecv),
+		)
+
+		c1 := m.styles.MetricCard.Width(cardStyleW2).Render(cpuCard)
+		c2 := m.styles.MetricCard.Width(cardStyleW2 + rem2).Render(memCard)
+		c3 := m.styles.MetricCard.Width(cardStyleW2).Render(swapCard)
+		c4 := m.styles.MetricCard.Width(cardStyleW2 + rem2).Render(netCard)
+
+		row1 := lipgloss.JoinHorizontal(lipgloss.Top, c1, " ", c2)
+		row2 := lipgloss.JoinHorizontal(lipgloss.Top, c3, " ", c4)
+		sb.WriteString(lipgloss.JoinVertical(lipgloss.Left, row1, row2))
+	}
 	sb.WriteString("\n\n")
 
 	// CPU Per-Core Matrix (if available and <= 32 cores)
 	if len(m.localMetrics.CoreUsages) > 0 {
 		sb.WriteString(m.styles.Subtitle.Render("📊 CPU PER-CORE USAGE MATRIX") + "\n")
-		sb.WriteString(strings.Repeat("─", width-8) + "\n")
-		var currRow strings.Builder
+		sb.WriteString(m.styles.Divider.Render(strings.Repeat("─", width)) + "\n")
+
 		limitCores := len(m.localMetrics.CoreUsages)
-		if limitCores > 24 {
-			limitCores = 24
+		if limitCores > 32 {
+			limitCores = 32
 		}
+
+		targetColW := 24
+		numCols := width / targetColW
+		if numCols < 2 {
+			numCols = 2
+		}
+		if numCols > 8 {
+			numCols = 8
+		}
+		if numCols > limitCores {
+			numCols = limitCores
+		}
+
+		colW := width / numCols
+		gaugeW := colW - 14
+		if gaugeW < 4 {
+			gaugeW = 4
+		}
+		if gaugeW > 12 {
+			gaugeW = 12
+		}
+
+		var currRow strings.Builder
 		for idx := 0; idx < limitCores; idx++ {
 			cUsage := m.localMetrics.CoreUsages[idx]
-			fmt.Fprintf(&currRow, " C%-2d [%s] %4.1f%% ", idx, renderBar(cUsage, 6), cUsage)
-			if (idx+1)%4 == 0 || idx == limitCores-1 {
+			coreTag := fmt.Sprintf("C%-2d", idx)
+			gauge := m.renderGauge(cUsage, gaugeW)
+			pct := m.formatPercent(cUsage)
+			cell := fmt.Sprintf(" %s [%s] %s", m.styles.MutedText.Render(coreTag), gauge, pct)
+
+			cellW := lipgloss.Width(cell)
+			if cellW < colW {
+				cell += strings.Repeat(" ", colW-cellW)
+			}
+			currRow.WriteString(cell)
+
+			if (idx+1)%numCols == 0 || idx == limitCores-1 {
 				currRow.WriteString("\n")
 			}
 		}
@@ -580,54 +765,274 @@ func (m *DashboardModel) renderOverviewTab(width int) string {
 
 	// Storage & Disks Partitions Breakdown Table
 	sb.WriteString(m.styles.Subtitle.Render("💾 STORAGE & DISK PARTITIONS") + "\n")
-	sb.WriteString(strings.Repeat("─", width-8) + "\n")
+	sb.WriteString(m.styles.Divider.Render(strings.Repeat("─", width)) + "\n")
+
 	if len(m.localMetrics.Partitions) > 0 {
-		fmt.Fprintf(&sb, "  %-20s %-16s %-8s %-18s %-14s %-8s\n",
-			"MOUNTPOINT", "DEVICE", "FSTYPE", "USED / TOTAL", "BAR", "USAGE%")
-		for _, p := range m.localMetrics.Partitions {
-			pBar := renderBar(p.UsedPercent, 10)
-			fmt.Fprintf(&sb, "  %-20s %-16s %-8s %-18s [%s] %5.1f%%\n",
-				truncate(p.Mountpoint, 19),
-				truncate(p.Device, 15),
-				p.Fstype,
-				fmt.Sprintf("%s / %s", formatBytes(p.Used), formatBytes(p.Total)),
-				pBar,
-				p.UsedPercent,
+		if width >= 110 {
+			// Full 6 columns (MOUNTPOINT, DEVICE, FSTYPE, USED/TOTAL, USAGE METER, USAGE%)
+			devW := 16
+			fsW := 8
+			sizeW := 22
+			pctW := 8
+			fixed := devW + fsW + sizeW + pctW + 10
+			remaining := width - fixed
+			if remaining < 20 {
+				remaining = 20
+			}
+			mountW := remaining * 45 / 100
+			if mountW < 16 {
+				mountW = 16
+			}
+			if mountW > 36 {
+				mountW = 36
+			}
+			barW := remaining - mountW
+			if barW < 8 {
+				barW = 8
+			}
+			if barW > 32 {
+				barW = 32
+			}
+
+			fmt.Fprintf(&sb, "  %-*s %-*s %-*s %-*s %-*s %*s\n",
+				mountW, "MOUNTPOINT",
+				devW, "DEVICE",
+				fsW, "FSTYPE",
+				sizeW, "USED / TOTAL",
+				barW, "USAGE METER",
+				pctW, "USAGE%",
 			)
+
+			for _, p := range m.localMetrics.Partitions {
+				pBar := m.renderGauge(p.UsedPercent, barW)
+				fmt.Fprintf(&sb, "  %-*s %-*s %-*s %-*s %s %s\n",
+					mountW, truncate(p.Mountpoint, mountW-1),
+					devW, truncate(p.Device, devW-1),
+					fsW, p.Fstype,
+					sizeW, fmt.Sprintf("%s / %s", formatBytes(p.Used), formatBytes(p.Total)),
+					pBar,
+					m.formatPercent(p.UsedPercent),
+				)
+			}
+		} else if width >= 85 {
+			// 5 columns (omit FSTYPE)
+			devW := 14
+			sizeW := 20
+			pctW := 8
+			fixed := devW + sizeW + pctW + 8
+			remaining := width - fixed
+			if remaining < 16 {
+				remaining = 16
+			}
+			mountW := remaining * 45 / 100
+			if mountW < 14 {
+				mountW = 14
+			}
+			barW := remaining - mountW
+			if barW < 6 {
+				barW = 6
+			}
+
+			fmt.Fprintf(&sb, "  %-*s %-*s %-*s %-*s %*s\n",
+				mountW, "MOUNTPOINT",
+				devW, "DEVICE",
+				sizeW, "USED / TOTAL",
+				barW, "USAGE METER",
+				pctW, "USAGE%",
+			)
+
+			for _, p := range m.localMetrics.Partitions {
+				pBar := m.renderGauge(p.UsedPercent, barW)
+				fmt.Fprintf(&sb, "  %-*s %-*s %-*s %s %s\n",
+					mountW, truncate(p.Mountpoint, mountW-1),
+					devW, truncate(p.Device, devW-1),
+					sizeW, fmt.Sprintf("%s / %s", formatBytes(p.Used), formatBytes(p.Total)),
+					pBar,
+					m.formatPercent(p.UsedPercent),
+				)
+			}
+		} else {
+			// Compact 4 columns (MOUNTPOINT, USED/TOTAL, USAGE METER, USAGE%)
+			sizeW := 18
+			pctW := 8
+			fixed := sizeW + pctW + 6
+			remaining := width - fixed
+			if remaining < 16 {
+				remaining = 16
+			}
+			mountW := remaining * 45 / 100
+			if mountW < 12 {
+				mountW = 12
+			}
+			barW := remaining - mountW
+			if barW < 6 {
+				barW = 6
+			}
+
+			fmt.Fprintf(&sb, "  %-*s %-*s %-*s %*s\n",
+				mountW, "MOUNTPOINT",
+				sizeW, "USED / TOTAL",
+				barW, "USAGE METER",
+				pctW, "USAGE%",
+			)
+
+			for _, p := range m.localMetrics.Partitions {
+				pBar := m.renderGauge(p.UsedPercent, barW)
+				fmt.Fprintf(&sb, "  %-*s %-*s %s %s\n",
+					mountW, truncate(p.Mountpoint, mountW-1),
+					sizeW, fmt.Sprintf("%s / %s", formatBytes(p.Used), formatBytes(p.Total)),
+					pBar,
+					m.formatPercent(p.UsedPercent),
+				)
+			}
 		}
 	} else {
-		fmt.Fprintf(&sb, "  Root: %s / %s (%.1f%%)\n",
-			formatBytes(m.localMetrics.UsedDisk), formatBytes(m.localMetrics.TotalDisk), m.localMetrics.DiskUsage)
+		fmt.Fprintf(&sb, "  Root: %s / %s (%s)\n",
+			formatBytes(m.localMetrics.UsedDisk), formatBytes(m.localMetrics.TotalDisk), m.formatPercent(m.localMetrics.DiskUsage))
 	}
 	sb.WriteString("\n")
 
 	// Top Processes (Task Manager)
 	if len(m.localMetrics.TopProcesses) > 0 {
 		sb.WriteString(m.styles.Subtitle.Render("📈 TOP PROCESSES (TASK MANAGER)") + "\n")
-		sb.WriteString(strings.Repeat("─", width-8) + "\n")
-		fmt.Fprintf(&sb, "  %-8s %-22s %-10s %-10s %-14s\n",
-			"PID", "PROCESS", "CPU%", "MEM%", "RSS MEMORY")
-		for _, pr := range m.localMetrics.TopProcesses {
-			fmt.Fprintf(&sb, "  %-8d %-22s %5.1f%%    %5.1f%%    %-14s\n",
-				pr.PID, truncate(pr.Name, 21), pr.CPUPercent, pr.MemoryPercent, formatBytes(pr.MemoryBytes))
+		sb.WriteString(m.styles.Divider.Render(strings.Repeat("─", width)) + "\n")
+
+		if width >= 105 {
+			// Full dual meter view
+			pidW := 8
+			sizeW := 12
+			cpuBarW := 10
+			memBarW := 10
+			fixed := pidW + sizeW + (cpuBarW + 9) + (memBarW + 9) + 12
+			procW := width - fixed
+			if procW < 16 {
+				procW = 16
+			}
+			if procW > 38 {
+				procW = 38
+			}
+
+			fmt.Fprintf(&sb, "  %-*s %-*s %-*s %-*s %*s\n",
+				pidW, "PID",
+				procW, "PROCESS",
+				cpuBarW+8, "CPU METER",
+				memBarW+8, "MEM METER",
+				sizeW, "RSS MEMORY",
+			)
+
+			for _, pr := range m.localMetrics.TopProcesses {
+				cpuGauge := m.renderGauge(min(100.0, pr.CPUPercent), cpuBarW)
+				memGauge := m.renderGauge(min(100.0, float64(pr.MemoryPercent)), memBarW)
+				fmt.Fprintf(&sb, "  %-*d %-*s %s %s %s %s %*s\n",
+					pidW, pr.PID,
+					procW, truncate(pr.Name, procW-1),
+					cpuGauge, m.formatPercent(pr.CPUPercent),
+					memGauge, m.formatPercent(float64(pr.MemoryPercent)),
+					sizeW, formatBytes(pr.MemoryBytes),
+				)
+			}
+		} else if width >= 85 {
+			// Single CPU meter + Mem %
+			pidW := 7
+			sizeW := 10
+			cpuBarW := 8
+			pctW := 7
+			fixed := pidW + sizeW + (cpuBarW + 9) + pctW + 10
+			procW := width - fixed
+			if procW < 14 {
+				procW = 14
+			}
+			if procW > 30 {
+				procW = 30
+			}
+
+			fmt.Fprintf(&sb, "  %-*s %-*s %-*s %-*s %*s\n",
+				pidW, "PID",
+				procW, "PROCESS",
+				cpuBarW+8, "CPU METER",
+				pctW, "MEM%",
+				sizeW, "RSS MEM",
+			)
+
+			for _, pr := range m.localMetrics.TopProcesses {
+				cpuGauge := m.renderGauge(min(100.0, pr.CPUPercent), cpuBarW)
+				fmt.Fprintf(&sb, "  %-*d %-*s %s %s %s %*s\n",
+					pidW, pr.PID,
+					procW, truncate(pr.Name, procW-1),
+					cpuGauge, m.formatPercent(pr.CPUPercent),
+					m.formatPercent(float64(pr.MemoryPercent)),
+					sizeW, formatBytes(pr.MemoryBytes),
+				)
+			}
+		} else {
+			// Compact view: PID, PROCESS, CPU%, MEM%, RSS MEM
+			pidW := 7
+			sizeW := 10
+			pctW := 7
+			fixed := pidW + pctW + pctW + sizeW + 8
+			procW := width - fixed
+			if procW < 12 {
+				procW = 12
+			}
+
+			fmt.Fprintf(&sb, "  %-*s %-*s %-*s %-*s %*s\n",
+				pidW, "PID",
+				procW, "PROCESS",
+				pctW, "CPU%",
+				pctW, "MEM%",
+				sizeW, "RSS MEM",
+			)
+
+			for _, pr := range m.localMetrics.TopProcesses {
+				fmt.Fprintf(&sb, "  %-*d %-*s %s %s %*s\n",
+					pidW, pr.PID,
+					procW, truncate(pr.Name, procW-1),
+					m.formatPercent(pr.CPUPercent),
+					m.formatPercent(float64(pr.MemoryPercent)),
+					sizeW, formatBytes(pr.MemoryBytes),
+				)
+			}
 		}
 		sb.WriteString("\n")
 	}
 
 	// Machine Host Details
 	sb.WriteString(m.styles.Subtitle.Render("💻 HOST & MESH PLATFORM") + "\n")
-	sb.WriteString(strings.Repeat("─", width-8) + "\n")
+	sb.WriteString(m.styles.Divider.Render(strings.Repeat("─", width)) + "\n")
 	uptimeStr := formatUptime(m.localMetrics.Uptime)
 	modelStr := m.localMetrics.CPUModel
-	if len(modelStr) > 40 {
-		modelStr = modelStr[:40] + "..."
-	}
-	fmt.Fprintf(&sb, "  Hostname:       %-26s OS / Platform:  %s %s (%s)\n",
-		m.localMetrics.Hostname, m.localMetrics.Platform, m.localMetrics.PlatformVer, m.localMetrics.Arch)
-	fmt.Fprintf(&sb, "  Kernel:         %-26s System Uptime:  %s\n",
-		m.localMetrics.KernelVer, uptimeStr)
-	if modelStr != "" {
-		fmt.Fprintf(&sb, "  CPU Model:      %s\n", modelStr)
+
+	if width >= 120 {
+		col1 := fmt.Sprintf("Hostname:   %s (%s)", m.localMetrics.Hostname, m.localMetrics.Arch)
+		col2 := fmt.Sprintf("OS/Platform: %s %s", m.localMetrics.Platform, m.localMetrics.PlatformVer)
+		col3 := fmt.Sprintf("System Uptime: %s", uptimeStr)
+		fmt.Fprintf(&sb, "  %-38s %-38s %s\n", truncate(col1, 36), truncate(col2, 36), col3)
+
+		col4 := fmt.Sprintf("Kernel:     %s", m.localMetrics.KernelVer)
+		col5 := fmt.Sprintf("CPU Model:   %s", modelStr)
+		col6 := fmt.Sprintf("Load Averages: %.2f, %.2f, %.2f", m.localMetrics.Load1, m.localMetrics.Load5, m.localMetrics.Load15)
+		fmt.Fprintf(&sb, "  %-38s %-38s %s\n", truncate(col4, 36), truncate(col5, 36), col6)
+	} else if width >= 85 {
+		colW := (width - 4) / 2
+		fmt.Fprintf(&sb, "  %-*s %s\n",
+			colW, "Hostname: "+truncate(fmt.Sprintf("%s (%s)", m.localMetrics.Hostname, m.localMetrics.Arch), colW-11),
+			"OS: "+truncate(fmt.Sprintf("%s %s", m.localMetrics.Platform, m.localMetrics.PlatformVer), colW-5),
+		)
+		fmt.Fprintf(&sb, "  %-*s %s\n",
+			colW, "Kernel:   "+truncate(m.localMetrics.KernelVer, colW-11),
+			"Uptime: "+uptimeStr,
+		)
+		if modelStr != "" {
+			fmt.Fprintf(&sb, "  %-*s %s\n",
+				colW, "CPU Model: "+truncate(modelStr, colW-12),
+				fmt.Sprintf("Load: %.2f, %.2f, %.2f", m.localMetrics.Load1, m.localMetrics.Load5, m.localMetrics.Load15),
+			)
+		}
+	} else {
+		// Compact host layout
+		fmt.Fprintf(&sb, "  Hostname: %s (%s)\n", truncate(m.localMetrics.Hostname, width-20), m.localMetrics.Arch)
+		fmt.Fprintf(&sb, "  OS:       %s %s | Up: %s\n", m.localMetrics.Platform, m.localMetrics.PlatformVer, uptimeStr)
+		fmt.Fprintf(&sb, "  Kernel:   %s\n", truncate(m.localMetrics.KernelVer, width-12))
 	}
 
 	return sb.String()
@@ -638,64 +1043,163 @@ func (m *DashboardModel) renderNodesTab(width int) string {
 
 	sb.WriteString(m.styles.Subtitle.Render("🌐 MESH NODES (P2P WIREGUARD NETWORK)") + "\n\n")
 
-	header := fmt.Sprintf("%-2s %-16s %-20s %-14s %-12s %-12s %-10s\n",
-		" ", "NAME", "MESH ADDR", "STATUS", "LATENCY", "OS / ARCH", "CPU / RAM")
-	divider := strings.Repeat("─", width-8) + "\n"
-	sb.WriteString(header)
-	sb.WriteString(divider)
-
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 
-	for i, n := range m.nodes {
-		cursor := "  "
-		if i == m.selectedNode {
-			cursor = "❯ "
-		}
+	divider := m.styles.Divider.Render(strings.Repeat("─", width)) + "\n"
 
-		st := m.nodeStates[n.Name]
-		statusStr := m.styles.StatusStopped
-		latencyStr := "-"
-		osArchStr := n.OS + "/" + n.Arch
-		cpuMemStr := "-"
+	if width >= 105 {
+		header := fmt.Sprintf("  %-2s %-18s %-24s %-16s %-12s %-16s %-12s\n",
+			" ", "NAME", "MESH ADDR", "STATUS", "LATENCY", "OS / ARCH", "CPU / RAM")
+		sb.WriteString(header)
+		sb.WriteString(divider)
 
-		if st != nil {
-			if st.IsProbing {
-				statusStr = m.styles.StatusProbing
-			} else if st.IsOnline {
-				statusStr = m.styles.StatusRunning
-				if st.Latency > 0 {
-					latencyStr = fmt.Sprintf("%dms", st.Latency.Milliseconds())
+		for i, n := range m.nodes {
+			cursor := "  "
+			if i == m.selectedNode {
+				cursor = "❯ "
+			}
+
+			st := m.nodeStates[n.Name]
+			statusStr := m.styles.StatusStopped
+			latencyStr := "-"
+			osArchStr := n.OS + "/" + n.Arch
+			cpuMemStr := "-"
+
+			if st != nil {
+				if st.IsProbing {
+					statusStr = m.styles.StatusProbing
+				} else if st.IsOnline {
+					statusStr = m.styles.StatusRunning
+					if st.Latency > 0 {
+						latencyStr = fmt.Sprintf("%dms", st.Latency.Milliseconds())
+					} else {
+						latencyStr = "<1ms (local)"
+					}
+					if st.Node != nil && st.Node.CPUUsage > 0 {
+						cpuMemStr = fmt.Sprintf("%.0f%% / %.0f%%", st.Node.CPUUsage, st.Node.MemoryUsage)
+					}
 				} else {
-					latencyStr = "<1ms (local)"
+					statusStr = m.styles.StatusFailed
+					latencyStr = "Timeout"
 				}
-				if st.Node != nil && st.Node.CPUUsage > 0 {
-					cpuMemStr = fmt.Sprintf("%.0f%% / %.0f%%", st.Node.CPUUsage, st.Node.MemoryUsage)
-				}
+			}
+
+			if osArchStr == "/" {
+				osArchStr = "unknown"
+			}
+
+			row := fmt.Sprintf("  %-2s %-18s %-24s %-16s %-12s %-16s %-12s\n",
+				cursor,
+				truncate(n.Name, 17),
+				truncate(n.Addr, 23),
+				statusStr,
+				latencyStr,
+				osArchStr,
+				cpuMemStr,
+			)
+
+			if i == m.selectedNode {
+				sb.WriteString(m.styles.SelectedRow.Render(row))
 			} else {
-				statusStr = m.styles.StatusFailed
-				latencyStr = "Timeout"
+				sb.WriteString(row)
 			}
 		}
+	} else if width >= 85 {
+		// Medium view: omit OS/ARCH
+		header := fmt.Sprintf("  %-2s %-18s %-20s %-16s %-12s %-10s\n",
+			" ", "NAME", "MESH ADDR", "STATUS", "LATENCY", "CPU/RAM")
+		sb.WriteString(header)
+		sb.WriteString(divider)
 
-		if osArchStr == "/" {
-			osArchStr = "unknown"
+		for i, n := range m.nodes {
+			cursor := "  "
+			if i == m.selectedNode {
+				cursor = "❯ "
+			}
+
+			st := m.nodeStates[n.Name]
+			statusStr := m.styles.StatusStopped
+			latencyStr := "-"
+			cpuMemStr := "-"
+
+			if st != nil {
+				if st.IsProbing {
+					statusStr = m.styles.StatusProbing
+				} else if st.IsOnline {
+					statusStr = m.styles.StatusRunning
+					if st.Latency > 0 {
+						latencyStr = fmt.Sprintf("%dms", st.Latency.Milliseconds())
+					} else {
+						latencyStr = "<1ms"
+					}
+					if st.Node != nil && st.Node.CPUUsage > 0 {
+						cpuMemStr = fmt.Sprintf("%.0f%%/%.0f%%", st.Node.CPUUsage, st.Node.MemoryUsage)
+					}
+				} else {
+					statusStr = m.styles.StatusFailed
+					latencyStr = "Timeout"
+				}
+			}
+
+			row := fmt.Sprintf("  %-2s %-18s %-20s %-16s %-12s %-10s\n",
+				cursor,
+				truncate(n.Name, 17),
+				truncate(n.Addr, 19),
+				statusStr,
+				latencyStr,
+				cpuMemStr,
+			)
+
+			if i == m.selectedNode {
+				sb.WriteString(m.styles.SelectedRow.Render(row))
+			} else {
+				sb.WriteString(row)
+			}
 		}
+	} else {
+		// Compact view: NAME, MESH ADDR, STATUS, CPU/RAM
+		header := fmt.Sprintf("  %-2s %-16s %-18s %-16s %-10s\n",
+			" ", "NAME", "MESH ADDR", "STATUS", "CPU/RAM")
+		sb.WriteString(header)
+		sb.WriteString(divider)
 
-		row := fmt.Sprintf("%-2s %-16s %-20s %-14s %-12s %-12s %-10s\n",
-			cursor,
-			truncate(n.Name, 15),
-			truncate(n.Addr, 19),
-			statusStr,
-			latencyStr,
-			osArchStr,
-			cpuMemStr,
-		)
+		for i, n := range m.nodes {
+			cursor := "  "
+			if i == m.selectedNode {
+				cursor = "❯ "
+			}
 
-		if i == m.selectedNode {
-			sb.WriteString(m.styles.SelectedRow.Render(row))
-		} else {
-			sb.WriteString(row)
+			st := m.nodeStates[n.Name]
+			statusStr := m.styles.StatusStopped
+			cpuMemStr := "-"
+
+			if st != nil {
+				if st.IsProbing {
+					statusStr = m.styles.StatusProbing
+				} else if st.IsOnline {
+					statusStr = m.styles.StatusRunning
+					if st.Node != nil && st.Node.CPUUsage > 0 {
+						cpuMemStr = fmt.Sprintf("%.0f%%/%.0f%%", st.Node.CPUUsage, st.Node.MemoryUsage)
+					}
+				} else {
+					statusStr = m.styles.StatusFailed
+				}
+			}
+
+			row := fmt.Sprintf("  %-2s %-16s %-18s %-16s %-10s\n",
+				cursor,
+				truncate(n.Name, 15),
+				truncate(n.Addr, 17),
+				statusStr,
+				cpuMemStr,
+			)
+
+			if i == m.selectedNode {
+				sb.WriteString(m.styles.SelectedRow.Render(row))
+			} else {
+				sb.WriteString(row)
+			}
 		}
 	}
 
@@ -704,7 +1208,7 @@ func (m *DashboardModel) renderNodesTab(width int) string {
 		sn := m.nodes[m.selectedNode]
 		st := m.nodeStates[sn.Name]
 		sb.WriteString("\n" + m.styles.Subtitle.Render("🔎 SELECTED NODE DETAILS") + "\n")
-		sb.WriteString(strings.Repeat("─", width-8) + "\n")
+		sb.WriteString(m.styles.Divider.Render(strings.Repeat("─", width)) + "\n")
 		fmt.Fprintf(&sb, "  Node ID:     %s\n", sn.ID)
 		fmt.Fprintf(&sb, "  Mesh Addr:   %s\n", sn.Addr)
 		if st != nil && !st.IsOnline && st.Error != "" {
@@ -894,48 +1398,126 @@ func (m *DashboardModel) renderServicesTab(width int) string {
 		m.selectedSvc = len(workloads) - 1
 	}
 
-	header := fmt.Sprintf("%-2s %-16s %-14s %-10s %-12s %-14s %-20s %-14s\n",
-		" ", "SERVICE", "NODE", "TYPE", "STATUS", "PORTS", "INGRESS DOMAIN", "HTTPS/TLS")
-	divider := strings.Repeat("─", width-8) + "\n"
-	sb.WriteString(header)
-	sb.WriteString(divider)
+	divider := m.styles.Divider.Render(strings.Repeat("─", width)) + "\n"
 
-	for i, w := range workloads {
-		cursor := "  "
-		if i == m.selectedSvc {
-			cursor = "❯ "
+	if width >= 120 {
+		header := fmt.Sprintf("  %-2s %-18s %-16s %-12s %-14s %-18s %-24s %-14s\n",
+			" ", "SERVICE", "NODE", "TYPE", "STATUS", "PORTS", "INGRESS DOMAIN", "HTTPS/TLS")
+		sb.WriteString(header)
+		sb.WriteString(divider)
+
+		for i, w := range workloads {
+			cursor := "  "
+			if i == m.selectedSvc {
+				cursor = "❯ "
+			}
+
+			st := m.styles.StatusRunning
+			switch w.State {
+			case entity.StateFailed:
+				st = m.styles.StatusFailed
+			case entity.StateStopped:
+				st = m.styles.StatusStopped
+			case entity.StateDeploying:
+				st = m.styles.StatusProbing
+			}
+
+			portsStr := strings.Join(w.Ports, ", ")
+			if portsStr == "" {
+				portsStr = "-"
+			}
+
+			row := fmt.Sprintf("  %-2s %-18s %-16s %-12s %-14s %-18s %-24s %-14s\n",
+				cursor,
+				truncate(w.Name, 17),
+				truncate(w.NodeName, 15),
+				truncate(string(w.Type), 11),
+				st,
+				truncate(portsStr, 17),
+				truncate(w.Domain, 23),
+				truncate(w.TLS, 13),
+			)
+
+			if i == m.selectedSvc {
+				sb.WriteString(m.styles.SelectedRow.Render(row))
+			} else {
+				sb.WriteString(row)
+			}
 		}
+	} else if width >= 90 {
+		// Medium view: omit PORTS and TLS
+		header := fmt.Sprintf("  %-2s %-18s %-14s %-10s %-14s %-20s\n",
+			" ", "SERVICE", "NODE", "TYPE", "STATUS", "INGRESS DOMAIN")
+		sb.WriteString(header)
+		sb.WriteString(divider)
 
-		st := m.styles.StatusRunning
-		switch w.State {
-		case entity.StateFailed:
-			st = m.styles.StatusFailed
-		case entity.StateStopped:
-			st = m.styles.StatusStopped
-		case entity.StateDeploying:
-			st = m.styles.StatusProbing
+		for i, w := range workloads {
+			cursor := "  "
+			if i == m.selectedSvc {
+				cursor = "❯ "
+			}
+
+			st := m.styles.StatusRunning
+			switch w.State {
+			case entity.StateFailed:
+				st = m.styles.StatusFailed
+			case entity.StateStopped:
+				st = m.styles.StatusStopped
+			case entity.StateDeploying:
+				st = m.styles.StatusProbing
+			}
+
+			row := fmt.Sprintf("  %-2s %-18s %-14s %-10s %-14s %-20s\n",
+				cursor,
+				truncate(w.Name, 17),
+				truncate(w.NodeName, 13),
+				truncate(string(w.Type), 9),
+				st,
+				truncate(w.Domain, 19),
+			)
+
+			if i == m.selectedSvc {
+				sb.WriteString(m.styles.SelectedRow.Render(row))
+			} else {
+				sb.WriteString(row)
+			}
 		}
+	} else {
+		// Compact view: SERVICE, TYPE, STATUS, DOMAIN
+		header := fmt.Sprintf("  %-2s %-16s %-10s %-14s %-18s\n",
+			" ", "SERVICE", "TYPE", "STATUS", "DOMAIN")
+		sb.WriteString(header)
+		sb.WriteString(divider)
 
-		portsStr := strings.Join(w.Ports, ", ")
-		if portsStr == "" {
-			portsStr = "-"
-		}
+		for i, w := range workloads {
+			cursor := "  "
+			if i == m.selectedSvc {
+				cursor = "❯ "
+			}
 
-		row := fmt.Sprintf("%-2s %-16s %-14s %-10s %-12s %-14s %-20s %-14s\n",
-			cursor,
-			truncate(w.Name, 15),
-			truncate(w.NodeName, 13),
-			truncate(string(w.Type), 9),
-			st,
-			truncate(portsStr, 13),
-			truncate(w.Domain, 19),
-			truncate(w.TLS, 13),
-		)
+			st := m.styles.StatusRunning
+			switch w.State {
+			case entity.StateFailed:
+				st = m.styles.StatusFailed
+			case entity.StateStopped:
+				st = m.styles.StatusStopped
+			case entity.StateDeploying:
+				st = m.styles.StatusProbing
+			}
 
-		if i == m.selectedSvc {
-			sb.WriteString(m.styles.SelectedRow.Render(row))
-		} else {
-			sb.WriteString(row)
+			row := fmt.Sprintf("  %-2s %-16s %-10s %-14s %-18s\n",
+				cursor,
+				truncate(w.Name, 15),
+				truncate(string(w.Type), 9),
+				st,
+				truncate(w.Domain, 17),
+			)
+
+			if i == m.selectedSvc {
+				sb.WriteString(m.styles.SelectedRow.Render(row))
+			} else {
+				sb.WriteString(row)
+			}
 		}
 	}
 
@@ -943,7 +1525,7 @@ func (m *DashboardModel) renderServicesTab(width int) string {
 	if m.selectedSvc < len(workloads) {
 		sw := workloads[m.selectedSvc]
 		sb.WriteString("\n" + m.styles.Subtitle.Render("🔎 SELECTED WORKLOAD DETAILS") + "\n")
-		sb.WriteString(strings.Repeat("─", width-8) + "\n")
+		sb.WriteString(m.styles.Divider.Render(strings.Repeat("─", width)) + "\n")
 		fmt.Fprintf(&sb, "  Service Name:   %-20s Node:          %s\n", sw.Name, sw.NodeName)
 		fmt.Fprintf(&sb, "  Workload Type:  %-20s Status:        %s\n", sw.Type, sw.State)
 		fmt.Fprintf(&sb, "  Replicas:       %-20d Load Balancer: %s\n", sw.Replicas, sw.LBPolicy)
@@ -965,8 +1547,12 @@ func (m *DashboardModel) renderLogsTab(width int) string {
 	var sb strings.Builder
 	sb.WriteString(m.styles.Subtitle.Render("📜 REAL-TIME LIVE LOGS") + "\n\n")
 
+	maxLogW := width - 4
+	if maxLogW < 30 {
+		maxLogW = 30
+	}
 	for _, l := range m.logs {
-		sb.WriteString("  " + l + "\n")
+		sb.WriteString("  " + truncate(l, maxLogW) + "\n")
 	}
 	sb.WriteString("\n  " + m.styles.MutedText.Render("(Press [r] to refresh; logs auto-stream from running services...)"))
 	return sb.String()
@@ -977,21 +1563,95 @@ func (m *DashboardModel) renderBackupsTab(width int) string {
 	sb.WriteString(m.styles.Subtitle.Render("💾 BACKUPS & SNAPSHOTS") + "\n\n")
 
 	sb.WriteString("  Active Backup Policies:\n")
-	sb.WriteString("  • Daily Snapshot: Local Directory (.kizuna/backups) + S3 Compatible Vault\n")
-	sb.WriteString("  • Retention: Keep last 7 revisions (older archives automatically pruned)\n\n")
+	if width >= 90 {
+		sb.WriteString("  • Daily Snapshot: Local Directory (.kizuna/backups) + S3 Compatible Vault\n")
+		sb.WriteString("  • Retention: Keep last 7 revisions (older archives automatically pruned)\n\n")
+	} else {
+		sb.WriteString("  • Daily Snapshot: Local (.kizuna/backups) + S3 Vault\n")
+		sb.WriteString("  • Retention: Keep last 7 revisions (auto-pruned)\n\n")
+	}
 	sb.WriteString("  Create a new snapshot with:  kizuna backup <service-name>\n")
 	return sb.String()
 }
 
-func renderSparkline(values []float64) string {
-	sparks := []rune{' ', '▂', '▃', '▄', '▅', '▆', '▇', '█'}
-	if len(values) == 0 {
-		return " "
+// renderGauge renders a smooth, high-resolution gauge with 1/8th fractional blocks
+func (m *DashboardModel) renderGauge(percent float64, width int) string {
+	if width < 3 {
+		width = 3
 	}
-	maxVal := 100.0
+	if percent < 0 {
+		percent = 0
+	}
+	if percent > 100 {
+		percent = 100
+	}
+
+	totalEighths := int((percent/100.0)*float64(width*8) + 0.5)
+	fullBlocks := totalEighths / 8
+	partial := totalEighths % 8
+
+	var fillStyle lipgloss.Style
+	if percent < 60.0 {
+		fillStyle = m.styles.GaugeLow
+	} else if percent < 85.0 {
+		fillStyle = m.styles.GaugeMed
+	} else {
+		fillStyle = m.styles.GaugeHigh
+	}
+
 	var sb strings.Builder
-	for _, v := range values {
-		idx := int((v / maxVal) * float64(len(sparks)-1))
+	if fullBlocks > 0 {
+		sb.WriteString(fillStyle.Render(strings.Repeat("█", fullBlocks)))
+	}
+	emptyBlocks := width - fullBlocks
+	if partial > 0 && emptyBlocks > 0 {
+		subRunes := []rune{' ', '▏', '▎', '▍', '▌', '▋', '▊', '▉'}
+		sb.WriteString(fillStyle.Render(string(subRunes[partial])))
+		emptyBlocks--
+	}
+	if emptyBlocks > 0 {
+		sb.WriteString(m.styles.GaugeEmpty.Render(strings.Repeat("░", emptyBlocks)))
+	}
+	return sb.String()
+}
+
+// formatPercent formats a percentage with color-graded threshold styling
+func (m *DashboardModel) formatPercent(p float64) string {
+	var style lipgloss.Style
+	if p < 60.0 {
+		style = m.styles.GaugeLow
+	} else if p < 85.0 {
+		style = m.styles.GaugeMed
+	} else {
+		style = m.styles.GaugeHigh
+	}
+	return style.Render(fmt.Sprintf("%5.1f%%", p))
+}
+
+func (m *DashboardModel) renderSparkline(values []float64, maxLen int) string {
+	sparks := []rune{' ', '▂', '▃', '▄', '▅', '▆', '▇', '█'}
+	if maxLen <= 0 {
+		maxLen = 14
+	}
+
+	var displayValues []float64
+	if len(values) < maxLen {
+		padCount := maxLen - len(values)
+		baseline := 0.0
+		if len(values) > 0 {
+			baseline = values[0]
+		}
+		for i := 0; i < padCount; i++ {
+			displayValues = append(displayValues, baseline)
+		}
+		displayValues = append(displayValues, values...)
+	} else {
+		displayValues = values[len(values)-maxLen:]
+	}
+
+	var sb strings.Builder
+	for _, v := range displayValues {
+		idx := int((v / 100.0) * float64(len(sparks)-1))
 		if idx < 0 {
 			idx = 0
 		}
@@ -1000,21 +1660,38 @@ func renderSparkline(values []float64) string {
 		}
 		sb.WriteRune(sparks[idx])
 	}
-	return sb.String()
+	return m.styles.Sparkline.Render(sb.String())
 }
 
 func renderBar(percent float64, totalBars int) string {
 	if totalBars <= 0 {
 		totalBars = 20
 	}
-	filled := int((percent / 100.0) * float64(totalBars))
-	if filled > totalBars {
-		filled = totalBars
+	if percent < 0 {
+		percent = 0
 	}
-	if filled < 0 {
-		filled = 0
+	if percent > 100 {
+		percent = 100
 	}
-	return strings.Repeat("█", filled) + strings.Repeat("░", totalBars-filled)
+
+	totalEighths := int((percent/100.0)*float64(totalBars*8) + 0.5)
+	fullBlocks := totalEighths / 8
+	partial := totalEighths % 8
+
+	var sb strings.Builder
+	if fullBlocks > 0 {
+		sb.WriteString(strings.Repeat("█", fullBlocks))
+	}
+	emptyBlocks := totalBars - fullBlocks
+	if partial > 0 && emptyBlocks > 0 {
+		subRunes := []rune{' ', '▏', '▎', '▍', '▌', '▋', '▊', '▉'}
+		sb.WriteString(string(subRunes[partial]))
+		emptyBlocks--
+	}
+	if emptyBlocks > 0 {
+		sb.WriteString(strings.Repeat("░", emptyBlocks))
+	}
+	return sb.String()
 }
 
 func formatBytes(b uint64) string {
