@@ -28,8 +28,14 @@ func NewClient(target *entity.TargetHost) *Client {
 }
 
 // getAuthMethods discovers available SSH auth mechanisms (agent, keys, password)
-func (c *Client) getAuthMethods() []ssh.AuthMethod {
+func (c *Client) getAuthMethods() ([]ssh.AuthMethod, func()) {
 	var methods []ssh.AuthMethod
+	var closers []func()
+	cleanup := func() {
+		for _, cl := range closers {
+			cl()
+		}
+	}
 
 	// 1. Password if provided
 	if c.target.Password != "" {
@@ -51,6 +57,9 @@ func (c *Client) getAuthMethods() []ssh.AuthMethod {
 			agentClient := agent.NewClient(conn)
 			if signers, err := agentClient.Signers(); err == nil && len(signers) > 0 {
 				methods = append(methods, ssh.PublicKeys(signers...))
+				closers = append(closers, func() { _ = conn.Close() })
+			} else {
+				_ = conn.Close()
 			}
 		}
 	}
@@ -68,7 +77,7 @@ func (c *Client) getAuthMethods() []ssh.AuthMethod {
 		}
 	}
 
-	return methods
+	return methods, cleanup
 }
 
 // connect establishes an SSH connection to the target host
@@ -88,9 +97,12 @@ func (c *Client) connect(ctx context.Context) (*ssh.Client, error) {
 
 	addr := net.JoinHostPort(c.target.Host, strconv.Itoa(port))
 
+	authMethods, cleanup := c.getAuthMethods()
+	defer cleanup()
+
 	config := &ssh.ClientConfig{
 		User:            user,
-		Auth:            c.getAuthMethods(),
+		Auth:            authMethods,
 		HostKeyCallback: ssh.InsecureIgnoreHostKey(), // In production can use known_hosts
 		Timeout:         15 * time.Second,
 	}

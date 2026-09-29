@@ -28,6 +28,7 @@ func NewMeshClient(mesh domain.MeshGateway) *MeshClient {
 func (c *MeshClient) getHTTPClient(ctx context.Context, addr string, port uint16) *http.Client {
 	return &http.Client{
 		Transport: &http.Transport{
+			DisableKeepAlives: true,
 			DialContext: func(ctx context.Context, network, _ string) (net.Conn, error) {
 				return c.mesh.Dial(ctx, addr, port)
 			},

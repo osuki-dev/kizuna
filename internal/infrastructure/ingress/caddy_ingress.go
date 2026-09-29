@@ -237,14 +237,15 @@ func (m *CaddyManager) reloadInternal(ctx context.Context) error {
 	// 1. Try local caddy binary if present in PATH
 	if _, err := exec.LookPath("caddy"); err == nil {
 		cmd := exec.CommandContext(ctx, "caddy", "reload", "--config", m.caddyFile)
-		if out, err := cmd.CombinedOutput(); err == nil {
-			return nil
-		} else {
-			// If reload failed because caddy wasn't running, start it in background
-			_ = exec.Command("caddy", "start", "--config", m.caddyFile).Start()
-			_ = out
+		if _, err := cmd.CombinedOutput(); err == nil {
 			return nil
 		}
+		// If reload failed because caddy wasn't running, start it
+		startCmd := exec.CommandContext(ctx, "caddy", "start", "--config", m.caddyFile)
+		if startOut, err := startCmd.CombinedOutput(); err != nil {
+			return fmt.Errorf("failed to start caddy: %w (output: %s)", err, strings.TrimSpace(string(startOut)))
+		}
+		return nil
 	}
 
 	// 2. Fallback: run or reload Caddy container via Docker

@@ -1,6 +1,9 @@
 package workload
 
 import (
+	"archive/tar"
+	"bytes"
+	"compress/gzip"
 	"context"
 	"os"
 	"path/filepath"
@@ -58,5 +61,55 @@ func TestWorkloadRunner_PersistenceAndReload(t *testing.T) {
 	}
 	if reloadedSt.Name != "test-api" {
 		t.Fatalf("expected restored service 'test-api', got %s", reloadedSt.Name)
+	}
+}
+
+func TestUnpackTarGz_Security(t *testing.T) {
+	// Construct a tar.gz with valid and malicious (ZipSlip) paths
+	var buf bytes.Buffer
+	gw := gzip.NewWriter(&buf)
+	tw := tar.NewWriter(gw)
+
+	// Valid entry
+	contentValid := []byte("valid content")
+	_ = tw.WriteHeader(&tar.Header{
+		Name: "app/index.js",
+		Mode: 0644,
+		Size: int64(len(contentValid)),
+	})
+	_, _ = tw.Write(contentValid)
+
+	// Malicious path traversal entry
+	contentEvil := []byte("evil content")
+	_ = tw.WriteHeader(&tar.Header{
+		Name: "../evil.txt",
+		Mode: 0644,
+		Size: int64(len(contentEvil)),
+	})
+	_, _ = tw.Write(contentEvil)
+
+	_ = tw.Close()
+	_ = gw.Close()
+
+	destDir := t.TempDir()
+	err := unpackTarGz(&buf, destDir)
+	if err != nil {
+		t.Fatalf("unexpected unpackTarGz error: %v", err)
+	}
+
+	// 1. Verify valid file exists
+	validPath := filepath.Join(destDir, "app", "index.js")
+	data, err := os.ReadFile(validPath)
+	if err != nil {
+		t.Fatalf("failed to read valid file: %v", err)
+	}
+	if string(data) != "valid content" {
+		t.Errorf("expected 'valid content', got %s", string(data))
+	}
+
+	// 2. Verify evil path traversal was rejected / ignored
+	evilPath := filepath.Join(filepath.Dir(destDir), "evil.txt")
+	if _, err := os.Stat(evilPath); !os.IsNotExist(err) {
+		t.Fatalf("security vulnerability: ZipSlip file was written outside destDir!")
 	}
 }

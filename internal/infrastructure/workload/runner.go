@@ -1,7 +1,9 @@
 package workload
 
 import (
+	"archive/tar"
 	"bufio"
+	"compress/gzip"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -164,9 +166,14 @@ func (r *Runner) deployDocker(ctx context.Context, svc *entity.Service, workDir 
 		args = append(args, imageName)
 
 		cmd := exec.CommandContext(ctx, "docker", args...)
-		cmd.Stdout = r.getLogWriter(svc.Name)
-		cmd.Stderr = cmd.Stdout
-		return cmd.Run()
+		logW := r.getLogWriter(svc.Name)
+		cmd.Stdout = logW
+		cmd.Stderr = logW
+		err := cmd.Run()
+		if c, ok := logW.(io.Closer); ok {
+			_ = c.Close()
+		}
+		return err
 	}
 
 	// Multi-replica local scaling with auto-port allocation & Caddy upstream pooling
@@ -208,9 +215,14 @@ func (r *Runner) deployDocker(ctx context.Context, svc *entity.Service, workDir 
 		args = append(args, imageName)
 
 		cmd := exec.CommandContext(ctx, "docker", args...)
-		cmd.Stdout = r.getLogWriter(svc.Name)
-		cmd.Stderr = cmd.Stdout
-		if err := cmd.Run(); err != nil {
+		logW := r.getLogWriter(svc.Name)
+		cmd.Stdout = logW
+		cmd.Stderr = logW
+		err := cmd.Run()
+		if c, ok := logW.(io.Closer); ok {
+			_ = c.Close()
+		}
+		if err != nil {
 			return fmt.Errorf("failed to run replica %d: %w", i, err)
 		}
 	}
@@ -261,6 +273,9 @@ func (r *Runner) deployProcess(ctx context.Context, svc *entity.Service, workDir
 	cmd.Stderr = logWriter
 
 	if err := cmd.Start(); err != nil {
+		if c, ok := logWriter.(io.Closer); ok {
+			_ = c.Close()
+		}
 		return fmt.Errorf("failed to start process: %w", err)
 	}
 
@@ -270,6 +285,9 @@ func (r *Runner) deployProcess(ctx context.Context, svc *entity.Service, workDir
 
 	go func() {
 		_ = cmd.Wait()
+		if c, ok := logWriter.(io.Closer); ok {
+			_ = c.Close()
+		}
 		r.mu.Lock()
 		if cur, ok := r.services[svc.Name]; ok && cur.State == entity.StateRunning {
 			cur.State = entity.StateStopped
@@ -474,7 +492,61 @@ func (r *Runner) getLogWriter(serviceName string) io.Writer {
 }
 
 func unpackTarGz(r io.Reader, destDir string) error {
-	cmd := exec.Command("tar", "-xzf", "-", "-C", destDir)
-	cmd.Stdin = r
-	return cmd.Run()
+	gr, err := gzip.NewReader(r)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = gr.Close() }()
+
+	tr := tar.NewReader(gr)
+	cleanDest := filepath.Clean(destDir)
+
+	for {
+		header, err := tr.Next()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			return err
+		}
+
+		cleanName := filepath.Clean(header.Name)
+		// Security: prevent ZipSlip / TarSlip path traversal attacks
+		if strings.HasPrefix(cleanName, "..") || filepath.IsAbs(cleanName) {
+			continue
+		}
+
+		targetPath := filepath.Join(cleanDest, cleanName)
+		if !strings.HasPrefix(targetPath, cleanDest+string(filepath.Separator)) && targetPath != cleanDest {
+			continue
+		}
+
+		switch header.Typeflag {
+		case tar.TypeDir:
+			if err := os.MkdirAll(targetPath, 0755); err != nil {
+				return err
+			}
+		case tar.TypeReg:
+			if err := os.MkdirAll(filepath.Dir(targetPath), 0755); err != nil {
+				return err
+			}
+			mode := header.FileInfo().Mode()
+			if mode == 0 {
+				mode = 0644
+			}
+			f, err := os.OpenFile(targetPath, os.O_CREATE|os.O_RDWR|os.O_TRUNC, mode)
+			if err != nil {
+				return err
+			}
+			if _, err := io.Copy(f, tr); err != nil {
+				_ = f.Close()
+				return err
+			}
+			_ = f.Close()
+		case tar.TypeSymlink:
+			_ = os.Remove(targetPath)
+			_ = os.Symlink(header.Linkname, targetPath)
+		}
+	}
+	return nil
 }

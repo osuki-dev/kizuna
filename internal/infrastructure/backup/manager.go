@@ -75,8 +75,15 @@ func (m *Manager) CreateBackup(ctx context.Context, svcName string, cfg *entity.
 		}
 	}
 
-	_ = tw.Close()
-	_ = gw.Close()
+	if err := tw.Close(); err != nil {
+		return nil, err
+	}
+	if err := gw.Close(); err != nil {
+		return nil, err
+	}
+	if err := outFile.Close(); err != nil {
+		return nil, err
+	}
 
 	stat, err := os.Stat(destPath)
 	if err != nil {
@@ -381,6 +388,15 @@ func addPathToTar(tw *tar.Writer, sourcePath string) error {
 			return err
 		}
 		header.Name = filepath.ToSlash(relPath)
+
+		if fileInfo.Mode()&os.ModeSymlink != 0 {
+			link, err := os.Readlink(path)
+			if err != nil {
+				return err
+			}
+			header.Linkname = link
+			return tw.WriteHeader(header)
+		}
 
 		if err := tw.WriteHeader(header); err != nil {
 			return err

@@ -180,6 +180,11 @@ func (s *Server) handleDeploy(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, fmt.Sprintf("failed to parse multipart: %v", err), http.StatusBadRequest)
 		return
 	}
+	defer func() {
+		if r.MultipartForm != nil {
+			_ = r.MultipartForm.RemoveAll()
+		}
+	}()
 
 	manifestJSON := r.FormValue("manifest")
 	var svc entity.Service
