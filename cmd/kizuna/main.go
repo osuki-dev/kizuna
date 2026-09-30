@@ -646,7 +646,7 @@ func runServer() error {
 	nodeID := "node_" + nodeName
 
 	var gossipEng *gossip.Engine
-	var nodeRepo domain.NodeRepository
+	nodeRepo, _ := config.NewNodeRepository("")
 
 	peerLookup := func(pubKey string) *entity.Node {
 		cleanKey := strings.TrimPrefix(pubKey, "nodekey:")
@@ -692,7 +692,6 @@ func runServer() error {
 	meshGw.SetSSHPolicy(sshCfg, peerLookup)
 
 	// Pre-load known seeds and discovered DERP relays before starting listener
-	nodeRepo, _ = config.NewNodeRepository("")
 	var seeds []*entity.Node
 	if nodeRepo != nil {
 		seeds, _ = nodeRepo.ListNodes()
@@ -734,6 +733,7 @@ func runServer() error {
 	_ = gossipEng.Start(ctx)
 	defer func() { _ = gossipEng.Stop() }()
 
+	authStore.GeneratePIN()
 	pin, _ := authStore.GetActivePIN()
 	ui := presenter.NewUI("")
 

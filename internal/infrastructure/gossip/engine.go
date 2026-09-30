@@ -16,6 +16,9 @@ import (
 	"github.com/osuki-dev/kizuna/internal/infrastructure/telemetry"
 )
 
+// DefaultPort is the default mesh communication port used by Gossip and API.
+const DefaultPort uint16 = 19800
+
 // Config holds initialization options for the Gossip Engine
 type Config struct {
 	NodeID         string
@@ -23,6 +26,7 @@ type Config struct {
 	MeshAddr       string
 	Host           string
 	IP             string
+	Port           uint16        // Mesh communication port (default: DefaultPort)
 	Tags           []string
 	DERP           *entity.DERPNodeInfo
 	Interval       time.Duration // Periodic gossip ping interval (default: 2s)
@@ -33,6 +37,14 @@ type Config struct {
 	Seeds          []*entity.Node
 }
 
+// piggybackEntry wraps a GossipUpdate with a dissemination counter.
+// Per SWIM protocol, each update is piggybacked at most log2(N)+1 times
+// before being pruned, preventing stale updates from circulating indefinitely.
+type piggybackEntry struct {
+	update    *entity.GossipUpdate
+	sendCount int
+}
+
 // Engine implements a decentralized, SWIM-based Gossip membership and state synchronization engine
 type Engine struct {
 	mu            sync.RWMutex
@@ -40,8 +52,10 @@ type Engine struct {
 	members       map[string]*entity.Node    // Keyed by Node.ID
 	nameToID      map[string]string          // Maps Node.Name to Node.ID
 	suspectTimers map[string]*time.Timer     // Keyed by Node.ID
-	recentUpdates []*entity.GossipUpdate     // Piggybacked update queue
+	recentUpdates []*piggybackEntry          // Piggybacked update queue with dissemination tracking
 	tombstones    map[string]time.Time       // Deleted / kicked node IDs and Names
+	tombstoneIDs  map[string]time.Time       // Tombstones keyed by Node.ID only
+	tombstoneNames map[string]time.Time      // Tombstones keyed by Node.Name only
 	failCount     map[string]int             // Node ID -> consecutive failed probe count
 	onNodeUpdate  func(*entity.Node)
 	transport     Transport
@@ -49,6 +63,7 @@ type Engine struct {
 	interval      time.Duration
 	suspectPeriod time.Duration
 	syncInterval  time.Duration
+	port          uint16
 	ctx           context.Context
 	cancel        context.CancelFunc
 	running       bool
@@ -151,6 +166,9 @@ func NewEngine(cfg Config) *Engine {
 	if cfg.IP == "" {
 		cfg.IP = DetectOutboundIP()
 	}
+	if cfg.Port == 0 {
+		cfg.Port = DefaultPort
+	}
 
 	self := &entity.Node{
 		ID:          cfg.NodeID,
@@ -169,18 +187,21 @@ func NewEngine(cfg Config) *Engine {
 	}
 
 	e := &Engine{
-		self:          self,
-		members:       make(map[string]*entity.Node),
-		nameToID:      make(map[string]string),
-		suspectTimers: make(map[string]*time.Timer),
-		recentUpdates: make([]*entity.GossipUpdate, 0, 50),
-		tombstones:    make(map[string]time.Time),
-		failCount:     make(map[string]int),
-		transport:     cfg.Transport,
-		repo:          cfg.Repo,
-		interval:      cfg.Interval,
-		suspectPeriod: cfg.SuspectTimeout,
-		syncInterval:  cfg.SyncInterval,
+		self:           self,
+		members:        make(map[string]*entity.Node),
+		nameToID:       make(map[string]string),
+		suspectTimers:  make(map[string]*time.Timer),
+		recentUpdates:  make([]*piggybackEntry, 0, 50),
+		tombstones:     make(map[string]time.Time),
+		tombstoneIDs:   make(map[string]time.Time),
+		tombstoneNames: make(map[string]time.Time),
+		failCount:      make(map[string]int),
+		transport:      cfg.Transport,
+		repo:           cfg.Repo,
+		interval:       cfg.Interval,
+		suspectPeriod:  cfg.SuspectTimeout,
+		syncInterval:   cfg.SyncInterval,
+		port:           cfg.Port,
 	}
 
 	// Register self
@@ -668,7 +689,7 @@ func (e *Engine) handleIndirectPing(msg *entity.GossipMessage) (*entity.GossipMe
 		Incarnation: e.self.Incarnation,
 	}
 
-	reply, err := e.transport.SendMessage(ctx, targetCopy.Addr, 19800, pingMsg)
+	reply, err := e.transport.SendMessage(ctx, targetCopy.Addr, e.port, pingMsg)
 	if err == nil && reply != nil && reply.Type == entity.GossipMsgAck {
 		return &entity.GossipMessage{
 			Type:       entity.GossipMsgAck,
@@ -1039,22 +1060,44 @@ func (e *Engine) queueUpdateLocked(u *entity.GossipUpdate) {
 	if len(e.recentUpdates) >= 50 {
 		e.recentUpdates = e.recentUpdates[1:]
 	}
-	e.recentUpdates = append(e.recentUpdates, u)
+	e.recentUpdates = append(e.recentUpdates, &piggybackEntry{update: u, sendCount: 0})
+}
+
+// maxDisseminations returns the SWIM-recommended max piggyback count: log2(N) + 1.
+func (e *Engine) maxDisseminations() int {
+	n := len(e.members)
+	if n <= 1 {
+		return 2
+	}
+	logN := 0
+	for v := n; v > 1; v >>= 1 {
+		logN++
+	}
+	return logN + 1
 }
 
 func (e *Engine) getPiggybackedUpdatesLocked(max int) []*entity.GossipUpdate {
 	if len(e.recentUpdates) == 0 {
 		return nil
 	}
-	if len(e.recentUpdates) <= max {
-		cp := make([]*entity.GossipUpdate, len(e.recentUpdates))
-		copy(cp, e.recentUpdates)
-		return cp
+
+	maxSends := e.maxDisseminations()
+	var result []*entity.GossipUpdate
+	var surviving []*piggybackEntry
+
+	for _, entry := range e.recentUpdates {
+		if entry.sendCount < maxSends {
+			if len(result) < max {
+				result = append(result, entry.update)
+			}
+			entry.sendCount++
+			surviving = append(surviving, entry)
+		}
+		// entries with sendCount >= maxSends are pruned (not added to surviving)
 	}
-	start := len(e.recentUpdates) - max
-	cp := make([]*entity.GossipUpdate, max)
-	copy(cp, e.recentUpdates[start:])
-	return cp
+
+	e.recentUpdates = surviving
+	return result
 }
 
 func (e *Engine) runGossipLoop() {
@@ -1098,7 +1141,7 @@ func (e *Engine) performGossipRound() {
 
 	start := time.Now()
 	ctx, cancel := context.WithTimeout(e.ctx, 12*time.Second)
-	reply, err := e.transport.SendMessage(ctx, peer.Addr, 19800, pingMsg)
+	reply, err := e.transport.SendMessage(ctx, peer.Addr, e.port, pingMsg)
 	cancel()
 
 	latency := time.Since(start).Milliseconds()
@@ -1137,7 +1180,7 @@ func (e *Engine) performGossipRound() {
 			TargetID:    peer.ID,
 			Incarnation: e.self.Incarnation,
 		}
-		indReply, indErr := e.transport.SendMessage(indCtx, indirectHelper.Addr, 19800, indMsg)
+		indReply, indErr := e.transport.SendMessage(indCtx, indirectHelper.Addr, e.port, indMsg)
 		indCancel()
 
 		if indErr == nil && indReply != nil {
@@ -1317,7 +1360,7 @@ func (e *Engine) performAntiEntropySync() {
 	e.mu.RUnlock()
 
 	ctx, cancel := context.WithTimeout(e.ctx, 5000*time.Millisecond)
-	resp, err := e.transport.SendMessage(ctx, peer.Addr, 19800, req)
+	resp, err := e.transport.SendMessage(ctx, peer.Addr, e.port, req)
 	cancel()
 
 	if err == nil && resp != nil && resp.Type == entity.GossipMsgSyncResp {

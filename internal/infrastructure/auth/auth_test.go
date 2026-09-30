@@ -13,6 +13,8 @@ func TestAuthStoreLifecycleAndRevocation(t *testing.T) {
 		t.Fatalf("failed to create auth store: %v", err)
 	}
 
+	// PIN is not generated eagerly; must call GeneratePIN first
+	store.GeneratePIN()
 	pin, ok := store.GetActivePIN()
 	if !ok || len(pin) != 6 {
 		t.Fatalf("expected valid 6-digit PIN, got %s (ok=%v)", pin, ok)

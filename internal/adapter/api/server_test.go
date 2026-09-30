@@ -23,6 +23,7 @@ func TestNodeMetaEndpoints(t *testing.T) {
 		t.Fatalf("failed to create auth store: %v", err)
 	}
 
+	authStore.GeneratePIN()
 	pin, _ := authStore.GetActivePIN()
 	token, err := authStore.VerifyPIN(pin, "test-client")
 	if err != nil {

@@ -32,7 +32,8 @@ type Store struct {
 	clients      map[string]AuthorizedClient
 }
 
-// NewAuthStore initializes auth manager
+// NewAuthStore initializes auth manager.
+// PIN generation is deferred until explicitly requested via GeneratePIN or GetActivePIN.
 func NewAuthStore(configDir string) (domain.AuthManager, error) {
 	if configDir == "" {
 		home, _ := os.UserHomeDir()
@@ -46,7 +47,6 @@ func NewAuthStore(configDir string) (domain.AuthManager, error) {
 	}
 
 	_ = store.load()
-	_ = store.GeneratePIN()
 	return store, nil
 }
 

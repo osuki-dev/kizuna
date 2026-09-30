@@ -30,16 +30,18 @@ type GossipEngine interface {
 
 // Server handles incoming RPC requests to the Agent over mesh or local TCP
 type Server struct {
-	auth     domain.AuthManager
-	workload domain.WorkloadRunner
-	ingress  domain.IngressManager
-	backup   domain.BackupManager
-	gossip   GossipEngine
-	nodeID   string
-	nodeName string
-	mu       sync.RWMutex
-	metaPath string
-	meta     entity.NodeMetaUpdate
+	auth          domain.AuthManager
+	workload      domain.WorkloadRunner
+	ingress       domain.IngressManager
+	backup        domain.BackupManager
+	gossip        GossipEngine
+	nodeID        string
+	nodeName      string
+	mu            sync.RWMutex
+	metaPath      string
+	meta          entity.NodeMetaUpdate
+	handlerOnce   sync.Once
+	cachedHandler http.Handler
 }
 
 // NewServer initializes the Agent API HTTP Server
@@ -89,29 +91,33 @@ func (s *Server) saveMetaLocked() error {
 	return os.WriteFile(s.metaPath, data, 0600)
 }
 
-// Handler returns the HTTP handler with all registered routes and auth middleware
+// Handler returns the HTTP handler with all registered routes and auth middleware.
+// The handler is built once and cached for all subsequent calls.
 func (s *Server) Handler() http.Handler {
-	mux := http.NewServeMux()
+	s.handlerOnce.Do(func() {
+		mux := http.NewServeMux()
 
-	// Public endpoint for pairing
-	mux.HandleFunc("/api/v1/pair", s.handlePair)
+		// Public endpoint for pairing
+		mux.HandleFunc("/api/v1/pair", s.handlePair)
 
-	// Protected endpoints
-	mux.HandleFunc("/api/v1/deploy", s.withAuth(s.handleDeploy))
-	mux.HandleFunc("/api/v1/ingress", s.withAuth(s.handleIngress))
-	mux.HandleFunc("/api/v1/status", s.withAuth(s.handleStatus))
-	mux.HandleFunc("/api/v1/logs", s.withAuth(s.handleLogs))
-	mux.HandleFunc("/api/v1/backup", s.withAuth(s.handleBackup))
-	mux.HandleFunc("/api/v1/node/meta", s.withAuth(s.handleNodeMeta))
-	mux.HandleFunc("/api/v1/auth/revoke", s.withAuth(s.handleRevoke))
+		// Protected endpoints
+		mux.HandleFunc("/api/v1/deploy", s.withAuth(s.handleDeploy))
+		mux.HandleFunc("/api/v1/ingress", s.withAuth(s.handleIngress))
+		mux.HandleFunc("/api/v1/status", s.withAuth(s.handleStatus))
+		mux.HandleFunc("/api/v1/logs", s.withAuth(s.handleLogs))
+		mux.HandleFunc("/api/v1/backup", s.withAuth(s.handleBackup))
+		mux.HandleFunc("/api/v1/node/meta", s.withAuth(s.handleNodeMeta))
+		mux.HandleFunc("/api/v1/auth/revoke", s.withAuth(s.handleRevoke))
 
-	// Internal node mesh synchronization & member discovery
-	mux.HandleFunc("/api/v1/node/sync", s.handleNodeSync)
-	mux.HandleFunc("/api/v1/node/members", s.handleNodeMembers)
-	mux.HandleFunc("/api/v1/node/remove", s.handleNodeRemove)
-	mux.HandleFunc("/api/v1/node/add", s.handleNodeAdd)
+		// Internal node mesh synchronization & member discovery
+		mux.HandleFunc("/api/v1/node/sync", s.handleNodeSync)
+		mux.HandleFunc("/api/v1/node/members", s.handleNodeMembers)
+		mux.HandleFunc("/api/v1/node/remove", s.handleNodeRemove)
+		mux.HandleFunc("/api/v1/node/add", s.handleNodeAdd)
 
-	return mux
+		s.cachedHandler = mux
+	})
+	return s.cachedHandler
 }
 
 // ServeConn dispatches a single raw net.Conn (from tailcat) to http.Server
