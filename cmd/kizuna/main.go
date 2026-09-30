@@ -1317,7 +1317,7 @@ func listNodes(wide bool) error {
 				wg.Add(1)
 				go func(t *entity.Node) {
 					defer wg.Done()
-					ctx, cancel := context.WithTimeout(context.Background(), 3500*time.Millisecond)
+					ctx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
 					defer cancel()
 
 					upNode, _, probeErr := cli.GetStatus(ctx, t)
@@ -1371,7 +1371,7 @@ func listNodes(wide bool) error {
 			wg.Add(1)
 			go func(t *entity.Node) {
 				defer wg.Done()
-				ctx, cancel := context.WithTimeout(context.Background(), 3500*time.Millisecond)
+				ctx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
 				defer cancel()
 
 				nCopy := *t
@@ -1863,6 +1863,24 @@ func newStatusCmd() *cobra.Command {
 				}
 			}
 
+			// Check if local daemon is running and has live cluster members
+			daemonMembers := make(map[string]*entity.Node)
+			clientHTTP := &http.Client{Timeout: 1200 * time.Millisecond}
+			if resp, err := clientHTTP.Get("http://127.0.0.1:19800/api/v1/node/members"); err == nil && resp.StatusCode == http.StatusOK {
+				defer func() { _ = resp.Body.Close() }()
+				var members []*entity.Node
+				if json.NewDecoder(resp.Body).Decode(&members) == nil {
+					for _, m := range members {
+						if m != nil {
+							daemonMembers[m.ID] = m
+							if m.Name != "" {
+								daemonMembers[m.Name] = m
+							}
+						}
+					}
+				}
+			}
+
 			// 4. Concurrently probe nodes with strict timeout so unreachable nodes never block the CLI!
 			meshGw := mesh.NewMeshGateway()
 			defer func() { _ = meshGw.Close() }()
@@ -1883,8 +1901,21 @@ func newStatusCmd() *cobra.Command {
 				wg.Add(1)
 				go func(idx int, target *entity.Node) {
 					defer wg.Done()
+
+					// If the local daemon is alive and actively tracking this node as alive, reuse live state
+					if live, ok := daemonMembers[target.ID]; ok && live != nil && live.IsOnline && live.GossipState == entity.GossipStateAlive {
+						resChan <- nodeResult{index: idx, node: live, latency: time.Duration(live.LatencyMs) * time.Millisecond, err: nil}
+						return
+					}
+					if target.Name != "" {
+						if live, ok := daemonMembers[target.Name]; ok && live != nil && live.IsOnline && live.GossipState == entity.GossipStateAlive {
+							resChan <- nodeResult{index: idx, node: live, latency: time.Duration(live.LatencyMs) * time.Millisecond, err: nil}
+							return
+						}
+					}
+
 					start := time.Now()
-					probeCtx, probeCancel := context.WithTimeout(cmd.Context(), 3500*time.Millisecond)
+					probeCtx, probeCancel := context.WithTimeout(cmd.Context(), 8*time.Second)
 					defer probeCancel()
 
 					nCopy := *target

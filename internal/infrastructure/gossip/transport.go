@@ -41,7 +41,7 @@ func (t *MeshTransport) SendMessage(ctx context.Context, targetAddr string, port
 	}
 
 	httpClient := &http.Client{
-		Timeout: 4500 * time.Millisecond,
+		Timeout: 12 * time.Second,
 		Transport: &http.Transport{
 			DialContext: func(ctx context.Context, network, _ string) (net.Conn, error) {
 				return t.mesh.Dial(ctx, targetAddr, port)

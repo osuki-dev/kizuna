@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net"
 	"os"
 	"path/filepath"
@@ -79,12 +80,14 @@ type TailcatMesh struct {
 	discoveredDERPs map[int]*entity.DERPNodeInfo
 	activeDERP      *entity.DERPNodeInfo
 	isBenchmarking  bool
+	clients         map[string]*tailcat.Client
 }
 
 // NewMeshGateway creates a new instance of TailcatMesh
 func NewMeshGateway() domain.MeshGateway {
 	return &TailcatMesh{
 		discoveredDERPs: make(map[int]*entity.DERPNodeInfo),
+		clients:         make(map[string]*tailcat.Client),
 	}
 }
 
@@ -297,12 +300,32 @@ func (m *TailcatMesh) Dial(ctx context.Context, addr string, port uint16) (net.C
 	}
 
 	// Dial via tailcat data-plane with persistent client key identity
-	cl := tailcat.NewClient(tailcat.Addr(addr))
-	cl.Key = localNodeKey
-	if os.Getenv("KIZUNA_DEBUG") == "" {
-		cl.Logf = func(string, ...any) {}
+	m.mu.Lock()
+	if m.clients == nil {
+		m.clients = make(map[string]*tailcat.Client)
 	}
-	return cl.DialTCPPort(ctx, port)
+	cl, exists := m.clients[addr]
+	if !exists {
+		cl = tailcat.NewClient(tailcat.Addr(addr))
+		cl.Key = localNodeKey
+		if os.Getenv("KIZUNA_DEBUG") == "" {
+			cl.Logf = func(string, ...any) {}
+		}
+		m.clients[addr] = cl
+	}
+	m.mu.Unlock()
+
+	conn, err := cl.DialTCPPort(ctx, port)
+	if err != nil {
+		m.mu.Lock()
+		delete(m.clients, addr)
+		m.mu.Unlock()
+		if closer, ok := any(cl).(io.Closer); ok {
+			_ = closer.Close()
+		}
+		return nil, err
+	}
+	return conn, nil
 }
 
 // Close gracefully closes the mesh server or listeners
@@ -316,6 +339,13 @@ func (m *TailcatMesh) Close() error {
 	m.isClosed = true
 
 	var err error
+	for _, cl := range m.clients {
+		if closer, ok := any(cl).(io.Closer); ok {
+			_ = closer.Close()
+		}
+	}
+	m.clients = make(map[string]*tailcat.Client)
+
 	if m.derpRelay != nil {
 		_ = m.derpRelay.Close()
 	}

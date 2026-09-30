@@ -1097,7 +1097,7 @@ func (e *Engine) performGossipRound() {
 	e.mu.Unlock()
 
 	start := time.Now()
-	ctx, cancel := context.WithTimeout(e.ctx, 5000*time.Millisecond)
+	ctx, cancel := context.WithTimeout(e.ctx, 12*time.Second)
 	reply, err := e.transport.SendMessage(ctx, peer.Addr, 19800, pingMsg)
 	cancel()
 
