@@ -193,7 +193,6 @@ func TestExtractNodePublicKey(t *testing.T) {
 	meshGw := &TailcatMesh{}
 	meshGw.nodeKey = nodeKey
 	meshGw.psk = psk
-	meshGw.keysLoaded = true
 
 	// Verify that loadOrCreateMeshKeys works
 	expectedPub := nodeKey.Public().String()

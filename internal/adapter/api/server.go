@@ -128,7 +128,7 @@ func (s *Server) withAuth(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		authHeader := r.Header.Get("Authorization")
 		token := strings.TrimPrefix(authHeader, "Bearer ")
-		if token == "" || !s.auth.ValidateToken(token) {
+		if token == "" || !s.auth.ValidateTokenFromAddr(token, r.RemoteAddr) {
 			http.Error(w, "unauthorized: invalid or missing bearer token", http.StatusUnauthorized)
 			return
 		}

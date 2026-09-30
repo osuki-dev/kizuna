@@ -56,6 +56,7 @@ type AuthManager interface {
 	GetActivePIN() (string, bool)
 	VerifyPIN(pin, clientName string) (string, error)
 	ValidateToken(token string) bool
+	ValidateTokenFromAddr(token, remoteAddr string) bool
 	RevokeClient(nameOrID string) error
 	RevokeToken(token string) error
 }

@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"math/big"
+	"net"
 	"os"
 	"path/filepath"
 	"sync"
@@ -102,16 +103,36 @@ func (s *Store) VerifyPIN(pin, clientName string) (string, error) {
 	return token, nil
 }
 
-// ValidateToken checks if a token is authorized
+// ValidateToken checks if a token is authorized.
+// "kzn_local" is only valid when the request originates from loopback (127.0.0.1 / ::1).
 func (s *Store) ValidateToken(token string) bool {
 	if token == "kzn_local" {
-		return true
+		// kzn_local is accepted only via ValidateTokenFromAddr; reject here.
+		return false
 	}
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
 	_, exists := s.clients[token]
 	return exists
+}
+
+// ValidateTokenFromAddr checks if a token is authorized, allowing kzn_local only from loopback addresses.
+func (s *Store) ValidateTokenFromAddr(token, remoteAddr string) bool {
+	if token == "kzn_local" {
+		return isLoopbackAddr(remoteAddr)
+	}
+	return s.ValidateToken(token)
+}
+
+// isLoopbackAddr checks if remoteAddr (host:port or host) is a loopback address.
+func isLoopbackAddr(remoteAddr string) bool {
+	host := remoteAddr
+	if h, _, err := net.SplitHostPort(remoteAddr); err == nil {
+		host = h
+	}
+	ip := net.ParseIP(host)
+	return ip != nil && ip.IsLoopback()
 }
 
 // RevokeClient revokes all tokens belonging to a client by ID or Name

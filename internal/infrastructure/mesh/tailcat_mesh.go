@@ -70,7 +70,7 @@ type TailcatMesh struct {
 	mu              sync.Mutex
 	nodeKey         key.NodePrivate
 	psk             tailcat.PresharedKey
-	keysLoaded      bool
+	keysOnce        sync.Once
 	server          *tailcat.Server
 	localLn         net.Listener
 	isClosed        bool
@@ -94,11 +94,9 @@ func NewMeshGateway() domain.MeshGateway {
 }
 
 func (m *TailcatMesh) getOrLoadKeys() (key.NodePrivate, tailcat.PresharedKey) {
-	if m.keysLoaded {
-		return m.nodeKey, m.psk
-	}
-	m.nodeKey, m.psk = loadOrCreateMeshKeys()
-	m.keysLoaded = true
+	m.keysOnce.Do(func() {
+		m.nodeKey, m.psk = loadOrCreateMeshKeys()
+	})
 	return m.nodeKey, m.psk
 }
 
@@ -298,13 +296,7 @@ func CheckSSHPermission(policy *entity.SSHConfig, caller *entity.Node, peerKey s
 		return nil
 	}
 
-	if hasAllowTags && !hasAllowNodes {
-		return fmt.Errorf("node '%s' (tags: %v) does not have any allowed tags (%v)", caller.Name, caller.Tags, policy.AllowTags)
-	}
-	if hasAllowNodes && !hasAllowTags {
-		return fmt.Errorf("node '%s' is not in allow_nodes list (%v)", caller.Name, policy.AllowNodes)
-	}
-	return fmt.Errorf("node '%s' does not match allow_tags (%v) or allow_nodes (%v)", caller.Name, policy.AllowTags, policy.AllowNodes)
+	return fmt.Errorf("access denied: node '%s' is not permitted by SSH policy", caller.Name)
 }
 
 func (m *TailcatMesh) checkSSHAccess(s *tailcat.Server, c net.Conn) error {
