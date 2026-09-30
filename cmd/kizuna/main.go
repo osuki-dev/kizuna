@@ -691,6 +691,18 @@ func runServer() error {
 	}
 	meshGw.SetSSHPolicy(sshCfg, peerLookup)
 
+	// Pre-load known seeds and discovered DERP relays before starting listener
+	nodeRepo, _ = config.NewNodeRepository("")
+	var seeds []*entity.Node
+	if nodeRepo != nil {
+		seeds, _ = nodeRepo.ListNodes()
+		for _, s := range seeds {
+			if s != nil && s.DERP != nil {
+				meshGw.AddDiscoveredDERP(s.DERP)
+			}
+		}
+	}
+
 	apiServer := api.NewServer(authStore, workloadRunner, ingressMgr, backupMgr, nodeID, nodeName)
 
 	addr, err := meshGw.Listen(ctx, 19800, func(conn net.Conn) {
@@ -701,12 +713,6 @@ func runServer() error {
 	}
 
 	// Initialize and launch decentralized Gossip Engine
-	nodeRepo, _ = config.NewNodeRepository("")
-	var seeds []*entity.Node
-	if nodeRepo != nil {
-		seeds, _ = nodeRepo.ListNodes()
-	}
-
 	gossipTransport := gossip.NewMeshTransport(meshGw)
 	gossipEng = gossip.NewEngine(gossip.Config{
 		NodeID:    nodeID,
@@ -1126,7 +1132,7 @@ func newNodeCmd() *cobra.Command {
 			return nil
 		},
 	}
-	setCmd.Flags().StringVar(&flagHost, "host", "", "Hostname or domain name of the node (e.g. mac-mini.local or 10.0.0.9)")
+	setCmd.Flags().StringVar(&flagHost, "host", "", "Hostname or domain name of the node (e.g. node-1.local or 10.0.0.9)")
 	setCmd.Flags().StringVar(&flagIP, "ip", "", "IP address of the node")
 	setCmd.Flags().StringVar(&flagTags, "tags", "", "Comma-separated list of tags (e.g. 'home,desktop,m4')")
 
@@ -1211,7 +1217,7 @@ Examples:
 				}
 			}
 			if rawTarget == "" {
-				return fmt.Errorf("node target required (e.g. 'kizuna node ssh ubuntu@puffincn')")
+				return fmt.Errorf("node target required (e.g. 'kizuna node ssh ubuntu@worker-1')")
 			}
 
 			user := sshUser
@@ -1286,8 +1292,11 @@ Examples:
 				return fmt.Errorf("node '%s' not found: %w", nodeName, err)
 			}
 
-			meshGw := mesh.NewMeshGateway()
+			meshGw := newMeshGatewayWithDiscoveredDERPs()
 			defer func() { _ = meshGw.Close() }()
+			if node.DERP != nil {
+				meshGw.AddDiscoveredDERP(node.DERP)
+			}
 
 			ctx, cancel := context.WithCancel(context.Background())
 			defer cancel()
@@ -1323,7 +1332,47 @@ Examples:
 		},
 	}
 
-	nodeCmd.AddCommand(addCmd, listCmd, rmCmd, tagCmd, setCmd, kickCmd, sshCmd, proxyCmd)
+	renameCmd := &cobra.Command{
+		Use:     "rename <node-name> <new-name>",
+		Aliases: []string{"alias"},
+		Short:   "Set an alias / new name for a mesh node",
+		Args:    cobra.ExactArgs(2),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			oldName := args[0]
+			newName := args[1]
+			repo, err := config.NewNodeRepository("")
+			if err != nil {
+				return err
+			}
+			node, err := resolveNode(oldName)
+			if err != nil {
+				return fmt.Errorf("node '%s' not found: %w", oldName, err)
+			}
+			_ = repo.DeleteNode(node.Name)
+			node.Name = newName
+			if err := repo.SaveNode(node); err != nil {
+				return fmt.Errorf("failed to save renamed node: %w", err)
+			}
+			// Update daemon memory if running
+			clientHTTP := &http.Client{Timeout: 500 * time.Millisecond}
+			if reqBody, err := json.Marshal(node); err == nil {
+				if resp, err := clientHTTP.Post("http://127.0.0.1:19800/api/v1/node/add", "application/json", bytes.NewReader(reqBody)); err == nil {
+					_ = resp.Body.Close()
+				}
+			}
+			if flagJSON {
+				return presenter.PrintJSON(os.Stdout, map[string]any{
+					"success":  true,
+					"old_name": oldName,
+					"new_name": newName,
+				})
+			}
+			fmt.Printf("✓ Node '%s' renamed to '%s'\n", oldName, newName)
+			return nil
+		},
+	}
+
+	nodeCmd.AddCommand(addCmd, listCmd, rmCmd, tagCmd, setCmd, renameCmd, kickCmd, sshCmd, proxyCmd)
 	return nodeCmd
 }
 
@@ -1341,6 +1390,20 @@ func parseTags(args []string) []string {
 		}
 	}
 	return result
+}
+
+func newMeshGatewayWithDiscoveredDERPs() domain.MeshGateway {
+	gw := mesh.NewMeshGateway()
+	if repo, err := config.NewNodeRepository(""); err == nil && repo != nil {
+		if nodes, err := repo.ListNodes(); err == nil {
+			for _, n := range nodes {
+				if n != nil && n.DERP != nil {
+					gw.AddDiscoveredDERP(n.DERP)
+				}
+			}
+		}
+	}
+	return gw
 }
 
 func resolveNode(nameOrID string) (*entity.Node, error) {
@@ -1447,7 +1510,7 @@ func listNodes(wide bool) error {
 		}
 
 		if len(deadOrStale) > 0 {
-			meshGw := mesh.NewMeshGateway()
+			meshGw := newMeshGatewayWithDiscoveredDERPs()
 			defer func() { _ = meshGw.Close() }()
 			cli := client.NewMeshClient(meshGw)
 
@@ -1456,7 +1519,7 @@ func listNodes(wide bool) error {
 				wg.Add(1)
 				go func(t *entity.Node) {
 					defer wg.Done()
-					ctx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
+					ctx, cancel := context.WithTimeout(context.Background(), 12*time.Second)
 					defer cancel()
 
 					upNode, _, probeErr := cli.GetStatus(ctx, t)
@@ -1501,7 +1564,7 @@ func listNodes(wide bool) error {
 		}
 	} else if len(repoNodes) > 0 {
 		// Daemon is not running: directly probe configured nodes
-		meshGw := mesh.NewMeshGateway()
+		meshGw := newMeshGatewayWithDiscoveredDERPs()
 		defer func() { _ = meshGw.Close() }()
 		cli := client.NewMeshClient(meshGw)
 
@@ -1510,7 +1573,7 @@ func listNodes(wide bool) error {
 			wg.Add(1)
 			go func(t *entity.Node) {
 				defer wg.Done()
-				ctx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
+				ctx, cancel := context.WithTimeout(context.Background(), 12*time.Second)
 				defer cancel()
 
 				nCopy := *t
@@ -2021,7 +2084,7 @@ func newStatusCmd() *cobra.Command {
 			}
 
 			// 4. Concurrently probe nodes with strict timeout so unreachable nodes never block the CLI!
-			meshGw := mesh.NewMeshGateway()
+			meshGw := newMeshGatewayWithDiscoveredDERPs()
 			defer func() { _ = meshGw.Close() }()
 			cli := client.NewMeshClient(meshGw)
 
@@ -2054,7 +2117,7 @@ func newStatusCmd() *cobra.Command {
 					}
 
 					start := time.Now()
-					probeCtx, probeCancel := context.WithTimeout(cmd.Context(), 8*time.Second)
+					probeCtx, probeCancel := context.WithTimeout(cmd.Context(), 12*time.Second)
 					defer probeCancel()
 
 					nCopy := *target

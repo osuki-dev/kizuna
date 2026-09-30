@@ -451,11 +451,22 @@ func (m *TailcatMesh) Dial(ctx context.Context, addr string, port uint16) (net.C
 		return dialer.DialContext(ctx, "tcp", fmt.Sprintf("127.0.0.1:%d", port))
 	}
 
-	// If target address does not have custom DERP region embedded, but we have discovered private DERPs,
-	// inject our active DERP region into the ConnInfo so the client dials our private DERP relay!
-	if len(ci.Region) == 0 && activeDERP != nil {
-		ci.Region = []*tailcfg.DERPRegion{BuildDERPRegion(activeDERP)}
-		addr = string(ci.Addr())
+	// If we have an active private DERP relay (e.g. cloud relay on port 8443), prioritize it
+	// so dials avoid blocked/slow third-party public relays (*.ipn.dev)
+	if activeDERP != nil {
+		privateRegion := BuildDERPRegion(activeDERP)
+		isPrivateAlready := false
+		for _, r := range ci.Region {
+			if r != nil && r.RegionID == tailcfg.DERPRegionID(activeDERP.RegionID) {
+				isPrivateAlready = true
+				break
+			}
+		}
+		if !isPrivateAlready {
+			ci.Region = []*tailcfg.DERPRegion{privateRegion}
+			ci.RegionID = 0
+			addr = string(ci.Addr())
+		}
 	}
 
 	// Dial via tailcat data-plane with persistent client key identity

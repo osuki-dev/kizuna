@@ -45,8 +45,8 @@ func TestNodeMetaEndpoints(t *testing.T) {
 	// 2. POST update meta
 	update := entity.NodeMetaUpdate{
 		Tags: []string{"home", "dev"},
-		Host: "mac-mini.local",
-		IP:   "10.0.0.9",
+		Host: "worker-1.local",
+		IP:   "192.168.1.50",
 	}
 	body, _ := json.Marshal(update)
 	reqPost, _ := http.NewRequest(http.MethodPost, "/api/v1/node/meta", bytes.NewReader(body))
@@ -67,11 +67,11 @@ func TestNodeMetaEndpoints(t *testing.T) {
 
 	var res map[string]any
 	_ = json.Unmarshal(rrGet2.Body.Bytes(), &res)
-	if res["host"] != "mac-mini.local" {
-		t.Errorf("expected host 'mac-mini.local', got %v", res["host"])
+	if res["host"] != "worker-1.local" {
+		t.Errorf("expected host 'worker-1.local', got %v", res["host"])
 	}
-	if res["ip"] != "10.0.0.9" {
-		t.Errorf("expected ip '10.0.0.9', got %v", res["ip"])
+	if res["ip"] != "192.168.1.50" {
+		t.Errorf("expected ip '192.168.1.50', got %v", res["ip"])
 	}
 
 	// 4. Test Revocation

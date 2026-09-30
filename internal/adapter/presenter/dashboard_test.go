@@ -115,8 +115,8 @@ func TestDashboardGaugeAndSparkline(t *testing.T) {
 
 func TestDashboardNodeStatusSync(t *testing.T) {
 	node := &entity.Node{
-		ID:          "node-mini",
-		Name:        "mac-mini",
+		ID:          "node-1",
+		Name:        "worker-1",
 		Addr:        "192.168.1.18:19800",
 		Status:      "alive",
 		GossipState: entity.GossipStateAlive,
@@ -128,13 +128,13 @@ func TestDashboardNodeStatusSync(t *testing.T) {
 	})
 
 	// Case 1: Probe failed with error
-	m.nodeStates["mac-mini"] = &NodeProbeState{
+	m.nodeStates["worker-1"] = &NodeProbeState{
 		IsOnline:  false,
 		IsProbing: false,
 		Error:     "context deadline exceeded",
 	}
 
-	badge, label := m.getNodeStatus(node, m.nodeStates["mac-mini"])
+	badge, label := m.getNodeStatus(node, m.nodeStates["worker-1"])
 	if label == "ALIVE" {
 		t.Errorf("expected UNREACHABLE status when probe failed, got label %s", label)
 	}
@@ -155,12 +155,12 @@ func TestDashboardNodeStatusSync(t *testing.T) {
 	}
 
 	// Case 2: Online node
-	m.nodeStates["mac-mini"] = &NodeProbeState{
+	m.nodeStates["worker-1"] = &NodeProbeState{
 		IsOnline:  true,
 		IsProbing: false,
 		Latency:   4 * time.Millisecond,
 	}
-	badgeOnline, labelOnline := m.getNodeStatus(node, m.nodeStates["mac-mini"])
+	badgeOnline, labelOnline := m.getNodeStatus(node, m.nodeStates["worker-1"])
 	if labelOnline != "ALIVE" {
 		t.Errorf("expected ALIVE when probe succeeded, got %s", labelOnline)
 	}
@@ -171,8 +171,8 @@ func TestDashboardNodeStatusSync(t *testing.T) {
 
 func TestDashboardSelectedRowAlignment(t *testing.T) {
 	node := &entity.Node{
-		ID:          "node-mini",
-		Name:        "mac-mini",
+		ID:          "node-1",
+		Name:        "worker-1",
 		Addr:        "192.168.1.18:19800",
 		OS:          "darwin",
 		Arch:        "arm64",
@@ -184,7 +184,7 @@ func TestDashboardSelectedRowAlignment(t *testing.T) {
 		Nodes: []*entity.Node{node},
 		Theme: entity.ResolveTheme("catppuccin", nil),
 	})
-	m.nodeStates["mac-mini"] = &NodeProbeState{
+	m.nodeStates["worker-1"] = &NodeProbeState{
 		IsOnline:  false,
 		IsProbing: false,
 		Error:     "context deadline exceeded",

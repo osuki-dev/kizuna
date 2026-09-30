@@ -2,6 +2,7 @@ package service
 
 import (
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -56,6 +57,26 @@ func NewManager(cfg DaemonConfig, runFunc func()) (*Manager, error) {
 		return nil, err
 	}
 
+	targetPath := execPath
+	home, _ := os.UserHomeDir()
+	if cfg.UserService && home != "" {
+		preferredDir := filepath.Join(home, ".local", "bin")
+		preferredPath := filepath.Join(preferredDir, "kizuna")
+		if execPath != preferredPath {
+			_ = os.MkdirAll(preferredDir, 0755)
+			if err := copyBinary(execPath, preferredPath); err == nil {
+				targetPath = preferredPath
+			}
+		}
+	} else if !cfg.UserService && os.Geteuid() == 0 {
+		preferredPath := "/usr/local/bin/kizuna"
+		if execPath != preferredPath {
+			if err := copyBinary(execPath, preferredPath); err == nil {
+				targetPath = preferredPath
+			}
+		}
+	}
+
 	opts := service.KeyValue{
 		"Restart":    "always",
 		"RestartSec": 5,
@@ -69,7 +90,7 @@ func NewManager(cfg DaemonConfig, runFunc func()) (*Manager, error) {
 		Name:        cfg.Name,
 		DisplayName: cfg.DisplayName,
 		Description: cfg.Description,
-		Executable:  execPath,
+		Executable:  targetPath,
 		Arguments:   cfg.Arguments,
 		Option:      opts,
 	}
@@ -81,6 +102,26 @@ func NewManager(cfg DaemonConfig, runFunc func()) (*Manager, error) {
 	}
 
 	return &Manager{svc: s, config: cfg}, nil
+}
+
+func copyBinary(src, dst string) error {
+	in, err := os.Open(src)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = in.Close() }()
+
+	_ = os.Remove(dst)
+	out, err := os.OpenFile(dst, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0755)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = out.Close() }()
+
+	if _, err := io.Copy(out, in); err != nil {
+		return err
+	}
+	return os.Chmod(dst, 0755)
 }
 
 // Restart stops and starts the background service

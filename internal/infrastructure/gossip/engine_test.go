@@ -95,7 +95,7 @@ func TestGossipMultiNodeAutoDiscovery(t *testing.T) {
 
 	engineB := gossip.NewEngine(gossip.Config{
 		NodeID:    "node_B",
-		NodeName:  "mac-mini-b",
+		NodeName:  "worker-b",
 		MeshAddr:  "10.0.0.2",
 		Transport: transport,
 	})
@@ -256,18 +256,18 @@ func TestGossipRepoPersistence(t *testing.T) {
 	updateMsg := &entity.GossipMessage{
 		Type:        entity.GossipMsgUpdate,
 		SenderID:    "node_B",
-		SenderName:  "mac-mini",
+		SenderName:  "worker-b",
 		SenderAddr:  "10.0.0.2",
 		Incarnation: 1,
 		Updates: []*entity.GossipUpdate{
 			{
 				Node: &entity.Node{
 					ID:       "node_B",
-					Name:     "mac-mini",
+					Name:     "worker-b",
 					Addr:     "10.0.0.2",
-					Host:     "mini.lan",
+					Host:     "worker.lan",
 					IP:       "10.0.0.2",
-					Tags:     []string{"mac", "server"},
+					Tags:     []string{"worker", "server"},
 					IsOnline: true,
 				},
 				State:       entity.GossipStateAlive,
@@ -283,12 +283,12 @@ func TestGossipRepoPersistence(t *testing.T) {
 	}
 
 	// Verify that the discovered node was automatically persisted into repo!
-	savedNode, err := repo.GetNode("mac-mini")
+	savedNode, err := repo.GetNode("worker-b")
 	if err != nil {
-		t.Fatalf("expected node 'mac-mini' to be persisted in repo: %v", err)
+		t.Fatalf("expected node 'worker-b' to be persisted in repo: %v", err)
 	}
-	if savedNode.Host != "mini.lan" {
-		t.Errorf("expected host 'mini.lan', got '%s'", savedNode.Host)
+	if savedNode.Host != "worker.lan" {
+		t.Errorf("expected host 'worker.lan', got '%s'", savedNode.Host)
 	}
 	if len(savedNode.Tags) != 2 {
 		t.Errorf("expected 2 tags, got %d", len(savedNode.Tags))
@@ -310,7 +310,7 @@ func TestGossipRemoveMemberAndTombstone(t *testing.T) {
 	// Add node_B
 	engine.AddOrUpdateMember(&entity.Node{
 		ID:          "node_B",
-		Name:        "mac-mini",
+		Name:        "worker-b",
 		Addr:        "10.0.0.2",
 		IsOnline:    true,
 		GossipState: entity.GossipStateAlive,
@@ -322,7 +322,7 @@ func TestGossipRemoveMemberAndTombstone(t *testing.T) {
 	}
 
 	// Remove node_B
-	removed := engine.RemoveMember("mac-mini")
+	removed := engine.RemoveMember("worker-b")
 	if !removed {
 		t.Fatalf("expected RemoveMember to return true")
 	}
@@ -331,15 +331,15 @@ func TestGossipRemoveMemberAndTombstone(t *testing.T) {
 	if len(membersAfter) != 1 {
 		t.Fatalf("expected 1 member after removal, got %d", len(membersAfter))
 	}
-	if _, ok := engine.GetMember("mac-mini"); ok {
-		t.Fatalf("expected mac-mini to be gone from GetMember")
+	if _, ok := engine.GetMember("worker-b"); ok {
+		t.Fatalf("expected worker-b to be gone from GetMember")
 	}
 
 	// An incoming message from removed node should be rejected (no resurrection)
 	pingMsg := &entity.GossipMessage{
 		Type:        entity.GossipMsgPing,
 		SenderID:    "node_B",
-		SenderName:  "mac-mini",
+		SenderName:  "worker-b",
 		SenderAddr:  "10.0.0.2",
 		Incarnation: 5,
 	}

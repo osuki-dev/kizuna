@@ -203,7 +203,7 @@ type Node struct {
 	OS          string      `json:"os"`
 	Arch        string      `json:"arch"`
 	Tags        []string    `json:"tags,omitempty" yaml:"tags,omitempty"`
-	Host        string      `json:"host,omitempty" yaml:"host,omitempty"` // Hostname, domain, or IP (e.g. mac-mini.local or 10.0.0.9)
+	Host        string      `json:"host,omitempty" yaml:"host,omitempty"` // Hostname, domain, or IP (e.g. node-1.example.com or 10.0.0.9)
 	IP          string      `json:"ip,omitempty" yaml:"ip,omitempty"`     // Legacy/convenience alias for Host
 	Status      string      `json:"status,omitempty" yaml:"status,omitempty"` // "alive", "suspect", "dead", "offline"
 	GossipState GossipState `json:"gossip_state,omitempty" yaml:"gossip_state,omitempty"` // Internal protocol state
