@@ -4,7 +4,6 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"io"
 	"net"
 	"os"
 	"path/filepath"
@@ -68,6 +67,9 @@ func loadOrCreateMeshKeys() (key.NodePrivate, tailcat.PresharedKey) {
 // TailcatMesh implements domain.MeshGateway using tailscale/tailcat
 type TailcatMesh struct {
 	mu              sync.Mutex
+	nodeKey         key.NodePrivate
+	psk             tailcat.PresharedKey
+	keysLoaded      bool
 	server          *tailcat.Server
 	localLn         net.Listener
 	isClosed        bool
@@ -76,6 +78,7 @@ type TailcatMesh struct {
 	derpConfig      *entity.DERPConfig
 	discoveredDERPs map[int]*entity.DERPNodeInfo
 	activeDERP      *entity.DERPNodeInfo
+	isBenchmarking  bool
 }
 
 // NewMeshGateway creates a new instance of TailcatMesh
@@ -83,6 +86,15 @@ func NewMeshGateway() domain.MeshGateway {
 	return &TailcatMesh{
 		discoveredDERPs: make(map[int]*entity.DERPNodeInfo),
 	}
+}
+
+func (m *TailcatMesh) getOrLoadKeys() (key.NodePrivate, tailcat.PresharedKey) {
+	if m.keysLoaded {
+		return m.nodeKey, m.psk
+	}
+	m.nodeKey, m.psk = loadOrCreateMeshKeys()
+	m.keysLoaded = true
+	return m.nodeKey, m.psk
 }
 
 // SetDERPConfig configures and starts a private DERP relay on this node
@@ -95,7 +107,7 @@ func (m *TailcatMesh) SetDERPConfig(cfg *entity.DERPConfig) error {
 		return nil
 	}
 
-	nodeKey, _ := loadOrCreateMeshKeys()
+	nodeKey, _ := m.getOrLoadKeys()
 	relay, err := NewDERPRelay(nodeKey, *cfg)
 	if err != nil {
 		return err
@@ -119,15 +131,31 @@ func (m *TailcatMesh) AddDiscoveredDERP(info *entity.DERPNodeInfo) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
+	// Check if this relay is already known and completely identical
+	existing, exists := m.discoveredDERPs[info.RegionID]
+	if exists && existing != nil &&
+		existing.HostName == info.HostName &&
+		existing.Port == info.Port &&
+		existing.STUNPort == info.STUNPort &&
+		existing.CertName == info.CertName {
+		return
+	}
+
 	m.discoveredDERPs[info.RegionID] = info
 
 	// If this node does not host its own DERP relay, benchmark and select the fastest one
-	if m.derpRelay == nil {
+	if m.derpRelay == nil && !m.isBenchmarking {
+		m.isBenchmarking = true
 		var candidates []*entity.DERPNodeInfo
 		for _, d := range m.discoveredDERPs {
 			candidates = append(candidates, d)
 		}
 		go func(cList []*entity.DERPNodeInfo) {
+			defer func() {
+				m.mu.Lock()
+				m.isBenchmarking = false
+				m.mu.Unlock()
+			}()
 			best := PickBestDERP(context.Background(), cList, 1500*time.Millisecond)
 			if best != nil {
 				m.mu.Lock()
@@ -163,7 +191,7 @@ func (m *TailcatMesh) Listen(ctx context.Context, port uint16, handler func(net.
 	defer m.mu.Unlock()
 
 	// 1. Initialize tailcat.Server with persistent identity keys
-	nodeKey, psk := loadOrCreateMeshKeys()
+	nodeKey, psk := m.getOrLoadKeys()
 
 	var logf func(string, ...any)
 	if os.Getenv("KIZUNA_DEBUG") == "" {
@@ -187,24 +215,7 @@ func (m *TailcatMesh) Listen(ctx context.Context, port uint16, handler func(net.
 					// 1. Check if local OpenSSH daemon is reachable dynamically
 					target, err := net.DialTimeout("tcp", "127.0.0.1:22", 200*time.Millisecond)
 					if err == nil {
-						defer func() { _ = c.Close() }()
-						defer func() { _ = target.Close() }()
-						errCh := make(chan struct{}, 2)
-						go func() {
-							_, _ = io.Copy(target, c)
-							if cw, ok := target.(interface{ CloseWrite() error }); ok {
-								_ = cw.CloseWrite()
-							}
-							errCh <- struct{}{}
-						}()
-						go func() {
-							_, _ = io.Copy(c, target)
-							if cw, ok := c.(interface{ CloseWrite() error }); ok {
-								_ = cw.CloseWrite()
-							}
-							errCh <- struct{}{}
-						}()
-						<-errCh
+						tailcat.ProxyConns(target, c)
 						return
 					}
 					// 2. Fallback to embedded tailcat SSH server (zero external dependency)
@@ -267,26 +278,27 @@ func (m *TailcatMesh) Dial(ctx context.Context, addr string, port uint16) (net.C
 	}
 
 	// If this address is the local node, loopback directly to local listener in <1ms
-	localNodeKey, _ := loadOrCreateMeshKeys()
-	if ci.ServerPublic.NodePublic == localNodeKey.Public() || (m.activeAddr != "" && m.activeAddr == addr) {
+	m.mu.Lock()
+	localNodeKey, _ := m.getOrLoadKeys()
+	activeAddr := m.activeAddr
+	activeDERP := m.activeDERP
+	m.mu.Unlock()
+
+	if ci.ServerPublic.NodePublic == localNodeKey.Public() || (activeAddr != "" && activeAddr == addr) {
 		var dialer net.Dialer
 		return dialer.DialContext(ctx, "tcp", fmt.Sprintf("127.0.0.1:%d", port))
 	}
 
 	// If target address does not have custom DERP region embedded, but we have discovered private DERPs,
 	// inject our active DERP region into the ConnInfo so the client dials our private DERP relay!
-	if len(ci.Region) == 0 {
-		m.mu.Lock()
-		activeDERP := m.activeDERP
-		m.mu.Unlock()
-		if activeDERP != nil {
-			ci.Region = []*tailcfg.DERPRegion{BuildDERPRegion(activeDERP)}
-			addr = string(ci.Addr())
-		}
+	if len(ci.Region) == 0 && activeDERP != nil {
+		ci.Region = []*tailcfg.DERPRegion{BuildDERPRegion(activeDERP)}
+		addr = string(ci.Addr())
 	}
 
-	// Dial via tailcat data-plane
+	// Dial via tailcat data-plane with persistent client key identity
 	cl := tailcat.NewClient(tailcat.Addr(addr))
+	cl.Key = localNodeKey
 	if os.Getenv("KIZUNA_DEBUG") == "" {
 		cl.Logf = func(string, ...any) {}
 	}

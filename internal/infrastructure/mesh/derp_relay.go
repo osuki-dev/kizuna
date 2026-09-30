@@ -120,6 +120,7 @@ type DERPRelay struct {
 	fingerprint string
 	server      *derpserver.Server
 	listener    net.Listener
+	httpServer  *http.Server
 	stunConn    *net.UDPConn
 	isClosed    bool
 }
@@ -198,12 +199,21 @@ func (r *DERPRelay) Start() error {
 
 	tlsConfig := &tls.Config{
 		Certificates: []tls.Certificate{r.tlsCert},
+		MinVersion:   tls.VersionTLS12,
 	}
 	tlsLn := tls.NewListener(tcpLn, tlsConfig)
 	r.listener = tlsLn
 
+	httpServer := &http.Server{
+		Handler:     mux,
+		ReadTimeout: 30 * time.Second,
+		IdleTimeout: 120 * time.Second,
+		TLSConfig:   tlsConfig,
+	}
+	r.httpServer = httpServer
+
 	go func() {
-		_ = http.Serve(tlsLn, mux)
+		_ = httpServer.Serve(tlsLn)
 	}()
 
 	// 3. Optional STUN server on UDP
@@ -212,6 +222,9 @@ func (r *DERPRelay) Start() error {
 		if err == nil {
 			r.stunConn = udpConn
 			go r.serveSTUN(udpConn)
+		} else {
+			// If STUN binding failed (e.g. port taken), do not advertise dead STUN port
+			r.cfg.STUNPort = 0
 		}
 	}
 
@@ -250,7 +263,11 @@ func (r *DERPRelay) Close() error {
 	r.isClosed = true
 
 	var firstErr error
-	if r.listener != nil {
+	if r.httpServer != nil {
+		if err := r.httpServer.Close(); err != nil && firstErr == nil {
+			firstErr = err
+		}
+	} else if r.listener != nil {
 		if err := r.listener.Close(); err != nil && firstErr == nil {
 			firstErr = err
 		}
@@ -319,16 +336,16 @@ func BuildDERPRegion(info *entity.DERPNodeInfo) *tailcfg.DERPRegion {
 }
 
 // MeasureDERPLatency measures the round-trip time (RTT) to a DERP relay
-func MeasureDERPLatency(node *entity.DERPNodeInfo, timeout time.Duration) time.Duration {
+func MeasureDERPLatency(node *entity.DERPNodeInfo, timeout time.Duration) (time.Duration, error) {
 	if node == nil || node.HostName == "" {
-		return 10 * time.Second
+		return 0, fmt.Errorf("empty host name")
 	}
 
 	// 1. Try STUN ping if STUN port is defined
 	if node.STUNPort > 0 {
 		rtt, err := probeSTUN(node.HostName, node.STUNPort, timeout)
 		if err == nil {
-			return rtt
+			return rtt, nil
 		}
 	}
 
@@ -339,10 +356,10 @@ func MeasureDERPLatency(node *entity.DERPNodeInfo, timeout time.Duration) time.D
 	conn, err := dialer.Dial("tcp", target)
 	if err == nil {
 		_ = conn.Close()
-		return time.Since(start)
+		return time.Since(start), nil
 	}
 
-	return 10 * time.Second
+	return 0, fmt.Errorf("derp probe failed: %w", err)
 }
 
 func probeSTUN(host string, port int, timeout time.Duration) (time.Duration, error) {
@@ -392,6 +409,7 @@ func PickBestDERP(ctx context.Context, candidates []*entity.DERPNodeInfo, timeou
 	type result struct {
 		node *entity.DERPNodeInfo
 		rtt  time.Duration
+		err  error
 	}
 
 	resCh := make(chan result, len(candidates))
@@ -401,8 +419,8 @@ func PickBestDERP(ctx context.Context, candidates []*entity.DERPNodeInfo, timeou
 		wg.Add(1)
 		go func(target *entity.DERPNodeInfo) {
 			defer wg.Done()
-			rtt := MeasureDERPLatency(target, timeout)
-			resCh <- result{node: target, rtt: rtt}
+			rtt, err := MeasureDERPLatency(target, timeout)
+			resCh <- result{node: target, rtt: rtt, err: err}
 		}(c)
 	}
 
@@ -413,10 +431,14 @@ func PickBestDERP(ctx context.Context, candidates []*entity.DERPNodeInfo, timeou
 	minRTT := 24 * time.Hour
 
 	for res := range resCh {
-		if res.rtt < minRTT {
+		if res.err == nil && res.rtt < minRTT {
 			minRTT = res.rtt
 			best = res.node
 		}
+	}
+
+	if best == nil {
+		return candidates[0]
 	}
 
 	return best

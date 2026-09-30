@@ -531,10 +531,13 @@ func runServer() error {
 			RegionName: flagDERPRegionName,
 		}
 	} else {
-		for _, path := range []string{"kizuna.yaml", "kizuna.yml"} {
-			if proj, err := config.LoadProject(path); err == nil && proj != nil && proj.DERP != nil {
+		cfgPath := flagConfig
+		if cfgPath == "" {
+			cfgPath, _ = config.FindConfigFile()
+		}
+		if cfgPath != "" {
+			if proj, err := config.LoadProject(cfgPath); err == nil && proj != nil && proj.DERP != nil {
 				derpCfg = proj.DERP
-				break
 			}
 		}
 	}

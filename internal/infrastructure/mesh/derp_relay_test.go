@@ -104,7 +104,10 @@ func TestDERPRelayLifecycle(t *testing.T) {
 	}
 
 	// Test MeasureDERPLatency
-	measRTT := MeasureDERPLatency(info, 2*time.Second)
+	measRTT, err := MeasureDERPLatency(info, 2*time.Second)
+	if err != nil {
+		t.Fatalf("MeasureDERPLatency failed: %v", err)
+	}
 	if measRTT <= 0 || measRTT >= 5*time.Second {
 		t.Fatalf("expected reasonable latency measurement, got %v", measRTT)
 	}
