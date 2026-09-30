@@ -2765,15 +2765,24 @@ func newCheckCmd() *cobra.Command {
 }
 
 func newUpgradeCmd() *cobra.Command {
-	return &cobra.Command{
+	var flagTimeout time.Duration
+
+	cmd := &cobra.Command{
 		Use:   "upgrade",
 		Short: "Upgrade kizuna to the latest release from GitHub",
 		RunE: func(cmd *cobra.Command, args []string) error {
+			ctx := cmd.Context()
+			if flagTimeout > 0 {
+				var cancel context.CancelFunc
+				ctx, cancel = context.WithTimeout(ctx, flagTimeout)
+				defer cancel()
+			}
+
 			mgr := updater.NewManager("", "")
 
 			if flagJSON {
 				var finalEv updater.UpgradeEvent
-				err := mgr.UpgradeWithProgress(cmd.Context(), version, func(ev updater.UpgradeEvent) {
+				err := mgr.UpgradeWithProgress(ctx, version, func(ev updater.UpgradeEvent) {
 					if ev.Step == updater.StepComplete || ev.Step == updater.StepUpToDate || ev.Step == updater.StepFailed {
 						finalEv = ev
 					}
@@ -2805,11 +2814,14 @@ func newUpgradeCmd() *cobra.Command {
 						themeName = proj.Theme
 					}
 				}
-				return presenter.RunUpgradeTUI(cmd.Context(), mgr, version, themeName)
+				return presenter.RunUpgradeTUI(ctx, mgr, version, themeName)
 			}
 
 			// Non-interactive fallback: clean text log
-			return mgr.Upgrade(cmd.Context(), version, os.Stdout)
+			return mgr.Upgrade(ctx, version, os.Stdout)
 		},
 	}
+
+	cmd.Flags().DurationVar(&flagTimeout, "timeout", 0, "Custom timeout for the upgrade process (e.g. 15m, default: no timeout)")
+	return cmd
 }

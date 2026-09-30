@@ -11,6 +11,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"os"
 	"os/exec"
@@ -100,11 +101,26 @@ func NewManager(repo, cacheDir string) *Manager {
 	}
 	_ = os.MkdirAll(cacheDir, 0755)
 
+	transport := &http.Transport{
+		Proxy: http.ProxyFromEnvironment,
+		DialContext: (&net.Dialer{
+			Timeout:   30 * time.Second,
+			KeepAlive: 30 * time.Second,
+		}).DialContext,
+		ForceAttemptHTTP2:     true,
+		MaxIdleConns:          10,
+		IdleConnTimeout:       90 * time.Second,
+		TLSHandshakeTimeout:   30 * time.Second,
+		ResponseHeaderTimeout: 60 * time.Second,
+		ExpectContinueTimeout: 1 * time.Second,
+	}
+
 	return &Manager{
 		repo:       repo,
 		apiBaseURL: "https://api.github.com",
 		httpClient: &http.Client{
-			Timeout: 30 * time.Second,
+			Transport: transport,
+			Timeout:   0, // No overall timeout; slow connections (even a few KB/s) can finish downloading without deadline cancellation
 		},
 		cacheDir: cacheDir,
 	}
@@ -112,6 +128,13 @@ func NewManager(repo, cacheDir string) *Manager {
 
 // FetchLatestRelease queries GitHub API for the latest release
 func (m *Manager) FetchLatestRelease(ctx context.Context) (*Release, error) {
+	// Ensure release metadata check has a sensible deadline if caller didn't specify one
+	if _, hasDeadline := ctx.Deadline(); !hasDeadline {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, 45*time.Second)
+		defer cancel()
+	}
+
 	baseURL := m.apiBaseURL
 	if baseURL == "" {
 		baseURL = "https://api.github.com"
@@ -123,6 +146,11 @@ func (m *Manager) FetchLatestRelease(ctx context.Context) (*Release, error) {
 	}
 	req.Header.Set("Accept", "application/vnd.github.v3+json")
 	req.Header.Set("User-Agent", "kizuna-cli-updater")
+	if token := os.Getenv("GITHUB_TOKEN"); token != "" {
+		req.Header.Set("Authorization", "Bearer "+token)
+	} else if token := os.Getenv("GH_TOKEN"); token != "" {
+		req.Header.Set("Authorization", "Bearer "+token)
+	}
 
 	resp, err := m.httpClient.Do(req)
 	if err != nil {
