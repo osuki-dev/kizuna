@@ -41,6 +41,7 @@ irm https://raw.githubusercontent.com/osuki-dev/kizuna/main/install.ps1 | iex
 
 ### Key Highlights
 * **Zero-Config P2P Mesh**: Powered by `tailscale/tailcat`. Direct encrypted WireGuard tunnels via STUN/UDP hole-punching and DERP fallback in pure userspace.
+* **Decentralized Private DERP Relay**: Host embedded zero-config DERP relays on nodes (`--derp`) for NAT traversal, automatically discovered via gossip with dynamic latency benchmarking.
 * **Agentless Scale-Out**: Deploy and horizontally scale across multiple production servers using pure SSH + Docker without installing Kizuna on worker nodes.
 * **Caddy Ingress & HTTP/3**: Automated Let's Encrypt / ZeroSSL, Cloudflare DNS-01 ACME, or internal Root CA for LAN/Homelab IPs, with HTTP/3 (QUIC) and HTTP/2.
 * **Common Proxy Presets**: One-click configuration for WebSockets, SSE & LLM streaming (`flush_interval -1`), gRPC (`h2c`), and CORS headers.
@@ -61,6 +62,9 @@ irm https://raw.githubusercontent.com/osuki-dev/kizuna/main/install.ps1 | iex
 ```bash
 # Run in foreground (displays Mesh Address and a 6-digit Pairing PIN)
 kizuna service run
+
+# Or run with embedded private DERP relay (optional, for NAT traversal relaying):
+kizuna service run --derp --derp-port 8443
 
 # Or install as an auto-starting system service (systemd / launchd / Windows Service):
 kizuna service install
