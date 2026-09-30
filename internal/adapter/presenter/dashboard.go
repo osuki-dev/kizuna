@@ -189,6 +189,7 @@ type DashboardModel struct {
 	activeEnv    string
 	width        int
 	height       int
+	showFullAddr bool
 	collector    *telemetry.Collector
 	localMetrics *telemetry.Metrics
 	cpuHistory   []float64
@@ -345,7 +346,7 @@ func (m *DashboardModel) probeAllNodesCmd() tea.Cmd {
 					err:      nil,
 				}
 			}
-			ctx, cancel := context.WithTimeout(context.Background(), 1500*time.Millisecond)
+			ctx, cancel := context.WithTimeout(context.Background(), 3500*time.Millisecond)
 			defer cancel()
 
 			updatedNode, services, err := m.client.GetStatus(ctx, target)
@@ -408,6 +409,9 @@ func (m *DashboardModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, nil
 		case "r":
 			return m, tea.Batch(m.fetchLocalMetricsCmd(), m.probeAllNodesCmd())
+		case "a", "A", "w", "W":
+			m.showFullAddr = !m.showFullAddr
+			return m, nil
 		}
 
 	case tea.WindowSizeMsg:
@@ -537,11 +541,11 @@ func (m *DashboardModel) View() string {
 	// 4. Footer shortcuts (Adaptive)
 	var footerText string
 	if termWidth >= 100 {
-		footerText = " [1-5 / Tab] Switch Views  •  [↑/↓] Select Item  •  [r] Refresh Telemetry  •  [q] Quit"
+		footerText = " [1-5 / Tab] Switch Views  •  [↑/↓] Select Item  •  [a] Toggle Addr  •  [r] Refresh Telemetry  •  [q] Quit"
 	} else if termWidth >= 80 {
-		footerText = " [1-5/Tab] Views  •  [↑/↓] Select  •  [r] Refresh  •  [q] Quit"
+		footerText = " [1-5/Tab] Views  •  [↑/↓] Select  •  [a] Addr  •  [r] Refresh  •  [q] Quit"
 	} else {
-		footerText = " [1-5] Tab  •  [r] Refresh  •  [q] Quit"
+		footerText = " [1-5] Tab  •  [a] Addr  •  [r] Refresh  •  [q] Quit"
 	}
 	s.WriteString(m.styles.MutedText.Render(footerText))
 
@@ -1073,7 +1077,7 @@ func (m *DashboardModel) renderNodesTab(width int) string {
 				hostStr = n.IP
 			}
 			if hostStr == "" {
-				hostStr = truncate(n.Addr, 17)
+				hostStr = FormatNodeAddr(n.Addr, false)
 			}
 
 			tagsStr := "-"
@@ -1155,7 +1159,7 @@ func (m *DashboardModel) renderNodesTab(width int) string {
 				hostStr = n.IP
 			}
 			if hostStr == "" {
-				hostStr = truncate(n.Addr, 17)
+				hostStr = FormatNodeAddr(n.Addr, false)
 			}
 
 			tagsStr := "-"
@@ -1231,7 +1235,7 @@ func (m *DashboardModel) renderNodesTab(width int) string {
 				hostStr = n.IP
 			}
 			if hostStr == "" {
-				hostStr = truncate(n.Addr, 17)
+				hostStr = FormatNodeAddr(n.Addr, false)
 			}
 
 			switch n.GossipState {
@@ -1281,7 +1285,18 @@ func (m *DashboardModel) renderNodesTab(width int) string {
 		sb.WriteString("\n" + m.styles.Subtitle.Render("🔎 SELECTED NODE DETAILS") + "\n")
 		sb.WriteString(m.styles.Divider.Render(strings.Repeat("─", width)) + "\n")
 		fmt.Fprintf(&sb, "  Node ID:      %s\n", sn.ID)
-		fmt.Fprintf(&sb, "  Mesh Addr:    %s\n", sn.Addr)
+
+		addrVal := FormatNodeAddr(sn.Addr, false)
+		addrHint := m.styles.MutedText.Render("(press 'a' to show full)")
+		if m.showFullAddr {
+			addrVal = sn.Addr
+			addrHint = m.styles.MutedText.Render("(press 'a' to collapse)")
+		}
+		if sn.Addr == "" {
+			fmt.Fprintf(&sb, "  Mesh Addr:    -\n")
+		} else {
+			fmt.Fprintf(&sb, "  Mesh Addr:    %s  %s\n", addrVal, addrHint)
+		}
 
 		hostVal := sn.Host
 		if hostVal == "" {
@@ -1299,14 +1314,20 @@ func (m *DashboardModel) renderNodesTab(width int) string {
 		fmt.Fprintf(&sb, "  Tags:         %s\n", tagsVal)
 
 		nodeStatus := sn.Status
-		if nodeStatus == "" {
-			nodeStatus = string(sn.GossipState)
-		}
-		if nodeStatus == "" {
-			if st != nil && st.IsOnline {
-				nodeStatus = "alive"
+		if st != nil && !st.IsOnline {
+			if sn.GossipState == entity.GossipStateDead {
+				nodeStatus = "dead"
 			} else {
 				nodeStatus = "offline"
+			}
+		} else if nodeStatus == "" {
+			nodeStatus = string(sn.GossipState)
+			if nodeStatus == "" {
+				if st != nil && st.IsOnline {
+					nodeStatus = "alive"
+				} else {
+					nodeStatus = "offline"
+				}
 			}
 		}
 		fmt.Fprintf(&sb, "  Health:       %s (Epoch: %d)\n", strings.ToUpper(nodeStatus), sn.Incarnation)

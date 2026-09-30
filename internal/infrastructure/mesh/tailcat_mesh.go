@@ -175,9 +175,17 @@ func (m *TailcatMesh) Dial(ctx context.Context, addr string, port uint16) (net.C
 	}
 
 	// If addr cannot be parsed as a Tailcat address, treat as a hostname (e.g. Docker container, LAN host)
-	if _, err := tailcat.ParseAddr(tailcat.Addr(addr)); err != nil {
+	ci, err := tailcat.ParseAddr(tailcat.Addr(addr))
+	if err != nil {
 		var dialer net.Dialer
 		return dialer.DialContext(ctx, "tcp", fmt.Sprintf("%s:%d", addr, port))
+	}
+
+	// If this address is the local node, loopback directly to local listener in <1ms
+	localNodeKey, _ := loadOrCreateMeshKeys()
+	if ci.ServerPublic.NodePublic == localNodeKey.Public() || (m.activeAddr != "" && m.activeAddr == addr) {
+		var dialer net.Dialer
+		return dialer.DialContext(ctx, "tcp", fmt.Sprintf("127.0.0.1:%d", port))
 	}
 
 	// Dial via tailcat data-plane

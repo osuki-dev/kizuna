@@ -170,20 +170,66 @@ func (u *UI) RenderServerStart(meshAddr, pin string) string {
 	return u.CardStyle.Render(content)
 }
 
-// GossipPill returns an indicator badge for gossip state
+// FormatNodeAddr formats a node mesh or IP address compactly unless full is requested.
+func FormatNodeAddr(addr string, full bool) string {
+	if full || len(addr) <= 24 {
+		return addr
+	}
+	return fmt.Sprintf("%s...%s", addr[:10], addr[len(addr)-6:])
+}
+
+// GossipPill returns an indicator badge for gossip state.
+// An unreachable or offline node is strictly rendered as offline or dead, never alive.
 func (u *UI) GossipPill(state entity.GossipState, isOnline bool) string {
+	if !isOnline {
+		if NoColor {
+			if state == entity.GossipStateDead {
+				return "[Dead]"
+			}
+			if state == entity.GossipStateSuspect {
+				return "[Suspect]"
+			}
+			if state == entity.GossipStateLeft {
+				return "[Left]"
+			}
+			return "[Offline]"
+		}
+		switch state {
+		case entity.GossipStateDead:
+			return lipgloss.NewStyle().
+				Bold(true).
+				Foreground(lipgloss.Color("#FFFFFF")).
+				Background(lipgloss.Color(u.Theme.Danger)).
+				Padding(0, 1).
+				Render("✖ Dead")
+		case entity.GossipStateSuspect:
+			return lipgloss.NewStyle().
+				Bold(true).
+				Foreground(lipgloss.Color("#000000")).
+				Background(lipgloss.Color(u.Theme.Warning)).
+				Padding(0, 1).
+				Render("▲ Suspect")
+		case entity.GossipStateLeft:
+			return lipgloss.NewStyle().
+				Foreground(lipgloss.Color("#FFFFFF")).
+				Background(lipgloss.Color(u.Theme.Muted)).
+				Padding(0, 1).
+				Render("○ Left")
+		default:
+			return u.StatusPill(false)
+		}
+	}
+
+	// When node is online:
 	if NoColor {
 		if state != "" {
 			return "[" + string(state) + "]"
 		}
-		if isOnline {
-			return "[Online]"
-		}
-		return "[Offline]"
+		return "[Online]"
 	}
 
 	switch state {
-	case entity.GossipStateAlive:
+	case entity.GossipStateAlive, "":
 		return lipgloss.NewStyle().
 			Bold(true).
 			Foreground(lipgloss.Color("#FFFFFF")).
@@ -201,9 +247,9 @@ func (u *UI) GossipPill(state entity.GossipState, isOnline bool) string {
 		return lipgloss.NewStyle().
 			Bold(true).
 			Foreground(lipgloss.Color("#FFFFFF")).
-			Background(lipgloss.Color(u.Theme.Danger)).
+			Background(lipgloss.Color(u.Theme.Warning)).
 			Padding(0, 1).
-			Render("✖ Dead")
+			Render("▲ Reconnecting")
 	case entity.GossipStateLeft:
 		return lipgloss.NewStyle().
 			Foreground(lipgloss.Color("#FFFFFF")).
@@ -215,13 +261,22 @@ func (u *UI) GossipPill(state entity.GossipState, isOnline bool) string {
 	}
 }
 
-// RenderNodeTable formats paired nodes into a Lipgloss table
-func (u *UI) RenderNodeTable(nodes []*entity.Node) string {
+// RenderNodeTable formats paired nodes into a Lipgloss table.
+// If wide is true, full un-truncated mesh addresses are included as an extra column.
+func (u *UI) RenderNodeTable(nodes []*entity.Node, wide ...bool) string {
 	if len(nodes) == 0 {
 		return u.MutedStyle.Render("No paired nodes found. Pair one with: kizuna node add <mesh-addr> --pin <pin>")
 	}
 
-	headers := []string{"NAME", "STATUS", "TAGS", "HOST / IP", "OS / ARCH", "LAST SEEN"}
+	isWide := len(wide) > 0 && wide[0]
+
+	var headers []string
+	if isWide {
+		headers = []string{"NAME", "STATUS", "TAGS", "HOST / IP", "OS / ARCH", "LAST SEEN", "MESH ADDR"}
+	} else {
+		headers = []string{"NAME", "STATUS", "TAGS", "HOST / IP", "OS / ARCH", "LAST SEEN"}
+	}
+
 	rows := [][]string{}
 
 	for _, n := range nodes {
@@ -247,19 +302,29 @@ func (u *UI) RenderNodeTable(nodes []*entity.Node) string {
 		} else if n.IP != "" {
 			hostStr = n.IP
 		} else if n.Addr != "" {
-			hostStr = n.Addr
+			hostStr = FormatNodeAddr(n.Addr, false)
 		}
 
 		statusBadge := u.GossipPill(n.GossipState, n.IsOnline)
 
-		rows = append(rows, []string{
+		row := []string{
 			u.BoldStyle.Render(n.Name),
 			statusBadge,
 			tagsStr,
 			hostStr,
 			osArch,
 			u.MutedStyle.Render(lastSeen),
-		})
+		}
+
+		if isWide {
+			addrStr := n.Addr
+			if addrStr == "" {
+				addrStr = "-"
+			}
+			row = append(row, addrStr)
+		}
+
+		rows = append(rows, row)
 	}
 
 	t := table.New().

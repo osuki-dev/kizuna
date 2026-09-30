@@ -347,11 +347,22 @@ func (e *Engine) RemoveMember(nameOrID string) bool {
 
 // AddOrUpdateMember adds or updates a member and clears any tombstone
 func (e *Engine) AddOrUpdateMember(node *entity.Node) {
-	if node == nil || node.ID == "" {
+	if node == nil {
 		return
 	}
 	e.mu.Lock()
 	defer e.mu.Unlock()
+
+	if node.ID == "" && node.Name != "" {
+		if id, ok := e.nameToID[node.Name]; ok {
+			node.ID = id
+		} else {
+			node.ID = "node_" + node.Name
+		}
+	}
+	if node.ID == "" {
+		return
+	}
 
 	delete(e.tombstones, node.ID)
 	if node.Name != "" {
@@ -1241,6 +1252,21 @@ func (e *Engine) selectRandomPeer() *entity.Node {
 				continue
 			}
 			candidates = append(candidates, m)
+		}
+	}
+
+	// If no alive peers available, probe dead peers to enable automatic node recovery
+	if len(candidates) == 0 {
+		for _, m := range e.members {
+			if m.ID != e.self.ID && (e.self.Name == "" || m.Name != e.self.Name) && m.Addr != "" {
+				if _, dead := e.tombstones[m.ID]; dead {
+					continue
+				}
+				if _, dead := e.tombstones[m.Name]; dead {
+					continue
+				}
+				candidates = append(candidates, m)
+			}
 		}
 	}
 

@@ -551,13 +551,16 @@ func runServer() error {
 }
 
 func newNodeCmd() *cobra.Command {
+	var flagWide bool
+
 	nodeCmd := &cobra.Command{
 		Use:   "node",
 		Short: "List, pair, or manage remote mesh nodes",
 		RunE: func(cmd *cobra.Command, args []string) error {
-			return listNodes()
+			return listNodes(flagWide)
 		},
 	}
+	nodeCmd.Flags().BoolVarP(&flagWide, "wide", "w", false, "Show full mesh addresses and extended details")
 
 	var pin string
 	var name string
@@ -623,12 +626,14 @@ func newNodeCmd() *cobra.Command {
 	_ = addCmd.MarkFlagRequired("pin")
 
 	listCmd := &cobra.Command{
-		Use:   "ls",
-		Short: "List all paired mesh nodes",
+		Use:     "ls",
+		Aliases: []string{"list"},
+		Short:   "List all paired mesh nodes",
 		RunE: func(cmd *cobra.Command, args []string) error {
-			return listNodes()
+			return listNodes(flagWide)
 		},
 	}
+	listCmd.Flags().BoolVarP(&flagWide, "wide", "w", false, "Show full mesh addresses and extended details")
 
 	rmCmd := &cobra.Command{
 		Use:   "rm <node-name>",
@@ -1127,12 +1132,12 @@ func resolveNode(nameOrID string) (*entity.Node, error) {
 	return nil, fmt.Errorf("node '%s' not found", nameOrID)
 }
 
-func listNodes() error {
+func listNodes(wide bool) error {
 	repo, err := config.NewNodeRepository("")
 	if err != nil {
 		return err
 	}
-	nodes, err := repo.ListNodes()
+	repoNodes, err := repo.ListNodes()
 	if err != nil {
 		return err
 	}
@@ -1149,66 +1154,174 @@ func listNodes() error {
 		}
 	}
 
-	var finalNodes []*entity.Node
+	nodeMap := make(map[string]*entity.Node)
+	var orderedKeys []string
+
+	upsert := func(key string, n *entity.Node) {
+		if _, exists := nodeMap[key]; !exists {
+			orderedKeys = append(orderedKeys, key)
+		}
+		nodeMap[key] = n
+	}
+
+	// First include all nodes known in the persistent repository
+	for _, n := range repoNodes {
+		if n == nil {
+			continue
+		}
+		key := n.Name
+		if key == "" {
+			key = n.ID
+		}
+		upsert(key, n)
+	}
+
 	if len(meshNodes) > 0 {
-		finalNodes = meshNodes
-	} else {
+		// Overlay live daemon state for all cluster members
+		for _, mn := range meshNodes {
+			if mn == nil {
+				continue
+			}
+			key := mn.Name
+			if key == "" {
+				key = mn.ID
+			}
+			upsert(key, mn)
+		}
+
+		// Re-verify any paired repo nodes currently reported as dead or offline
+		var deadOrStale []*entity.Node
+		for _, rn := range repoNodes {
+			if rn == nil {
+				continue
+			}
+			key := rn.Name
+			if key == "" {
+				key = rn.ID
+			}
+			if current, ok := nodeMap[key]; ok {
+				if !current.IsOnline || current.GossipState == entity.GossipStateDead {
+					deadOrStale = append(deadOrStale, rn)
+				}
+			}
+		}
+
+		if len(deadOrStale) > 0 {
+			meshGw := mesh.NewMeshGateway()
+			defer func() { _ = meshGw.Close() }()
+			cli := client.NewMeshClient(meshGw)
+
+			var wg sync.WaitGroup
+			for _, target := range deadOrStale {
+				wg.Add(1)
+				go func(t *entity.Node) {
+					defer wg.Done()
+					ctx, cancel := context.WithTimeout(context.Background(), 3500*time.Millisecond)
+					defer cancel()
+
+					upNode, _, probeErr := cli.GetStatus(ctx, t)
+					key := t.Name
+					if key == "" {
+						key = t.ID
+					}
+					if probeErr == nil && upNode != nil {
+						upNode.IsOnline = true
+						if upNode.Status == "" {
+							upNode.Status = "alive"
+						}
+						if upNode.ID == "" {
+							upNode.ID = t.ID
+						}
+						if t.Name != "" {
+							upNode.Name = t.Name
+						}
+						if upNode.Addr == "" {
+							upNode.Addr = t.Addr
+						}
+						if upNode.AuthToken == "" {
+							upNode.AuthToken = t.AuthToken
+						}
+						if len(upNode.Tags) == 0 {
+							upNode.Tags = t.Tags
+						}
+						upNode.GossipState = entity.GossipStateAlive
+						nodeMap[key] = upNode
+						_ = repo.SaveNode(upNode)
+
+						clientHTTP := &http.Client{Timeout: 500 * time.Millisecond}
+						if reqBody, err := json.Marshal(upNode); err == nil {
+							if resp, err := clientHTTP.Post("http://127.0.0.1:19800/api/v1/node/add", "application/json", bytes.NewReader(reqBody)); err == nil {
+								_ = resp.Body.Close()
+							}
+						}
+					}
+				}(target)
+			}
+			wg.Wait()
+		}
+	} else if len(repoNodes) > 0 {
+		// Daemon is not running: directly probe configured nodes
 		meshGw := mesh.NewMeshGateway()
 		defer func() { _ = meshGw.Close() }()
 		cli := client.NewMeshClient(meshGw)
 
 		var wg sync.WaitGroup
-		probed := make([]*entity.Node, len(nodes))
-
-		for i, n := range nodes {
+		for _, target := range repoNodes {
 			wg.Add(1)
-			go func(idx int, target *entity.Node) {
+			go func(t *entity.Node) {
 				defer wg.Done()
-				ctx, cancel := context.WithTimeout(context.Background(), 6*time.Second)
+				ctx, cancel := context.WithTimeout(context.Background(), 3500*time.Millisecond)
 				defer cancel()
 
-				nCopy := *target
-				upNode, _, err := cli.GetStatus(ctx, target)
-				if err != nil {
-					if os.Getenv("KIZUNA_DEBUG") != "" {
-						fmt.Fprintf(os.Stderr, "DEBUG GetStatus error: %v\n", err)
-					}
+				nCopy := *t
+				upNode, _, probeErr := cli.GetStatus(ctx, t)
+				key := t.Name
+				if key == "" {
+					key = t.ID
+				}
+				if probeErr != nil {
 					nCopy.IsOnline = false
-					nCopy.Status = "dead"
+					nCopy.Status = "offline"
 					nCopy.GossipState = entity.GossipStateDead
-					probed[idx] = &nCopy
+					nodeMap[key] = &nCopy
 				} else {
 					if upNode != nil {
 						upNode.IsOnline = true
 						if upNode.Status == "" {
 							upNode.Status = "alive"
 						}
+						if t.Name != "" {
+							upNode.Name = t.Name
+						}
+						if upNode.Addr == "" {
+							upNode.Addr = t.Addr
+						}
+						if upNode.AuthToken == "" {
+							upNode.AuthToken = t.AuthToken
+						}
+						if len(upNode.Tags) == 0 {
+							upNode.Tags = t.Tags
+						}
 						upNode.GossipState = entity.GossipStateAlive
-						probed[idx] = upNode
+						nodeMap[key] = upNode
 					} else {
 						nCopy.IsOnline = true
 						nCopy.Status = "alive"
 						nCopy.GossipState = entity.GossipStateAlive
-						probed[idx] = &nCopy
+						nodeMap[key] = &nCopy
 					}
 				}
-			}(i, n)
+			}(target)
 		}
 		wg.Wait()
-		finalNodes = probed
 	}
 
-	// Filter out any nodes that are dead or removed from cluster
-	var activeNodes []*entity.Node
-	for _, n := range finalNodes {
-		if n != nil && n.GossipState != entity.GossipStateDead && n.Status != "dead" {
-			activeNodes = append(activeNodes, n)
+	var finalNodes []*entity.Node
+	for _, k := range orderedKeys {
+		n := nodeMap[k]
+		if n == nil {
+			continue
 		}
-	}
-	finalNodes = activeNodes
-
-	// Guarantee Status is populated on all returned nodes
-	for _, n := range finalNodes {
 		if n.Status == "" {
 			if n.GossipState != "" {
 				n.Status = string(n.GossipState)
@@ -1218,6 +1331,7 @@ func listNodes() error {
 				n.Status = "offline"
 			}
 		}
+		finalNodes = append(finalNodes, n)
 	}
 
 	if flagJSON {
@@ -1225,7 +1339,7 @@ func listNodes() error {
 	}
 
 	ui := presenter.NewUI("")
-	fmt.Println(ui.RenderNodeTable(finalNodes))
+	fmt.Println(ui.RenderNodeTable(finalNodes, wide))
 	return nil
 }
 
@@ -1509,6 +1623,50 @@ func runDashboard() error {
 		nodes, _ = repo.ListNodes()
 	}
 
+	// Also check if local daemon has live mesh members and merge them
+	clientHTTP := &http.Client{Timeout: 800 * time.Millisecond}
+	resp, httpErr := clientHTTP.Get("http://127.0.0.1:19800/api/v1/node/members")
+	if httpErr == nil && resp.StatusCode == http.StatusOK {
+		defer func() { _ = resp.Body.Close() }()
+		var gm []*entity.Node
+		if json.NewDecoder(resp.Body).Decode(&gm) == nil && len(gm) > 0 {
+			nodeMap := make(map[string]*entity.Node)
+			var ordered []*entity.Node
+			for _, n := range nodes {
+				if n != nil {
+					key := n.Name
+					if key == "" {
+						key = n.ID
+					}
+					nodeMap[key] = n
+					ordered = append(ordered, n)
+				}
+			}
+			for _, mn := range gm {
+				if mn != nil {
+					key := mn.Name
+					if key == "" {
+						key = mn.ID
+					}
+					if _, exists := nodeMap[key]; !exists {
+						nodeMap[key] = mn
+						ordered = append(ordered, mn)
+					} else {
+						nodeMap[key] = mn
+					}
+				}
+			}
+			nodes = nil
+			for _, k := range ordered {
+				key := k.Name
+				if key == "" {
+					key = k.ID
+				}
+				nodes = append(nodes, nodeMap[key])
+			}
+		}
+	}
+
 	themeName := ""
 	var configuredServices []*entity.Service
 	cfgPath := flagConfig
@@ -1547,6 +1705,7 @@ func runDashboard() error {
 func newStatusCmd() *cobra.Command {
 	var interactive bool
 	var watch bool
+	var flagWide bool
 
 	cmd := &cobra.Command{
 		Use:   "status [service-name]",
@@ -1568,6 +1727,8 @@ func newStatusCmd() *cobra.Command {
 			if err == nil {
 				nodes, _ = repo.ListNodes()
 			}
+
+
 
 			// If no remote nodes configured, register local machine as node
 			if len(nodes) == 0 {
@@ -1622,7 +1783,7 @@ func newStatusCmd() *cobra.Command {
 				go func(idx int, target *entity.Node) {
 					defer wg.Done()
 					start := time.Now()
-					probeCtx, probeCancel := context.WithTimeout(context.Background(), 1200*time.Millisecond)
+					probeCtx, probeCancel := context.WithTimeout(cmd.Context(), 3500*time.Millisecond)
 					defer probeCancel()
 
 					nCopy := *target
@@ -1630,13 +1791,36 @@ func newStatusCmd() *cobra.Command {
 					latency := time.Since(start)
 					if err != nil {
 						nCopy.IsOnline = false
+						nCopy.Status = "offline"
+						nCopy.GossipState = entity.GossipStateDead
 						resChan <- nodeResult{index: idx, node: &nCopy, latency: latency, err: err}
 					} else {
 						if upNode != nil {
 							upNode.IsOnline = true
+							if upNode.Status == "" {
+								upNode.Status = "alive"
+							}
+							if upNode.ID == "" {
+								upNode.ID = target.ID
+							}
+							if target.Name != "" {
+								upNode.Name = target.Name
+							}
+							if upNode.Addr == "" {
+								upNode.Addr = target.Addr
+							}
+							if upNode.AuthToken == "" {
+								upNode.AuthToken = target.AuthToken
+							}
+							if len(upNode.Tags) == 0 {
+								upNode.Tags = target.Tags
+							}
+							upNode.GossipState = entity.GossipStateAlive
 							resChan <- nodeResult{index: idx, node: upNode, services: svcs, latency: latency}
 						} else {
 							nCopy.IsOnline = true
+							nCopy.Status = "alive"
+							nCopy.GossipState = entity.GossipStateAlive
 							resChan <- nodeResult{index: idx, node: &nCopy, services: svcs, latency: latency}
 						}
 					}
@@ -1652,6 +1836,15 @@ func newStatusCmd() *cobra.Command {
 
 			for res := range resChan {
 				probedNodes[res.index] = res.node
+				if res.err == nil && res.node != nil {
+					_ = repo.SaveNode(res.node)
+					clientHTTP := &http.Client{Timeout: 500 * time.Millisecond}
+					if reqBody, err := json.Marshal(res.node); err == nil {
+						if resp, err := clientHTTP.Post("http://127.0.0.1:19800/api/v1/node/add", "application/json", bytes.NewReader(reqBody)); err == nil {
+							_ = resp.Body.Close()
+						}
+					}
+				}
 				if len(res.services) > 0 {
 					for _, s := range res.services {
 						found := false
@@ -1681,7 +1874,7 @@ func newStatusCmd() *cobra.Command {
 			fmt.Println()
 			fmt.Println(ui.RenderSystemCard(localMetrics))
 			fmt.Println()
-			fmt.Println(ui.RenderNodeTable(probedNodes))
+			fmt.Println(ui.RenderNodeTable(probedNodes, flagWide))
 			if len(activeServices) > 0 {
 				fmt.Println()
 				fmt.Println(ui.RenderServicesTable(activeServices))
@@ -1693,7 +1886,8 @@ func newStatusCmd() *cobra.Command {
 	}
 
 	cmd.Flags().BoolVarP(&interactive, "interactive", "i", false, "Launch interactive Bubble Tea TUI dashboard")
-	cmd.Flags().BoolVarP(&watch, "watch", "w", false, "Watch status in interactive Bubble Tea TUI")
+	cmd.Flags().BoolVarP(&watch, "watch", "W", false, "Watch status in interactive Bubble Tea TUI")
+	cmd.Flags().BoolVarP(&flagWide, "wide", "w", false, "Show full mesh addresses in node table")
 	return cmd
 }
 
