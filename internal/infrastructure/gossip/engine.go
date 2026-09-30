@@ -7,6 +7,7 @@ import (
 	"net"
 	"os"
 	"runtime"
+	"strings"
 	"sync"
 	"time"
 
@@ -56,25 +57,70 @@ type Engine struct {
 	}
 }
 
-// DetectOutboundIP determines the preferred local outbound IP for gossip/metadata
+var cgnatNet = &net.IPNet{
+	IP:   net.ParseIP("100.64.0.0"),
+	Mask: net.CIDRMask(10, 32),
+}
+
+func isVirtualOrVPN(ifName string) bool {
+	lower := strings.ToLower(ifName)
+	prefixes := []string{
+		"tailscale", "docker", "br-", "veth", "tun", "tap", "utun", "wg", "virbr", "vmnet", "vbox",
+	}
+	for _, p := range prefixes {
+		if strings.HasPrefix(lower, p) {
+			return true
+		}
+	}
+	return false
+}
+
+// DetectOutboundIP determines the preferred local physical outbound IP for gossip/metadata,
+// prioritizing real physical LAN interfaces (eno, eth, en, wlan) and ignoring VPN/Tailscale/Docker virtual networks.
 func DetectOutboundIP() string {
-	conn, err := net.Dial("udp", "8.8.8.8:80")
-	if err != nil {
-		if addrs, err := net.InterfaceAddrs(); err == nil {
+	// 1. Try finding a physical LAN IPv4 interface first
+	if ifaces, err := net.Interfaces(); err == nil {
+		for _, iface := range ifaces {
+			if iface.Flags&net.FlagUp == 0 || iface.Flags&net.FlagLoopback != 0 {
+				continue
+			}
+			if isVirtualOrVPN(iface.Name) {
+				continue
+			}
+			addrs, err := iface.Addrs()
+			if err != nil {
+				continue
+			}
 			for _, addr := range addrs {
-				if ipNet, ok := addr.(*net.IPNet); ok && !ipNet.IP.IsLoopback() && ipNet.IP.To4() != nil {
-					return ipNet.IP.String()
+				ipNet, ok := addr.(*net.IPNet)
+				if !ok || ipNet.IP == nil || ipNet.IP.IsLoopback() {
+					continue
 				}
+				ipv4 := ipNet.IP.To4()
+				if ipv4 == nil {
+					continue
+				}
+				if cgnatNet.Contains(ipv4) || ipv4.IsLinkLocalUnicast() {
+					continue
+				}
+				return ipv4.String()
 			}
 		}
-		return ""
 	}
-	defer func() { _ = conn.Close() }()
-	localAddr, ok := conn.LocalAddr().(*net.UDPAddr)
-	if !ok || localAddr.IP == nil {
-		return ""
+
+	// 2. Fallback to outbound dial if no physical LAN interface matched
+	conn, err := net.Dial("udp", "8.8.8.8:80")
+	if err == nil {
+		defer func() { _ = conn.Close() }()
+		if localAddr, ok := conn.LocalAddr().(*net.UDPAddr); ok && localAddr.IP != nil {
+			ipv4 := localAddr.IP.To4()
+			if ipv4 != nil && !cgnatNet.Contains(ipv4) {
+				return ipv4.String()
+			}
+		}
 	}
-	return localAddr.IP.String()
+
+	return ""
 }
 
 // NewEngine creates and initializes a new Gossip Engine
