@@ -41,6 +41,7 @@ import (
 	"github.com/osuki-dev/kizuna/internal/infrastructure/workload"
 	"github.com/osuki-dev/kizuna/internal/usecase"
 	"github.com/spf13/cobra"
+	"github.com/tailscale/tailcat"
 )
 
 var (
@@ -548,7 +549,22 @@ func runServer() error {
 				fmt.Printf("⚠️  Failed to start private DERP relay: %v\n", err)
 			}
 		} else if !flagJSON {
-			fmt.Printf("✓ Private DERP relay active on port %d (STUN %d)\n", derpCfg.Port, derpCfg.STUNPort)
+			active := meshGw.GetActiveDERP()
+			host := derpCfg.Host
+			stunPort := derpCfg.STUNPort
+			if active != nil {
+				if active.HostName != "" {
+					host = active.HostName
+				}
+				stunPort = active.STUNPort
+			}
+			fmt.Printf("✓ Private DERP relay active on %s:%d (STUN %d)\n", host, derpCfg.Port, stunPort)
+			if ip := net.ParseIP(host); ip != nil && (ip.IsPrivate() || ip.IsLoopback()) {
+				fmt.Printf("⚠️  Notice: DERP relay is bound to private IP (%s).\n", host)
+				fmt.Printf("   If on a cloud VPS (Tencent/Aliyun/AWS), peers cannot connect across the Internet unless you:\n")
+				fmt.Printf("   1. Pass --derp-host <PUBLIC_IP>\n")
+				fmt.Printf("   2. Open TCP port %d in your Cloud Security Group / Firewall.\n\n", derpCfg.Port)
+			}
 		}
 	}
 
@@ -657,6 +673,15 @@ func newNodeCmd() *cobra.Command {
 			cli := client.NewMeshClient(meshGw)
 			res, err := cli.Pair(context.Background(), addr, 19800, pin, "kizuna-cli")
 			if err != nil {
+				if ci, parseErr := tailcat.ParseAddr(tailcat.Addr(addr)); parseErr == nil && len(ci.Region) > 0 {
+					for _, r := range ci.Region {
+						for _, n := range r.Nodes {
+							if ip := net.ParseIP(n.HostName); ip != nil && (ip.IsPrivate() || ip.IsLoopback()) {
+								return fmt.Errorf("%s\n\n💡 Troubleshooting Tip: The target node's DERP relay is advertising private VPC/LAN IP '%s'.\n   If that node is on a cloud VPS (Tencent Cloud / Aliyun / AWS), it must be started with:\n     kizuna service run --derp --derp-host <VPS_PUBLIC_IP> --derp-port %d\n   Also ensure TCP port %d is allowed in your Cloud Security Group / Firewall", i18n.T("node_pair_failed", err), n.HostName, n.DERPPort, n.DERPPort)
+							}
+						}
+					}
+				}
 				return fmt.Errorf("%s", i18n.T("node_pair_failed", err))
 			}
 			if !res.Success {

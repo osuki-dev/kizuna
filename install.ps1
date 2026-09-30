@@ -34,7 +34,7 @@ if (-not $Version) {
         $Release = Invoke-RestMethod -Uri $ReleaseUrl -Headers @{ "User-Agent" = "kizuna-installer" }
         $Version = $Release.tag_name
     } catch {
-        $Version = "v0.3.0"
+        $Version = "v0.3.1"
         Write-Warning "Could not fetch latest release, using default $Version"
     }
 }

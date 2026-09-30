@@ -132,8 +132,6 @@ func NewDERPRelay(nodeKey key.NodePrivate, cfg entity.DERPConfig) (*DERPRelay, e
 	}
 	if cfg.STUNPort < 0 {
 		cfg.STUNPort = 0
-	} else if cfg.STUNPort == 0 {
-		cfg.STUNPort = 3478
 	}
 	if cfg.RegionID <= 0 {
 		cfg.RegionID = 901
@@ -145,7 +143,24 @@ func NewDERPRelay(nodeKey key.NodePrivate, cfg entity.DERPConfig) (*DERPRelay, e
 		cfg.RegionName = "Kizuna Private Relay"
 	}
 	if cfg.Host == "" {
-		cfg.Host = gossip.DetectOutboundIP()
+		localIP := gossip.DetectOutboundIP()
+		parsed := net.ParseIP(localIP)
+
+		// If local interface IP is private (e.g. Cloud VPS behind VPC 1:1 NAT like 172.16.x / 10.x / 192.168.x),
+		// attempt to auto-detect the public WAN IP via STUN / HTTP reflection so external peers can connect!
+		if parsed == nil || parsed.IsPrivate() || parsed.IsLoopback() {
+			ctx, cancel := context.WithTimeout(context.Background(), 2500*time.Millisecond)
+			wanIP := DetectPublicIP(ctx)
+			cancel()
+			if wanIP != "" {
+				cfg.Host = wanIP
+			} else {
+				cfg.Host = localIP
+			}
+		} else {
+			cfg.Host = localIP
+		}
+
 		if cfg.Host == "" {
 			cfg.Host = "127.0.0.1"
 		}
