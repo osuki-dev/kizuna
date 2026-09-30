@@ -40,6 +40,47 @@ type Project struct {
 	Services     map[string]*Service `json:"services"`
 	DERP         *DERPConfig         `json:"derp,omitempty" yaml:"derp,omitempty"`
 	SSH          *SSHConfig          `json:"ssh,omitempty" yaml:"ssh,omitempty"`
+	Mesh         *MeshConfig         `json:"mesh,omitempty" yaml:"mesh,omitempty"`
+}
+
+// MeshConfig defines cluster mesh networking, timeout, and upload limits configurable via kizuna.yaml
+type MeshConfig struct {
+	Port           uint16 `json:"port,omitempty" yaml:"port,omitempty"`
+	ProbeTimeout   string `json:"probe_timeout,omitempty" yaml:"probe_timeout,omitempty"`     // e.g. "5s", "12s"
+	GossipInterval string `json:"gossip_interval,omitempty" yaml:"gossip_interval,omitempty"` // e.g. "2s", "3s"
+	MaxUploadMB    int    `json:"max_upload_mb,omitempty" yaml:"max_upload_mb,omitempty"`     // Max multipart deploy upload in MB (default: 500)
+}
+
+// GetProbeTimeout parses ProbeTimeout or returns fallback
+func (m *MeshConfig) GetProbeTimeout(fallback time.Duration) time.Duration {
+	if m == nil || m.ProbeTimeout == "" {
+		return fallback
+	}
+	d, err := time.ParseDuration(m.ProbeTimeout)
+	if err != nil || d <= 0 {
+		return fallback
+	}
+	return d
+}
+
+// GetGossipInterval parses GossipInterval or returns fallback
+func (m *MeshConfig) GetGossipInterval(fallback time.Duration) time.Duration {
+	if m == nil || m.GossipInterval == "" {
+		return fallback
+	}
+	d, err := time.ParseDuration(m.GossipInterval)
+	if err != nil || d <= 0 {
+		return fallback
+	}
+	return d
+}
+
+// GetMaxUploadBytes returns upload size limit in bytes (default: 500MB)
+func (m *MeshConfig) GetMaxUploadBytes() int64 {
+	if m == nil || m.MaxUploadMB <= 0 {
+		return 500 << 20 // 500MB
+	}
+	return int64(m.MaxUploadMB) << 20
 }
 
 // Service represents an individual deployable workload

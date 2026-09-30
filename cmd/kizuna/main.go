@@ -567,6 +567,7 @@ func runServer() error {
 	}
 
 	var projSSH *entity.SSHConfig
+	var projMesh *entity.MeshConfig
 	cfgPath := flagConfig
 	if cfgPath == "" {
 		cfgPath, _ = config.FindConfigFile()
@@ -578,6 +579,9 @@ func runServer() error {
 			}
 			if proj.SSH != nil {
 				projSSH = proj.SSH
+			}
+			if proj.Mesh != nil {
+				projMesh = proj.Mesh
 			}
 		}
 	}
@@ -704,7 +708,17 @@ func runServer() error {
 
 	apiServer := api.NewServer(authStore, workloadRunner, ingressMgr, backupMgr, nodeID, nodeName)
 
-	addr, err := meshGw.Listen(ctx, 19800, func(conn net.Conn) {
+	meshPort := gossip.DefaultPort
+	var meshInterval time.Duration
+	if projMesh != nil {
+		if projMesh.Port != 0 {
+			meshPort = projMesh.Port
+		}
+		meshInterval = projMesh.GetGossipInterval(0)
+		apiServer.SetMaxUploadBytes(projMesh.GetMaxUploadBytes())
+	}
+
+	addr, err := meshGw.Listen(ctx, meshPort, func(conn net.Conn) {
 		apiServer.ServeConn(conn)
 	})
 	if err != nil {
@@ -719,6 +733,8 @@ func runServer() error {
 		MeshAddr:  addr,
 		Host:      nodeName,
 		IP:        gossip.DetectOutboundIP(),
+		Port:      meshPort,
+		Interval:  meshInterval,
 		DERP:      meshGw.GetActiveDERP(),
 		Transport: gossipTransport,
 		Repo:      nodeRepo,
@@ -1406,6 +1422,19 @@ func newMeshGatewayWithDiscoveredDERPs() domain.MeshGateway {
 	return gw
 }
 
+func resolveProbeTimeout() time.Duration {
+	cfgPath := flagConfig
+	if cfgPath == "" {
+		cfgPath, _ = config.FindConfigFile()
+	}
+	if cfgPath != "" {
+		if proj, err := config.LoadProject(cfgPath); err == nil && proj != nil && proj.Mesh != nil {
+			return proj.Mesh.GetProbeTimeout(12 * time.Second)
+		}
+	}
+	return 12 * time.Second
+}
+
 func resolveNode(nameOrID string) (*entity.Node, error) {
 	if nameOrID == "" {
 		return nil, fmt.Errorf("node name or ID is required")
@@ -1519,7 +1548,7 @@ func listNodes(wide bool) error {
 				wg.Add(1)
 				go func(t *entity.Node) {
 					defer wg.Done()
-					ctx, cancel := context.WithTimeout(context.Background(), 12*time.Second)
+					ctx, cancel := context.WithTimeout(context.Background(), resolveProbeTimeout())
 					defer cancel()
 
 					upNode, _, probeErr := cli.GetStatus(ctx, t)
@@ -1573,7 +1602,7 @@ func listNodes(wide bool) error {
 			wg.Add(1)
 			go func(t *entity.Node) {
 				defer wg.Done()
-				ctx, cancel := context.WithTimeout(context.Background(), 12*time.Second)
+				ctx, cancel := context.WithTimeout(context.Background(), resolveProbeTimeout())
 				defer cancel()
 
 				nCopy := *t
@@ -2117,7 +2146,7 @@ func newStatusCmd() *cobra.Command {
 					}
 
 					start := time.Now()
-					probeCtx, probeCancel := context.WithTimeout(cmd.Context(), 12*time.Second)
+					probeCtx, probeCancel := context.WithTimeout(cmd.Context(), resolveProbeTimeout())
 					defer probeCancel()
 
 					nCopy := *target

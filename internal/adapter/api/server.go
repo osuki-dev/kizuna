@@ -37,11 +37,12 @@ type Server struct {
 	gossip        GossipEngine
 	nodeID        string
 	nodeName      string
-	mu            sync.RWMutex
-	metaPath      string
-	meta          entity.NodeMetaUpdate
-	handlerOnce   sync.Once
-	cachedHandler http.Handler
+	mu             sync.RWMutex
+	metaPath       string
+	meta           entity.NodeMetaUpdate
+	handlerOnce    sync.Once
+	cachedHandler  http.Handler
+	maxUploadBytes int64
 }
 
 // NewServer initializes the Agent API HTTP Server
@@ -58,16 +59,26 @@ func NewServer(
 	metaPath := filepath.Join(configDir, "node_meta.json")
 
 	s := &Server{
-		auth:     auth,
-		workload: workload,
-		ingress:  ingress,
-		backup:   backup,
-		nodeID:   nodeID,
-		nodeName: nodeName,
-		metaPath: metaPath,
+		auth:           auth,
+		workload:       workload,
+		ingress:        ingress,
+		backup:         backup,
+		nodeID:         nodeID,
+		nodeName:       nodeName,
+		metaPath:       metaPath,
+		maxUploadBytes: 500 << 20, // 500MB default
 	}
 	s.loadMeta()
 	return s
+}
+
+// SetMaxUploadBytes sets maximum allowable multipart upload size for deployment artifacts
+func (s *Server) SetMaxUploadBytes(bytes int64) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if bytes > 0 {
+		s.maxUploadBytes = bytes
+	}
 }
 
 // SetGossipEngine attaches an active Gossip engine to the API Server
@@ -180,8 +191,11 @@ func (s *Server) handleDeploy(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Deploy request parses multipart: json "manifest" + optional binary "artifact"
-	err := r.ParseMultipartForm(500 << 20) // 500MB max
+	limit := s.maxUploadBytes
+	if limit <= 0 {
+		limit = 500 << 20 // 500MB fallback
+	}
+	err := r.ParseMultipartForm(limit)
 	if err != nil {
 		http.Error(w, fmt.Sprintf("failed to parse multipart: %v", err), http.StatusBadRequest)
 		return

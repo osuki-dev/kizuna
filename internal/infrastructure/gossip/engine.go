@@ -51,12 +51,11 @@ type Engine struct {
 	self          *entity.Node
 	members       map[string]*entity.Node    // Keyed by Node.ID
 	nameToID      map[string]string          // Maps Node.Name to Node.ID
-	suspectTimers map[string]*time.Timer     // Keyed by Node.ID
-	recentUpdates []*piggybackEntry          // Piggybacked update queue with dissemination tracking
-	tombstones    map[string]time.Time       // Deleted / kicked node IDs and Names
-	tombstoneIDs  map[string]time.Time       // Tombstones keyed by Node.ID only
-	tombstoneNames map[string]time.Time      // Tombstones keyed by Node.Name only
-	failCount     map[string]int             // Node ID -> consecutive failed probe count
+	suspectTimers  map[string]*time.Timer     // Keyed by Node.ID
+	recentUpdates  []*piggybackEntry          // Piggybacked update queue with dissemination tracking
+	tombstoneIDs   map[string]time.Time       // Tombstones keyed by Node.ID only (avoids Name/ID collisions)
+	tombstoneNames map[string]time.Time       // Tombstones keyed by Node.Name only
+	failCount      map[string]int             // Node ID -> consecutive failed probe count
 	onNodeUpdate  func(*entity.Node)
 	transport     Transport
 	repo          domain.NodeRepository
@@ -125,7 +124,9 @@ func DetectOutboundIP() string {
 		}
 	}
 
-	// 2. Fallback to outbound dial if no physical LAN interface matched
+	// 2. Fallback to querying the OS routing table via a connectionless UDP dial.
+	// NOTE: Dialing UDP does NOT send any packets on the wire (no handshake). It only
+	// queries the kernel's FIB routing table to determine which source IP would route outbound.
 	conn, err := net.Dial("udp", "8.8.8.8:80")
 	if err == nil {
 		defer func() { _ = conn.Close() }()
@@ -133,6 +134,27 @@ func DetectOutboundIP() string {
 			ipv4 := localAddr.IP.To4()
 			if ipv4 != nil && !cgnatNet.Contains(ipv4) {
 				return ipv4.String()
+			}
+		}
+	}
+
+	// 3. Last-resort fallback for air-gapped / isolated networks with no default route:
+	// pick any non-loopback IPv4 address
+	if ifaces, err := net.Interfaces(); err == nil {
+		for _, iface := range ifaces {
+			if iface.Flags&net.FlagUp == 0 || iface.Flags&net.FlagLoopback != 0 {
+				continue
+			}
+			addrs, err := iface.Addrs()
+			if err != nil {
+				continue
+			}
+			for _, addr := range addrs {
+				if ipNet, ok := addr.(*net.IPNet); ok && ipNet.IP != nil && !ipNet.IP.IsLoopback() {
+					if ipv4 := ipNet.IP.To4(); ipv4 != nil && !ipv4.IsLinkLocalUnicast() {
+						return ipv4.String()
+					}
+				}
 			}
 		}
 	}
@@ -192,7 +214,6 @@ func NewEngine(cfg Config) *Engine {
 		nameToID:       make(map[string]string),
 		suspectTimers:  make(map[string]*time.Timer),
 		recentUpdates:  make([]*piggybackEntry, 0, 50),
-		tombstones:     make(map[string]time.Time),
 		tombstoneIDs:   make(map[string]time.Time),
 		tombstoneNames: make(map[string]time.Time),
 		failCount:      make(map[string]int),
@@ -380,6 +401,39 @@ func (e *Engine) BroadcastUpdate(node *entity.Node) {
 	e.applyUpdateLocked(update)
 }
 
+func (e *Engine) isTombstonedLocked(id, name string) bool {
+	if id != "" {
+		if _, dead := e.tombstoneIDs[id]; dead {
+			return true
+		}
+	}
+	if name != "" {
+		if _, dead := e.tombstoneNames[name]; dead {
+			return true
+		}
+	}
+	return false
+}
+
+func (e *Engine) addTombstoneLocked(id, name string) {
+	now := time.Now()
+	if id != "" {
+		e.tombstoneIDs[id] = now
+	}
+	if name != "" {
+		e.tombstoneNames[name] = now
+	}
+}
+
+func (e *Engine) removeTombstoneLocked(id, name string) {
+	if id != "" {
+		delete(e.tombstoneIDs, id)
+	}
+	if name != "" {
+		delete(e.tombstoneNames, name)
+	}
+}
+
 // GetMembers returns all known active members in the cluster
 func (e *Engine) GetMembers() []*entity.Node {
 	e.mu.RLock()
@@ -387,10 +441,7 @@ func (e *Engine) GetMembers() []*entity.Node {
 
 	list := make([]*entity.Node, 0, len(e.members))
 	for _, n := range e.members {
-		if _, dead := e.tombstones[n.ID]; dead {
-			continue
-		}
-		if _, dead := e.tombstones[n.Name]; dead {
+		if e.isTombstonedLocked(n.ID, n.Name) {
 			continue
 		}
 		list = append(list, e.cloneNode(n))
@@ -420,8 +471,11 @@ func (e *Engine) RemoveMember(nameOrID string) bool {
 	}
 
 	// Always tombstone by both ID and Name to reject incoming gossip
-	e.tombstones[nameOrID] = time.Now()
-	e.tombstones[id] = time.Now()
+	if node != nil {
+		e.addTombstoneLocked(node.ID, node.Name)
+	} else {
+		e.addTombstoneLocked(id, nameOrID)
+	}
 	delete(e.failCount, id)
 	delete(e.failCount, nameOrID)
 
@@ -430,10 +484,6 @@ func (e *Engine) RemoveMember(nameOrID string) bool {
 			_ = e.repo.DeleteNode(nameOrID)
 		}
 		return false
-	}
-
-	if node.Name != "" {
-		e.tombstones[node.Name] = time.Now()
 	}
 
 	if timer, ok := e.suspectTimers[id]; ok {
@@ -480,10 +530,7 @@ func (e *Engine) AddOrUpdateMember(node *entity.Node) {
 		return
 	}
 
-	delete(e.tombstones, node.ID)
-	if node.Name != "" {
-		delete(e.tombstones, node.Name)
-	}
+	e.removeTombstoneLocked(node.ID, node.Name)
 	delete(e.failCount, node.ID)
 
 	nCopy := e.cloneNode(node)
@@ -505,10 +552,11 @@ func (e *Engine) AddOrUpdateMember(node *entity.Node) {
 func (e *Engine) ClearTombstone(nameOrID string) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
-	delete(e.tombstones, nameOrID)
-	if id, ok := e.nameToID[nameOrID]; ok {
-		delete(e.tombstones, id)
+	id := nameOrID
+	if mappedID, ok := e.nameToID[nameOrID]; ok {
+		id = mappedID
 	}
+	e.removeTombstoneLocked(id, nameOrID)
 }
 
 // GetMember retrieves a single member by ID or Name
@@ -516,18 +564,17 @@ func (e *Engine) GetMember(nameOrID string) (*entity.Node, bool) {
 	e.mu.RLock()
 	defer e.mu.RUnlock()
 
-	if _, dead := e.tombstones[nameOrID]; dead {
-		return nil, false
-	}
-
 	if n, ok := e.members[nameOrID]; ok {
+		if e.isTombstonedLocked(n.ID, n.Name) {
+			return nil, false
+		}
 		return e.cloneNode(n), true
 	}
 	if id, ok := e.nameToID[nameOrID]; ok {
-		if _, dead := e.tombstones[id]; dead {
-			return nil, false
-		}
 		if n, ok := e.members[id]; ok {
+			if e.isTombstonedLocked(n.ID, n.Name) {
+				return nil, false
+			}
 			return e.cloneNode(n), true
 		}
 	}
@@ -808,13 +855,8 @@ func (e *Engine) registerOrTouchSenderLocked(msg *entity.GossipMessage) {
 		return
 	}
 
-	if _, dead := e.tombstones[msg.SenderID]; dead {
+	if e.isTombstonedLocked(msg.SenderID, msg.SenderName) {
 		return
-	}
-	if msg.SenderName != "" {
-		if _, dead := e.tombstones[msg.SenderName]; dead {
-			return
-		}
 	}
 	delete(e.failCount, msg.SenderID)
 
@@ -875,13 +917,8 @@ func (e *Engine) applyUpdateLocked(u *entity.GossipUpdate) {
 		return
 	}
 
-	if _, dead := e.tombstones[u.Node.ID]; dead {
+	if e.isTombstonedLocked(u.Node.ID, u.Node.Name) {
 		return
-	}
-	if u.Node.Name != "" {
-		if _, dead := e.tombstones[u.Node.Name]; dead {
-			return
-		}
 	}
 
 	// 1. If update is about self
@@ -1244,9 +1281,14 @@ func (e *Engine) cleanupTombstones() {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	now := time.Now()
-	for k, t := range e.tombstones {
+	for k, t := range e.tombstoneIDs {
 		if now.Sub(t) > 24*time.Hour {
-			delete(e.tombstones, k)
+			delete(e.tombstoneIDs, k)
+		}
+	}
+	for k, t := range e.tombstoneNames {
+		if now.Sub(t) > 24*time.Hour {
+			delete(e.tombstoneNames, k)
 		}
 	}
 }
@@ -1294,10 +1336,7 @@ func (e *Engine) reloadFromRepo() {
 		if n == nil || n.ID == e.self.ID || n.Name == e.self.Name {
 			continue
 		}
-		if _, dead := e.tombstones[n.ID]; dead {
-			continue
-		}
-		if _, dead := e.tombstones[n.Name]; dead {
+		if e.isTombstonedLocked(n.ID, n.Name) {
 			continue
 		}
 		if existing, ok := e.members[n.ID]; ok {
@@ -1416,10 +1455,7 @@ func (e *Engine) selectRandomPeer() *entity.Node {
 	var candidates []*entity.Node
 	for _, m := range e.members {
 		if m.ID != e.self.ID && (e.self.Name == "" || m.Name != e.self.Name) && m.Addr != "" && m.GossipState != entity.GossipStateDead {
-			if _, dead := e.tombstones[m.ID]; dead {
-				continue
-			}
-			if _, dead := e.tombstones[m.Name]; dead {
+			if e.isTombstonedLocked(m.ID, m.Name) {
 				continue
 			}
 			candidates = append(candidates, m)
@@ -1430,10 +1466,7 @@ func (e *Engine) selectRandomPeer() *entity.Node {
 	if len(candidates) == 0 {
 		for _, m := range e.members {
 			if m.ID != e.self.ID && (e.self.Name == "" || m.Name != e.self.Name) && m.Addr != "" {
-				if _, dead := e.tombstones[m.ID]; dead {
-					continue
-				}
-				if _, dead := e.tombstones[m.Name]; dead {
+				if e.isTombstonedLocked(m.ID, m.Name) {
 					continue
 				}
 				candidates = append(candidates, m)
@@ -1455,10 +1488,7 @@ func (e *Engine) selectRandomPeerExcluding(excludeID string) *entity.Node {
 	var candidates []*entity.Node
 	for _, m := range e.members {
 		if m.ID != e.self.ID && (e.self.Name == "" || m.Name != e.self.Name) && m.ID != excludeID && m.Addr != "" && m.GossipState == entity.GossipStateAlive {
-			if _, dead := e.tombstones[m.ID]; dead {
-				continue
-			}
-			if _, dead := e.tombstones[m.Name]; dead {
+			if e.isTombstonedLocked(m.ID, m.Name) {
 				continue
 			}
 			candidates = append(candidates, m)

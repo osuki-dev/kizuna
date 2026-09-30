@@ -7,6 +7,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
 
 	"github.com/kardianos/service"
@@ -111,17 +112,34 @@ func copyBinary(src, dst string) error {
 	}
 	defer func() { _ = in.Close() }()
 
-	_ = os.Remove(dst)
-	out, err := os.OpenFile(dst, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0755)
+	tmpDst := dst + ".tmp"
+	_ = os.Remove(tmpDst)
+
+	out, err := os.OpenFile(tmpDst, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0755)
 	if err != nil {
 		return err
 	}
-	defer func() { _ = out.Close() }()
 
 	if _, err := io.Copy(out, in); err != nil {
+		_ = out.Close()
+		_ = os.Remove(tmpDst)
 		return err
 	}
-	return os.Chmod(dst, 0755)
+	_ = out.Close()
+	_ = os.Chmod(tmpDst, 0755)
+
+	// Safe atomic replacement (handles Windows locked executable where in-place overwrite fails)
+	oldDst := dst + ".old"
+	_ = os.Remove(oldDst)
+	if err := os.Rename(dst, oldDst); err == nil {
+		defer func() { _ = os.Remove(oldDst) }()
+	}
+
+	if err := os.Rename(tmpDst, dst); err != nil {
+		_ = os.Rename(oldDst, dst)
+		return err
+	}
+	return nil
 }
 
 // Restart stops and starts the background service
@@ -339,7 +357,8 @@ func isLinuxServiceRunning(serviceName string) bool {
 	if err == nil && strings.TrimSpace(string(out)) == "active" {
 		return true
 	}
-	out, err = exec.Command("pgrep", "-f", "kizuna service run").Output()
+	uidStr := strconv.Itoa(os.Getuid())
+	out, err = exec.Command("pgrep", "-u", uidStr, "-f", "kizuna service run").Output()
 	if err == nil && len(strings.TrimSpace(string(out))) > 0 {
 		return true
 	}
