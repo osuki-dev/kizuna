@@ -446,24 +446,35 @@ func (u *UI) RenderSystemCard(m *telemetry.Metrics) string {
 	}
 
 	var sb strings.Builder
-	sb.WriteString(title + "\n")
-	sb.WriteString(sysInfo + "\n\n")
-	sb.WriteString(cpuLine + "\n")
-	sb.WriteString(memLine + "\n")
+	sb.WriteString(title)
+	sb.WriteByte('\n')
+	sb.WriteString(sysInfo)
+	sb.WriteString("\n\n")
+	sb.WriteString(cpuLine)
+	sb.WriteByte('\n')
+	sb.WriteString(memLine)
+	sb.WriteByte('\n')
 	if m.TotalSwap > 0 {
-		sb.WriteString(swapLine + "\n")
+		sb.WriteString(swapLine)
+		sb.WriteByte('\n')
 	}
-	sb.WriteString(netLine + "\n\n")
+	sb.WriteString(netLine)
+	sb.WriteString("\n\n")
 
-	sb.WriteString(u.SecondaryStyle.Bold(true).Render("💾 STORAGE & PARTITIONS") + "\n")
+	sb.WriteString(u.SecondaryStyle.Bold(true).Render("💾 STORAGE & PARTITIONS"))
+	sb.WriteByte('\n')
 	for _, dl := range diskLines {
-		sb.WriteString(dl + "\n")
+		sb.WriteString(dl)
+		sb.WriteByte('\n')
 	}
 
 	if len(procLines) > 0 {
-		sb.WriteString("\n" + u.SecondaryStyle.Bold(true).Render("📊 TOP PROCESSES (TASK MANAGER)") + "\n")
+		sb.WriteByte('\n')
+		sb.WriteString(u.SecondaryStyle.Bold(true).Render("📊 TOP PROCESSES (TASK MANAGER)"))
+		sb.WriteByte('\n')
 		for _, pl := range procLines {
-			sb.WriteString(pl + "\n")
+			sb.WriteString(pl)
+			sb.WriteByte('\n')
 		}
 	}
 

@@ -13,6 +13,7 @@ type Theme struct {
 	Muted      string `yaml:"muted" json:"muted"`
 	Background string `yaml:"background" json:"background"`
 	BoxBorder  string `yaml:"box_border" json:"box_border"`
+	Selection  string `yaml:"selection,omitempty" json:"selection,omitempty"`
 }
 
 // Built-in theme presets
@@ -27,6 +28,7 @@ var themePresets = map[string]*Theme{
 		Muted:      "#6C7086", // Overlay0
 		Background: "#1E1E2E", // Base
 		BoxBorder:  "#CBA6F7",
+		Selection:  "#313244", // Surface0
 	},
 	"tokyonight": {
 		Name:       "Tokyo Night",
@@ -38,6 +40,7 @@ var themePresets = map[string]*Theme{
 		Muted:      "#565F89",
 		Background: "#1A1B26",
 		BoxBorder:  "#7AA2F7",
+		Selection:  "#292E42",
 	},
 	"dracula": {
 		Name:       "Dracula",
@@ -49,6 +52,7 @@ var themePresets = map[string]*Theme{
 		Muted:      "#6272A4",
 		Background: "#282A36",
 		BoxBorder:  "#BD93F9",
+		Selection:  "#44475A",
 	},
 	"nord": {
 		Name:       "Nord",
@@ -60,6 +64,7 @@ var themePresets = map[string]*Theme{
 		Muted:      "#4C566A", // Polar Night
 		Background: "#2E3440",
 		BoxBorder:  "#88C0D0",
+		Selection:  "#3B4252",
 	},
 }
 
@@ -82,6 +87,9 @@ func ResolveTheme(name string, custom *Theme) *Theme {
 		}
 		if custom.BoxBorder == "" {
 			custom.BoxBorder = custom.Primary
+		}
+		if custom.Selection == "" {
+			custom.Selection = "#313244"
 		}
 		return custom
 	}

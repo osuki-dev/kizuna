@@ -22,9 +22,10 @@ type Styles struct {
 	ActiveTab     lipgloss.Style
 	Box           lipgloss.Style
 	HeaderBox     lipgloss.Style
-	MetricCard    lipgloss.Style
-	SelectedRow   lipgloss.Style
-	StatusRunning string
+	MetricCard      lipgloss.Style
+	SelectedRow     lipgloss.Style
+	selectedRowOpen string
+	StatusRunning   string
 	StatusStopped string
 	StatusFailed  string
 	StatusProbing string
@@ -59,6 +60,20 @@ func NewStyles(theme *entity.Theme) Styles {
 	mCol := lipgloss.Color(theme.Muted)
 	bgCol := lipgloss.Color(theme.Background)
 	borderCol := lipgloss.Color(theme.BoxBorder)
+	selBg := theme.Selection
+	if selBg == "" {
+		selBg = "#313244"
+	}
+
+	selStyle := lipgloss.NewStyle().
+		Bold(true).
+		Foreground(lipgloss.Color("#FFFFFF")).
+		Background(lipgloss.Color(selBg))
+	dummy := selStyle.Render("X")
+	var selOpen string
+	if idx := strings.Index(dummy, "X"); idx >= 0 {
+		selOpen = dummy[:idx]
+	}
 
 	return Styles{
 		Title: lipgloss.NewStyle().
@@ -89,10 +104,8 @@ func NewStyles(theme *entity.Theme) Styles {
 			BorderForeground(mCol).
 			Padding(0, 1).
 			Background(bgCol),
-		SelectedRow: lipgloss.NewStyle().
-			Bold(true).
-			Foreground(lipgloss.Color("#FFFFFF")).
-			Background(borderCol),
+		SelectedRow:     selStyle,
+		selectedRowOpen: selOpen,
 		StatusRunning: lipgloss.NewStyle().Foreground(sCol).Bold(true).Render("● Online"),
 		StatusStopped: lipgloss.NewStyle().Foreground(mCol).Render("○ Offline"),
 		StatusFailed:  lipgloss.NewStyle().Foreground(dCol).Bold(true).Render("✖ Unreachable"),
@@ -589,7 +602,8 @@ func (m *DashboardModel) renderHeader(width int) string {
 func (m *DashboardModel) renderOverviewTab(width int) string {
 	var sb strings.Builder
 
-	sb.WriteString(m.styles.Subtitle.Render("⚡ SYSTEM RESOURCE MANAGER (REAL-TIME)") + "\n\n")
+	sb.WriteString(m.styles.Subtitle.Render("⚡ SYSTEM RESOURCE MANAGER (REAL-TIME)"))
+	sb.WriteString("\n\n")
 
 	cpuP := m.localMetrics.CPUUsage
 	memP := m.localMetrics.MemoryUsage
@@ -718,8 +732,10 @@ func (m *DashboardModel) renderOverviewTab(width int) string {
 
 	// CPU Per-Core Matrix (if available and <= 32 cores)
 	if len(m.localMetrics.CoreUsages) > 0 {
-		sb.WriteString(m.styles.Subtitle.Render("📊 CPU PER-CORE USAGE MATRIX") + "\n")
-		sb.WriteString(m.styles.Divider.Render(strings.Repeat("─", width)) + "\n")
+		sb.WriteString(m.styles.Subtitle.Render("📊 CPU PER-CORE USAGE MATRIX"))
+		sb.WriteByte('\n')
+		sb.WriteString(m.styles.Divider.Render(strings.Repeat("─", width)))
+		sb.WriteByte('\n')
 
 		limitCores := len(m.localMetrics.CoreUsages)
 		if limitCores > 32 {
@@ -770,8 +786,10 @@ func (m *DashboardModel) renderOverviewTab(width int) string {
 	}
 
 	// Storage & Disks Partitions Breakdown Table
-	sb.WriteString(m.styles.Subtitle.Render("💾 STORAGE & DISK PARTITIONS") + "\n")
-	sb.WriteString(m.styles.Divider.Render(strings.Repeat("─", width)) + "\n")
+	sb.WriteString(m.styles.Subtitle.Render("💾 STORAGE & DISK PARTITIONS"))
+	sb.WriteByte('\n')
+	sb.WriteString(m.styles.Divider.Render(strings.Repeat("─", width)))
+	sb.WriteByte('\n')
 
 	if len(m.localMetrics.Partitions) > 0 {
 		if width >= 110 {
@@ -900,8 +918,10 @@ func (m *DashboardModel) renderOverviewTab(width int) string {
 
 	// Top Processes (Task Manager)
 	if len(m.localMetrics.TopProcesses) > 0 {
-		sb.WriteString(m.styles.Subtitle.Render("📈 TOP PROCESSES (TASK MANAGER)") + "\n")
-		sb.WriteString(m.styles.Divider.Render(strings.Repeat("─", width)) + "\n")
+		sb.WriteString(m.styles.Subtitle.Render("📈 TOP PROCESSES (TASK MANAGER)"))
+		sb.WriteByte('\n')
+		sb.WriteString(m.styles.Divider.Render(strings.Repeat("─", width)))
+		sb.WriteByte('\n')
 
 		if width >= 105 {
 			// Full dual meter view
@@ -1003,8 +1023,10 @@ func (m *DashboardModel) renderOverviewTab(width int) string {
 	}
 
 	// Machine Host Details
-	sb.WriteString(m.styles.Subtitle.Render("💻 HOST & MESH PLATFORM") + "\n")
-	sb.WriteString(m.styles.Divider.Render(strings.Repeat("─", width)) + "\n")
+	sb.WriteString(m.styles.Subtitle.Render("💻 HOST & MESH PLATFORM"))
+	sb.WriteByte('\n')
+	sb.WriteString(m.styles.Divider.Render(strings.Repeat("─", width)))
+	sb.WriteByte('\n')
 	uptimeStr := formatUptime(m.localMetrics.Uptime)
 	modelStr := m.localMetrics.CPUModel
 
@@ -1047,18 +1069,20 @@ func (m *DashboardModel) renderOverviewTab(width int) string {
 func (m *DashboardModel) renderNodesTab(width int) string {
 	var sb strings.Builder
 
-	sb.WriteString(m.styles.Subtitle.Render("🌐 MESH NODES (P2P WIREGUARD NETWORK)") + "\n\n")
+	sb.WriteString(m.styles.Subtitle.Render("🌐 MESH NODES (P2P WIREGUARD NETWORK)"))
+	sb.WriteString("\n\n")
 
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 
-	divider := m.styles.Divider.Render(strings.Repeat("─", width)) + "\n"
+	divider := m.styles.Divider.Render(strings.Repeat("─", width))
 
 	if width >= 105 {
 		header := fmt.Sprintf("  %-2s %-16s %-18s %-16s %-14s %-10s %-14s %-10s\n",
 			" ", "NAME", "HOST / IP", "TAGS", "STATUS", "LATENCY", "OS / ARCH", "CPU/RAM")
 		sb.WriteString(header)
 		sb.WriteString(divider)
+		sb.WriteByte('\n')
 
 		for i, n := range m.nodes {
 			cursor := "  "
@@ -1067,7 +1091,7 @@ func (m *DashboardModel) renderNodesTab(width int) string {
 			}
 
 			st := m.nodeStates[n.Name]
-			statusStr := m.styles.StatusStopped
+			badge, _ := m.getNodeStatus(n, st)
 			latencyStr := "-"
 			osArchStr := n.OS + "/" + n.Arch
 			cpuMemStr := "-"
@@ -1085,20 +1109,8 @@ func (m *DashboardModel) renderNodesTab(width int) string {
 				tagsStr = strings.Join(n.Tags, ",")
 			}
 
-			switch n.GossipState {
-			case entity.GossipStateSuspect:
-				statusStr = m.styles.WarningText.Render("▲ Suspect")
-			case entity.GossipStateDead:
-				statusStr = m.styles.StatusFailed
-			}
-
 			if st != nil {
-				if st.IsProbing {
-					statusStr = m.styles.StatusProbing
-				} else if st.IsOnline {
-					if n.GossipState == "" || n.GossipState == entity.GossipStateAlive {
-						statusStr = m.styles.StatusRunning
-					}
+				if st.IsOnline {
 					if st.Latency > 0 {
 						latencyStr = fmt.Sprintf("%dms", st.Latency.Milliseconds())
 					} else {
@@ -1107,10 +1119,7 @@ func (m *DashboardModel) renderNodesTab(width int) string {
 					if st.Node != nil && st.Node.CPUUsage > 0 {
 						cpuMemStr = fmt.Sprintf("%.0f%%/%.0f%%", st.Node.CPUUsage, st.Node.MemoryUsage)
 					}
-				} else {
-					if n.GossipState != entity.GossipStateSuspect {
-						statusStr = m.styles.StatusFailed
-					}
+				} else if !st.IsProbing {
 					latencyStr = "Timeout"
 				}
 			}
@@ -1119,22 +1128,18 @@ func (m *DashboardModel) renderNodesTab(width int) string {
 				osArchStr = "unknown"
 			}
 
-			row := fmt.Sprintf("  %-2s %-16s %-18s %-16s %-14s %-10s %-14s %-10s\n",
-				cursor,
-				truncate(n.Name, 15),
-				truncate(hostStr, 17),
-				truncate(tagsStr, 15),
-				statusStr,
-				latencyStr,
-				osArchStr,
-				cpuMemStr,
-			)
+			col0 := padVisual(cursor, 2)
+			col1 := padVisual(truncate(n.Name, 16), 16)
+			col2 := padVisual(truncate(hostStr, 18), 18)
+			col3 := padVisual(truncate(tagsStr, 16), 16)
+			col4 := padVisual(badge, 14)
+			col5 := padVisual(truncate(latencyStr, 10), 10)
+			col6 := padVisual(truncate(osArchStr, 14), 14)
+			col7 := padVisual(truncate(cpuMemStr, 10), 10)
 
-			if i == m.selectedNode {
-				sb.WriteString(m.styles.SelectedRow.Render(row))
-			} else {
-				sb.WriteString(row)
-			}
+			line := "  " + col0 + " " + col1 + " " + col2 + " " + col3 + " " + col4 + " " + col5 + " " + col6 + " " + col7
+			sb.WriteString(m.renderRow(line, i == m.selectedNode))
+			sb.WriteByte('\n')
 		}
 	} else if width >= 85 {
 		// Medium view: omit OS/ARCH
@@ -1142,6 +1147,7 @@ func (m *DashboardModel) renderNodesTab(width int) string {
 			" ", "NAME", "HOST / IP", "TAGS", "STATUS", "LATENCY", "CPU/RAM")
 		sb.WriteString(header)
 		sb.WriteString(divider)
+		sb.WriteByte('\n')
 
 		for i, n := range m.nodes {
 			cursor := "  "
@@ -1150,7 +1156,7 @@ func (m *DashboardModel) renderNodesTab(width int) string {
 			}
 
 			st := m.nodeStates[n.Name]
-			statusStr := m.styles.StatusStopped
+			badge, _ := m.getNodeStatus(n, st)
 			latencyStr := "-"
 			cpuMemStr := "-"
 
@@ -1167,20 +1173,8 @@ func (m *DashboardModel) renderNodesTab(width int) string {
 				tagsStr = strings.Join(n.Tags, ",")
 			}
 
-			switch n.GossipState {
-			case entity.GossipStateSuspect:
-				statusStr = m.styles.WarningText.Render("▲ Suspect")
-			case entity.GossipStateDead:
-				statusStr = m.styles.StatusFailed
-			}
-
 			if st != nil {
-				if st.IsProbing {
-					statusStr = m.styles.StatusProbing
-				} else if st.IsOnline {
-					if n.GossipState == "" || n.GossipState == entity.GossipStateAlive {
-						statusStr = m.styles.StatusRunning
-					}
+				if st.IsOnline {
 					if st.Latency > 0 {
 						latencyStr = fmt.Sprintf("%dms", st.Latency.Milliseconds())
 					} else {
@@ -1189,29 +1183,22 @@ func (m *DashboardModel) renderNodesTab(width int) string {
 					if st.Node != nil && st.Node.CPUUsage > 0 {
 						cpuMemStr = fmt.Sprintf("%.0f%%/%.0f%%", st.Node.CPUUsage, st.Node.MemoryUsage)
 					}
-				} else {
-					if n.GossipState != entity.GossipStateSuspect {
-						statusStr = m.styles.StatusFailed
-					}
+				} else if !st.IsProbing {
 					latencyStr = "Timeout"
 				}
 			}
 
-			row := fmt.Sprintf("  %-2s %-16s %-18s %-14s %-14s %-10s %-10s\n",
-				cursor,
-				truncate(n.Name, 15),
-				truncate(hostStr, 17),
-				truncate(tagsStr, 13),
-				statusStr,
-				latencyStr,
-				cpuMemStr,
-			)
+			col0 := padVisual(cursor, 2)
+			col1 := padVisual(truncate(n.Name, 16), 16)
+			col2 := padVisual(truncate(hostStr, 18), 18)
+			col3 := padVisual(truncate(tagsStr, 14), 14)
+			col4 := padVisual(badge, 14)
+			col5 := padVisual(truncate(latencyStr, 10), 10)
+			col6 := padVisual(truncate(cpuMemStr, 10), 10)
 
-			if i == m.selectedNode {
-				sb.WriteString(m.styles.SelectedRow.Render(row))
-			} else {
-				sb.WriteString(row)
-			}
+			line := "  " + col0 + " " + col1 + " " + col2 + " " + col3 + " " + col4 + " " + col5 + " " + col6
+			sb.WriteString(m.renderRow(line, i == m.selectedNode))
+			sb.WriteByte('\n')
 		}
 	} else {
 		// Compact view: NAME, HOST / IP, STATUS, CPU/RAM
@@ -1219,6 +1206,7 @@ func (m *DashboardModel) renderNodesTab(width int) string {
 			" ", "NAME", "HOST / IP", "STATUS", "CPU/RAM")
 		sb.WriteString(header)
 		sb.WriteString(divider)
+		sb.WriteByte('\n')
 
 		for i, n := range m.nodes {
 			cursor := "  "
@@ -1227,7 +1215,7 @@ func (m *DashboardModel) renderNodesTab(width int) string {
 			}
 
 			st := m.nodeStates[n.Name]
-			statusStr := m.styles.StatusStopped
+			badge, _ := m.getNodeStatus(n, st)
 			cpuMemStr := "-"
 
 			hostStr := n.Host
@@ -1238,43 +1226,19 @@ func (m *DashboardModel) renderNodesTab(width int) string {
 				hostStr = FormatNodeAddr(n.Addr, false)
 			}
 
-			switch n.GossipState {
-			case entity.GossipStateSuspect:
-				statusStr = m.styles.WarningText.Render("▲ Suspect")
-			case entity.GossipStateDead:
-				statusStr = m.styles.StatusFailed
+			if st != nil && st.IsOnline && st.Node != nil && st.Node.CPUUsage > 0 {
+				cpuMemStr = fmt.Sprintf("%.0f%%/%.0f%%", st.Node.CPUUsage, st.Node.MemoryUsage)
 			}
 
-			if st != nil {
-				if st.IsProbing {
-					statusStr = m.styles.StatusProbing
-				} else if st.IsOnline {
-					if n.GossipState == "" || n.GossipState == entity.GossipStateAlive {
-						statusStr = m.styles.StatusRunning
-					}
-					if st.Node != nil && st.Node.CPUUsage > 0 {
-						cpuMemStr = fmt.Sprintf("%.0f%%/%.0f%%", st.Node.CPUUsage, st.Node.MemoryUsage)
-					}
-				} else {
-					if n.GossipState != entity.GossipStateSuspect {
-						statusStr = m.styles.StatusFailed
-					}
-				}
-			}
+			col0 := padVisual(cursor, 2)
+			col1 := padVisual(truncate(n.Name, 16), 16)
+			col2 := padVisual(truncate(hostStr, 18), 18)
+			col3 := padVisual(badge, 14)
+			col4 := padVisual(truncate(cpuMemStr, 10), 10)
 
-			row := fmt.Sprintf("  %-2s %-16s %-18s %-14s %-10s\n",
-				cursor,
-				truncate(n.Name, 15),
-				truncate(hostStr, 17),
-				statusStr,
-				cpuMemStr,
-			)
-
-			if i == m.selectedNode {
-				sb.WriteString(m.styles.SelectedRow.Render(row))
-			} else {
-				sb.WriteString(row)
-			}
+			line := "  " + col0 + " " + col1 + " " + col2 + " " + col3 + " " + col4
+			sb.WriteString(m.renderRow(line, i == m.selectedNode))
+			sb.WriteByte('\n')
 		}
 	}
 
@@ -1282,8 +1246,11 @@ func (m *DashboardModel) renderNodesTab(width int) string {
 	if m.selectedNode < len(m.nodes) {
 		sn := m.nodes[m.selectedNode]
 		st := m.nodeStates[sn.Name]
-		sb.WriteString("\n" + m.styles.Subtitle.Render("🔎 SELECTED NODE DETAILS") + "\n")
-		sb.WriteString(m.styles.Divider.Render(strings.Repeat("─", width)) + "\n")
+		sb.WriteByte('\n')
+		sb.WriteString(m.styles.Subtitle.Render("🔎 SELECTED NODE DETAILS"))
+		sb.WriteByte('\n')
+		sb.WriteString(divider)
+		sb.WriteByte('\n')
 		fmt.Fprintf(&sb, "  Node ID:      %s\n", sn.ID)
 
 		addrVal := FormatNodeAddr(sn.Addr, false)
@@ -1313,24 +1280,8 @@ func (m *DashboardModel) renderNodesTab(width int) string {
 		}
 		fmt.Fprintf(&sb, "  Tags:         %s\n", tagsVal)
 
-		nodeStatus := sn.Status
-		if st != nil && !st.IsOnline {
-			if sn.GossipState == entity.GossipStateDead {
-				nodeStatus = "dead"
-			} else {
-				nodeStatus = "offline"
-			}
-		} else if nodeStatus == "" {
-			nodeStatus = string(sn.GossipState)
-			if nodeStatus == "" {
-				if st != nil && st.IsOnline {
-					nodeStatus = "alive"
-				} else {
-					nodeStatus = "offline"
-				}
-			}
-		}
-		fmt.Fprintf(&sb, "  Health:       %s (Epoch: %d)\n", strings.ToUpper(nodeStatus), sn.Incarnation)
+		badge, _ := m.getNodeStatus(sn, st)
+		fmt.Fprintf(&sb, "  Health:       %s (Epoch: %d)\n", badge, sn.Incarnation)
 
 		if sn.CPUUsage > 0 || sn.MemoryUsage > 0 {
 			fmt.Fprintf(&sb, "  Telemetry:    CPU: %.1f%% | RAM: %.1f%% | Disk: %.1f%% | Load: %.2f\n",
@@ -1511,7 +1462,8 @@ func (m *DashboardModel) getAggregatedWorkloads() []*aggregatedWorkload {
 func (m *DashboardModel) renderServicesTab(width int) string {
 	var sb strings.Builder
 
-	sb.WriteString(m.styles.Subtitle.Render("📦 MESH WORKLOADS & INGRESS ROUTING") + "\n\n")
+	sb.WriteString(m.styles.Subtitle.Render("📦 MESH WORKLOADS & INGRESS ROUTING"))
+	sb.WriteString("\n\n")
 
 	workloads := m.getAggregatedWorkloads()
 	if len(workloads) == 0 {
@@ -1524,13 +1476,14 @@ func (m *DashboardModel) renderServicesTab(width int) string {
 		m.selectedSvc = len(workloads) - 1
 	}
 
-	divider := m.styles.Divider.Render(strings.Repeat("─", width)) + "\n"
+	divider := m.styles.Divider.Render(strings.Repeat("─", width))
 
 	if width >= 120 {
 		header := fmt.Sprintf("  %-2s %-18s %-16s %-12s %-14s %-18s %-24s %-14s\n",
 			" ", "SERVICE", "NODE", "TYPE", "STATUS", "PORTS", "INGRESS DOMAIN", "HTTPS/TLS")
 		sb.WriteString(header)
 		sb.WriteString(divider)
+		sb.WriteByte('\n')
 
 		for i, w := range workloads {
 			cursor := "  "
@@ -1553,22 +1506,18 @@ func (m *DashboardModel) renderServicesTab(width int) string {
 				portsStr = "-"
 			}
 
-			row := fmt.Sprintf("  %-2s %-18s %-16s %-12s %-14s %-18s %-24s %-14s\n",
-				cursor,
-				truncate(w.Name, 17),
-				truncate(w.NodeName, 15),
-				truncate(string(w.Type), 11),
-				st,
-				truncate(portsStr, 17),
-				truncate(w.Domain, 23),
-				truncate(w.TLS, 13),
-			)
+			col0 := padVisual(cursor, 2)
+			col1 := padVisual(truncate(w.Name, 18), 18)
+			col2 := padVisual(truncate(w.NodeName, 16), 16)
+			col3 := padVisual(truncate(string(w.Type), 12), 12)
+			col4 := padVisual(st, 14)
+			col5 := padVisual(truncate(portsStr, 18), 18)
+			col6 := padVisual(truncate(w.Domain, 24), 24)
+			col7 := padVisual(truncate(w.TLS, 14), 14)
 
-			if i == m.selectedSvc {
-				sb.WriteString(m.styles.SelectedRow.Render(row))
-			} else {
-				sb.WriteString(row)
-			}
+			line := "  " + col0 + " " + col1 + " " + col2 + " " + col3 + " " + col4 + " " + col5 + " " + col6 + " " + col7
+			sb.WriteString(m.renderRow(line, i == m.selectedSvc))
+			sb.WriteByte('\n')
 		}
 	} else if width >= 90 {
 		// Medium view: omit PORTS and TLS
@@ -1576,6 +1525,7 @@ func (m *DashboardModel) renderServicesTab(width int) string {
 			" ", "SERVICE", "NODE", "TYPE", "STATUS", "INGRESS DOMAIN")
 		sb.WriteString(header)
 		sb.WriteString(divider)
+		sb.WriteByte('\n')
 
 		for i, w := range workloads {
 			cursor := "  "
@@ -1593,20 +1543,16 @@ func (m *DashboardModel) renderServicesTab(width int) string {
 				st = m.styles.StatusProbing
 			}
 
-			row := fmt.Sprintf("  %-2s %-18s %-14s %-10s %-14s %-20s\n",
-				cursor,
-				truncate(w.Name, 17),
-				truncate(w.NodeName, 13),
-				truncate(string(w.Type), 9),
-				st,
-				truncate(w.Domain, 19),
-			)
+			col0 := padVisual(cursor, 2)
+			col1 := padVisual(truncate(w.Name, 18), 18)
+			col2 := padVisual(truncate(w.NodeName, 14), 14)
+			col3 := padVisual(truncate(string(w.Type), 10), 10)
+			col4 := padVisual(st, 14)
+			col5 := padVisual(truncate(w.Domain, 20), 20)
 
-			if i == m.selectedSvc {
-				sb.WriteString(m.styles.SelectedRow.Render(row))
-			} else {
-				sb.WriteString(row)
-			}
+			line := "  " + col0 + " " + col1 + " " + col2 + " " + col3 + " " + col4 + " " + col5
+			sb.WriteString(m.renderRow(line, i == m.selectedSvc))
+			sb.WriteByte('\n')
 		}
 	} else {
 		// Compact view: SERVICE, TYPE, STATUS, DOMAIN
@@ -1614,6 +1560,7 @@ func (m *DashboardModel) renderServicesTab(width int) string {
 			" ", "SERVICE", "TYPE", "STATUS", "DOMAIN")
 		sb.WriteString(header)
 		sb.WriteString(divider)
+		sb.WriteByte('\n')
 
 		for i, w := range workloads {
 			cursor := "  "
@@ -1631,27 +1578,26 @@ func (m *DashboardModel) renderServicesTab(width int) string {
 				st = m.styles.StatusProbing
 			}
 
-			row := fmt.Sprintf("  %-2s %-16s %-10s %-14s %-18s\n",
-				cursor,
-				truncate(w.Name, 15),
-				truncate(string(w.Type), 9),
-				st,
-				truncate(w.Domain, 17),
-			)
+			col0 := padVisual(cursor, 2)
+			col1 := padVisual(truncate(w.Name, 16), 16)
+			col2 := padVisual(truncate(string(w.Type), 10), 10)
+			col3 := padVisual(st, 14)
+			col4 := padVisual(truncate(w.Domain, 18), 18)
 
-			if i == m.selectedSvc {
-				sb.WriteString(m.styles.SelectedRow.Render(row))
-			} else {
-				sb.WriteString(row)
-			}
+			line := "  " + col0 + " " + col1 + " " + col2 + " " + col3 + " " + col4
+			sb.WriteString(m.renderRow(line, i == m.selectedSvc))
+			sb.WriteByte('\n')
 		}
 	}
 
 	// Details of Selected Workload
 	if m.selectedSvc < len(workloads) {
 		sw := workloads[m.selectedSvc]
-		sb.WriteString("\n" + m.styles.Subtitle.Render("🔎 SELECTED WORKLOAD DETAILS") + "\n")
-		sb.WriteString(m.styles.Divider.Render(strings.Repeat("─", width)) + "\n")
+		sb.WriteByte('\n')
+		sb.WriteString(m.styles.Subtitle.Render("🔎 SELECTED WORKLOAD DETAILS"))
+		sb.WriteByte('\n')
+		sb.WriteString(divider)
+		sb.WriteByte('\n')
 		fmt.Fprintf(&sb, "  Service Name:   %-20s Node:          %s\n", sw.Name, sw.NodeName)
 		fmt.Fprintf(&sb, "  Workload Type:  %-20s Status:        %s\n", sw.Type, sw.State)
 		fmt.Fprintf(&sb, "  Replicas:       %-20d Load Balancer: %s\n", sw.Replicas, sw.LBPolicy)
@@ -1671,22 +1617,27 @@ func (m *DashboardModel) renderServicesTab(width int) string {
 
 func (m *DashboardModel) renderLogsTab(width int) string {
 	var sb strings.Builder
-	sb.WriteString(m.styles.Subtitle.Render("📜 REAL-TIME LIVE LOGS") + "\n\n")
+	sb.WriteString(m.styles.Subtitle.Render("📜 REAL-TIME LIVE LOGS"))
+	sb.WriteString("\n\n")
 
 	maxLogW := width - 4
 	if maxLogW < 30 {
 		maxLogW = 30
 	}
 	for _, l := range m.logs {
-		sb.WriteString("  " + truncate(l, maxLogW) + "\n")
+		sb.WriteString("  ")
+		sb.WriteString(truncate(l, maxLogW))
+		sb.WriteByte('\n')
 	}
-	sb.WriteString("\n  " + m.styles.MutedText.Render("(Press [r] to refresh; logs auto-stream from running services...)"))
+	sb.WriteString("\n  ")
+	sb.WriteString(m.styles.MutedText.Render("(Press [r] to refresh; logs auto-stream from running services...)"))
 	return sb.String()
 }
 
 func (m *DashboardModel) renderBackupsTab(width int) string {
 	var sb strings.Builder
-	sb.WriteString(m.styles.Subtitle.Render("💾 BACKUPS & SNAPSHOTS") + "\n\n")
+	sb.WriteString(m.styles.Subtitle.Render("💾 BACKUPS & SNAPSHOTS"))
+	sb.WriteString("\n\n")
 
 	sb.WriteString("  Active Backup Policies:\n")
 	if width >= 90 {
@@ -1852,12 +1803,71 @@ func formatUptime(seconds uint64) string {
 	return fmt.Sprintf("%dm %ds", mins, d/time.Second)
 }
 
+func padVisual(s string, targetWidth int) string {
+	w := lipgloss.Width(s)
+	if w < targetWidth {
+		return s + strings.Repeat(" ", targetWidth-w)
+	}
+	return s
+}
+
 func truncate(s string, maxLen int) string {
-	if len(s) <= maxLen {
+	runes := []rune(s)
+	if len(runes) <= maxLen {
 		return s
 	}
 	if maxLen <= 3 {
-		return s[:maxLen]
+		return string(runes[:maxLen])
 	}
-	return s[:maxLen-3] + "..."
+	return string(runes[:maxLen-3]) + "..."
 }
+
+func (m *DashboardModel) renderRow(line string, isSelected bool) string {
+	if !isSelected {
+		return line
+	}
+	rendered := m.styles.SelectedRow.Render(line)
+	if m.styles.selectedRowOpen != "" {
+		lastReset := strings.LastIndex(rendered, "\x1b[0m")
+		if lastReset > 0 {
+			body := rendered[:lastReset]
+			rendered = strings.ReplaceAll(body, "\x1b[0m", "\x1b[0m"+m.styles.selectedRowOpen) + rendered[lastReset:]
+		}
+	}
+	return rendered
+}
+
+func (m *DashboardModel) getNodeStatus(n *entity.Node, st *NodeProbeState) (badge string, label string) {
+	if st != nil {
+		if st.IsProbing {
+			return m.styles.StatusProbing, "PROBING"
+		}
+		if st.IsOnline {
+			if n.GossipState == entity.GossipStateSuspect {
+				return m.styles.WarningText.Render("▲ Suspect"), "SUSPECT"
+			}
+			return m.styles.StatusRunning, "ALIVE"
+		}
+		// Probe failed or timed out:
+		if n.GossipState == entity.GossipStateSuspect {
+			return m.styles.WarningText.Render("▲ Suspect"), "SUSPECT"
+		}
+		return m.styles.StatusFailed, "UNREACHABLE"
+	}
+
+	// No probe state, fallback to gossip state / status:
+	switch n.GossipState {
+	case entity.GossipStateSuspect:
+		return m.styles.WarningText.Render("▲ Suspect"), "SUSPECT"
+	case entity.GossipStateDead:
+		return m.styles.StatusFailed, "UNREACHABLE"
+	case entity.GossipStateAlive:
+		return m.styles.StatusRunning, "ALIVE"
+	default:
+		if n.Status == "alive" {
+			return m.styles.StatusRunning, "ALIVE"
+		}
+		return m.styles.StatusStopped, "OFFLINE"
+	}
+}
+

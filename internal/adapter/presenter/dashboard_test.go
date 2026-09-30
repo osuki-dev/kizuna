@@ -112,3 +112,101 @@ func TestDashboardGaugeAndSparkline(t *testing.T) {
 		t.Errorf("renderSparkline with maxLen 16 produced width %d", lipgloss.Width(sp))
 	}
 }
+
+func TestDashboardNodeStatusSync(t *testing.T) {
+	node := &entity.Node{
+		ID:          "node-mini",
+		Name:        "mac-mini",
+		Addr:        "192.168.1.18:19800",
+		Status:      "alive",
+		GossipState: entity.GossipStateAlive,
+	}
+
+	m := NewDashboardWithOptions(DashboardOptions{
+		Nodes: []*entity.Node{node},
+		Theme: entity.ResolveTheme("catppuccin", nil),
+	})
+
+	// Case 1: Probe failed with error
+	m.nodeStates["mac-mini"] = &NodeProbeState{
+		IsOnline:  false,
+		IsProbing: false,
+		Error:     "context deadline exceeded",
+	}
+
+	badge, label := m.getNodeStatus(node, m.nodeStates["mac-mini"])
+	if label == "ALIVE" {
+		t.Errorf("expected UNREACHABLE status when probe failed, got label %s", label)
+	}
+	if !strings.Contains(badge, "Unreachable") {
+		t.Errorf("expected Unreachable badge when probe failed, got %s", badge)
+	}
+
+	// Verify renderNodesTab output
+	tabOut := m.renderNodesTab(120)
+	if strings.Contains(tabOut, "Health:       ALIVE") {
+		t.Errorf("Health in details pane must not show ALIVE when probe failed: %s", tabOut)
+	}
+	if !strings.Contains(tabOut, "Unreachable") {
+		t.Errorf("expected Unreachable in table and details: %s", tabOut)
+	}
+	if !strings.Contains(tabOut, "context deadline exceeded") {
+		t.Errorf("expected error message in details pane: %s", tabOut)
+	}
+
+	// Case 2: Online node
+	m.nodeStates["mac-mini"] = &NodeProbeState{
+		IsOnline:  true,
+		IsProbing: false,
+		Latency:   4 * time.Millisecond,
+	}
+	badgeOnline, labelOnline := m.getNodeStatus(node, m.nodeStates["mac-mini"])
+	if labelOnline != "ALIVE" {
+		t.Errorf("expected ALIVE when probe succeeded, got %s", labelOnline)
+	}
+	if !strings.Contains(badgeOnline, "Online") {
+		t.Errorf("expected Online badge, got %s", badgeOnline)
+	}
+}
+
+func TestDashboardSelectedRowAlignment(t *testing.T) {
+	node := &entity.Node{
+		ID:          "node-mini",
+		Name:        "mac-mini",
+		Addr:        "192.168.1.18:19800",
+		OS:          "darwin",
+		Arch:        "arm64",
+		Status:      "offline",
+		GossipState: entity.GossipStateDead,
+	}
+
+	m := NewDashboardWithOptions(DashboardOptions{
+		Nodes: []*entity.Node{node},
+		Theme: entity.ResolveTheme("catppuccin", nil),
+	})
+	m.nodeStates["mac-mini"] = &NodeProbeState{
+		IsOnline:  false,
+		IsProbing: false,
+		Error:     "context deadline exceeded",
+	}
+
+	// Render wide view
+	out := m.renderNodesTab(120)
+
+	// Verify no glued words like "UnreachableTimeout"
+	if strings.Contains(out, "UnreachableTimeout") {
+		t.Errorf("columns are misaligned/mashed: %s", out)
+	}
+
+	// Verify trailing newline is not styled inside selection block (no trailing box)
+	lines := strings.Split(out, "\n")
+	for _, l := range lines {
+		if strings.HasSuffix(l, " \x1b[0m") && !strings.Contains(l, "─") {
+			// Ensure no floating block artifact
+			if lipgloss.Width(l) > 120 {
+				t.Errorf("line exceeds expected width: %q", l)
+			}
+		}
+	}
+}
+
