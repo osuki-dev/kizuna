@@ -93,13 +93,40 @@ jobs:
           cp checksums.txt sha256sums.txt
           cd ..
 
+      - name: Generate Changelog and Release Notes
+        run: |
+          TAG="${{ steps.tag.outputs.TAG_NAME }}"
+          NOTES_FILE="dist/release_notes.md"
+
+          echo "## 🚀 What's Changed in ${TAG}" > "${NOTES_FILE}"
+          echo "" >> "${NOTES_FILE}"
+
+          # 1. Extract git tag annotation message (if present)
+          TAG_MSG="$(git tag -l --format='%(contents)' "${TAG}" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')"
+          if [ -n "${TAG_MSG}" ]; then
+            echo "${TAG_MSG}" >> "${NOTES_FILE}"
+            echo "" >> "${NOTES_FILE}"
+          fi
+
+          # 2. Extract commit history between previous tag and current tag
+          PREV_TAG="$(git describe --tags --abbrev=0 "${TAG}^" 2>/dev/null || true)"
+          if [ -n "${PREV_TAG}" ]; then
+            echo "### 📦 Commit Log (${PREV_TAG}...${TAG})" >> "${NOTES_FILE}"
+            git log "${PREV_TAG}..${TAG}" --pretty=format:"* %s (%h)" >> "${NOTES_FILE}"
+            echo "" >> "${NOTES_FILE}"
+            echo "" >> "${NOTES_FILE}"
+            echo "**Full Changelog**: https://github.com/${{ github.repository }}/compare/${PREV_TAG}...${TAG}" >> "${NOTES_FILE}"
+          fi
+
       - name: Create GitHub Release with Auto Changelog
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ steps.tag.outputs.TAG_NAME }}
           name: Kizuna ${{ steps.tag.outputs.TAG_NAME }}
+          body_path: dist/release_notes.md
           draft: false
           prerelease: false
-          generate_release_notes: true
           files: |
-            dist/*
+            dist/checksums.txt
+            dist/sha256sums.txt
+            dist/kizuna_*
