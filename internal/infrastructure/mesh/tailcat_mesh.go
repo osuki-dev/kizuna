@@ -13,7 +13,9 @@ import (
 	"time"
 
 	"github.com/osuki-dev/kizuna/internal/domain"
+	"github.com/osuki-dev/kizuna/internal/domain/entity"
 	"github.com/tailscale/tailcat"
+	"tailscale.com/tailcfg"
 	"tailscale.com/types/key"
 )
 
@@ -65,16 +67,94 @@ func loadOrCreateMeshKeys() (key.NodePrivate, tailcat.PresharedKey) {
 
 // TailcatMesh implements domain.MeshGateway using tailscale/tailcat
 type TailcatMesh struct {
-	mu           sync.Mutex
-	server       *tailcat.Server
-	localLn      net.Listener
-	isClosed     bool
-	activeAddr   string
+	mu              sync.Mutex
+	server          *tailcat.Server
+	localLn         net.Listener
+	isClosed        bool
+	activeAddr      string
+	derpRelay       *DERPRelay
+	derpConfig      *entity.DERPConfig
+	discoveredDERPs map[int]*entity.DERPNodeInfo
+	activeDERP      *entity.DERPNodeInfo
 }
 
 // NewMeshGateway creates a new instance of TailcatMesh
 func NewMeshGateway() domain.MeshGateway {
-	return &TailcatMesh{}
+	return &TailcatMesh{
+		discoveredDERPs: make(map[int]*entity.DERPNodeInfo),
+	}
+}
+
+// SetDERPConfig configures and starts a private DERP relay on this node
+func (m *TailcatMesh) SetDERPConfig(cfg *entity.DERPConfig) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	m.derpConfig = cfg
+	if cfg == nil || !cfg.Enabled {
+		return nil
+	}
+
+	nodeKey, _ := loadOrCreateMeshKeys()
+	relay, err := NewDERPRelay(nodeKey, *cfg)
+	if err != nil {
+		return err
+	}
+	if err := relay.Start(); err != nil {
+		return err
+	}
+
+	m.derpRelay = relay
+	info := relay.NodeInfo()
+	m.activeDERP = info
+	m.discoveredDERPs[info.RegionID] = info
+	return nil
+}
+
+// AddDiscoveredDERP registers a DERP relay discovered from peer nodes via Gossip
+func (m *TailcatMesh) AddDiscoveredDERP(info *entity.DERPNodeInfo) {
+	if info == nil || info.RegionID == 0 {
+		return
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	m.discoveredDERPs[info.RegionID] = info
+
+	// If this node does not host its own DERP relay, benchmark and select the fastest one
+	if m.derpRelay == nil {
+		var candidates []*entity.DERPNodeInfo
+		for _, d := range m.discoveredDERPs {
+			candidates = append(candidates, d)
+		}
+		go func(cList []*entity.DERPNodeInfo) {
+			best := PickBestDERP(context.Background(), cList, 1500*time.Millisecond)
+			if best != nil {
+				m.mu.Lock()
+				m.activeDERP = best
+				m.mu.Unlock()
+			}
+		}(candidates)
+	}
+}
+
+// GetActiveDERP returns the active DERP relay info (local or fastest remote)
+func (m *TailcatMesh) GetActiveDERP() *entity.DERPNodeInfo {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.activeDERP
+}
+
+// GetDiscoveredDERPs returns all discovered DERP relays across the mesh
+func (m *TailcatMesh) GetDiscoveredDERPs() []*entity.DERPNodeInfo {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	var list []*entity.DERPNodeInfo
+	for _, d := range m.discoveredDERPs {
+		list = append(list, d)
+	}
+	return list
 }
 
 // Listen starts a tailcat server or local fallback on the specified port
@@ -135,6 +215,11 @@ func (m *TailcatMesh) Listen(ctx context.Context, port uint16, handler func(net.
 		},
 	}
 
+	// If active DERP is configured or discovered, use it as the private bootstrap relay
+	if m.activeDERP != nil {
+		s.Region = BuildDERPRegion(m.activeDERP)
+	}
+
 	// Always bind local TCP listener for local CLI IPC (127.0.0.1) and direct LAN connectivity
 	ln, localErr := net.Listen("tcp", fmt.Sprintf(":%d", port))
 	if localErr == nil {
@@ -188,6 +273,18 @@ func (m *TailcatMesh) Dial(ctx context.Context, addr string, port uint16) (net.C
 		return dialer.DialContext(ctx, "tcp", fmt.Sprintf("127.0.0.1:%d", port))
 	}
 
+	// If target address does not have custom DERP region embedded, but we have discovered private DERPs,
+	// inject our active DERP region into the ConnInfo so the client dials our private DERP relay!
+	if len(ci.Region) == 0 {
+		m.mu.Lock()
+		activeDERP := m.activeDERP
+		m.mu.Unlock()
+		if activeDERP != nil {
+			ci.Region = []*tailcfg.DERPRegion{BuildDERPRegion(activeDERP)}
+			addr = string(ci.Addr())
+		}
+	}
+
 	// Dial via tailcat data-plane
 	cl := tailcat.NewClient(tailcat.Addr(addr))
 	if os.Getenv("KIZUNA_DEBUG") == "" {
@@ -207,6 +304,9 @@ func (m *TailcatMesh) Close() error {
 	m.isClosed = true
 
 	var err error
+	if m.derpRelay != nil {
+		_ = m.derpRelay.Close()
+	}
 	if m.server != nil {
 		err = m.server.Close()
 	}

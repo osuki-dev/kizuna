@@ -54,6 +54,14 @@ var (
 	flagJSON    bool
 	flagNoColor bool
 	flagLang    string
+
+	// DERP Relay CLI flags
+	flagDERP           bool
+	flagDERPHost       string
+	flagDERPPort       int
+	flagDERPSTUNPort   int
+	flagDERPRegionID   int
+	flagDERPRegionName string
 )
 
 func main() {
@@ -322,11 +330,31 @@ func newServiceCmd() *cobra.Command {
 				return nil
 			}
 
+			serviceArgs := []string{"service", "run"}
+			if flagDERP {
+				serviceArgs = append(serviceArgs, "--derp")
+				if flagDERPHost != "" {
+					serviceArgs = append(serviceArgs, fmt.Sprintf("--derp-host=%s", flagDERPHost))
+				}
+				if flagDERPPort != 8443 && flagDERPPort != 0 {
+					serviceArgs = append(serviceArgs, fmt.Sprintf("--derp-port=%d", flagDERPPort))
+				}
+				if flagDERPSTUNPort != 3478 {
+					serviceArgs = append(serviceArgs, fmt.Sprintf("--derp-stun-port=%d", flagDERPSTUNPort))
+				}
+				if flagDERPRegionID != 901 && flagDERPRegionID != 0 {
+					serviceArgs = append(serviceArgs, fmt.Sprintf("--derp-region-id=%d", flagDERPRegionID))
+				}
+				if flagDERPRegionName != "" && flagDERPRegionName != "Kizuna Private Relay" {
+					serviceArgs = append(serviceArgs, fmt.Sprintf("--derp-region-name=%s", flagDERPRegionName))
+				}
+			}
+
 			daemonCfg := service.DaemonConfig{
 				Name:        "kizuna-server",
 				DisplayName: "Kizuna Service",
 				Description: "Kizuna P2P Zero-Trust Deployment Service",
-				Arguments:   []string{"service", "run"},
+				Arguments:   serviceArgs,
 				UserService: useUserService,
 			}
 			mgr, err := service.NewManager(daemonCfg, func() {
@@ -471,6 +499,15 @@ func newServiceCmd() *cobra.Command {
 		},
 	}
 
+	for _, c := range []*cobra.Command{svcCmd, runCmd, installCmd} {
+		c.Flags().BoolVar(&flagDERP, "derp", false, "Enable hosting a private DERP relay on this node")
+		c.Flags().StringVar(&flagDERPHost, "derp-host", "", "Public IP or domain for the DERP relay (default: auto-detected LAN/WAN IP)")
+		c.Flags().IntVar(&flagDERPPort, "derp-port", 8443, "TCP/TLS port for the DERP relay (default: 8443)")
+		c.Flags().IntVar(&flagDERPSTUNPort, "derp-stun-port", 3478, "UDP STUN port for NAT traversal (default: 3478, 0 to disable)")
+		c.Flags().IntVar(&flagDERPRegionID, "derp-region-id", 901, "Custom region ID for this DERP relay (default: 901)")
+		c.Flags().StringVar(&flagDERPRegionName, "derp-region-name", "Kizuna Private Relay", "Human-readable region name for this DERP relay")
+	}
+
 	svcCmd.AddCommand(runCmd, installCmd, startCmd, stopCmd, restartCmd, serviceStatusCmd, uninstallCmd)
 	return svcCmd
 }
@@ -481,6 +518,36 @@ func runServer() error {
 
 	meshGw := mesh.NewMeshGateway()
 	defer func() { _ = meshGw.Close() }()
+
+	// Resolve DERP relay configuration (from CLI flags or kizuna.yaml)
+	var derpCfg *entity.DERPConfig
+	if flagDERP {
+		derpCfg = &entity.DERPConfig{
+			Enabled:    true,
+			Host:       flagDERPHost,
+			Port:       flagDERPPort,
+			STUNPort:   flagDERPSTUNPort,
+			RegionID:   flagDERPRegionID,
+			RegionName: flagDERPRegionName,
+		}
+	} else {
+		for _, path := range []string{"kizuna.yaml", "kizuna.yml"} {
+			if proj, err := config.LoadProject(path); err == nil && proj != nil && proj.DERP != nil {
+				derpCfg = proj.DERP
+				break
+			}
+		}
+	}
+
+	if derpCfg != nil && derpCfg.Enabled {
+		if err := meshGw.SetDERPConfig(derpCfg); err != nil {
+			if !flagJSON {
+				fmt.Printf("⚠️  Failed to start private DERP relay: %v\n", err)
+			}
+		} else if !flagJSON {
+			fmt.Printf("✓ Private DERP relay active on port %d (STUN %d)\n", derpCfg.Port, derpCfg.STUNPort)
+		}
+	}
 
 	workloadRunner := workload.NewWorkloadRunner("")
 	ingressMgr := ingress.NewCaddyManager("")
@@ -519,9 +586,15 @@ func runServer() error {
 		MeshAddr:  addr,
 		Host:      nodeName,
 		IP:        gossip.DetectOutboundIP(),
+		DERP:      meshGw.GetActiveDERP(),
 		Transport: gossipTransport,
 		Repo:      nodeRepo,
 		Seeds:     seeds,
+	})
+	gossipEng.SetOnNodeUpdate(func(node *entity.Node) {
+		if node != nil && node.DERP != nil {
+			meshGw.AddDiscoveredDERP(node.DERP)
+		}
 	})
 	apiServer.SetGossipEngine(gossipEng)
 	_ = gossipEng.Start(ctx)

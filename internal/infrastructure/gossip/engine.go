@@ -24,6 +24,7 @@ type Config struct {
 	Host           string
 	IP             string
 	Tags           []string
+	DERP           *entity.DERPNodeInfo
 	Interval       time.Duration // Periodic gossip ping interval (default: 2s)
 	SuspectTimeout time.Duration // Time in suspect state before marking dead (default: 5s)
 	SyncInterval   time.Duration // Anti-entropy full state sync interval (default: 20s)
@@ -42,6 +43,7 @@ type Engine struct {
 	recentUpdates []*entity.GossipUpdate     // Piggybacked update queue
 	tombstones    map[string]time.Time       // Deleted / kicked node IDs and Names
 	failCount     map[string]int             // Node ID -> consecutive failed probe count
+	onNodeUpdate  func(*entity.Node)
 	transport     Transport
 	repo          domain.NodeRepository
 	interval      time.Duration
@@ -157,6 +159,7 @@ func NewEngine(cfg Config) *Engine {
 		Host:        cfg.Host,
 		IP:          cfg.IP,
 		Tags:        cfg.Tags,
+		DERP:        cfg.DERP,
 		OS:          runtime.GOOS,
 		Arch:        runtime.GOARCH,
 		IsOnline:    true,
@@ -291,6 +294,52 @@ func (e *Engine) UpdateLocalMeta(meta *entity.NodeMetaUpdate) {
 		Timestamp:   time.Now(),
 	}
 	e.queueUpdateLocked(update)
+}
+
+// UpdateLocalDERP updates self DERP relay information, increments incarnation and queues broadcast
+func (e *Engine) UpdateLocalDERP(derp *entity.DERPNodeInfo) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+
+	e.self.DERP = derp
+	e.self.Incarnation++
+	e.self.LastSeen = time.Now()
+
+	update := &entity.GossipUpdate{
+		Node:        e.cloneNode(e.self),
+		State:       entity.GossipStateAlive,
+		Incarnation: e.self.Incarnation,
+		Timestamp:   time.Now(),
+	}
+	e.queueUpdateLocked(update)
+}
+
+// SetOnNodeUpdate registers a callback invoked whenever a node's metadata or DERP status changes
+func (e *Engine) SetOnNodeUpdate(fn func(*entity.Node)) {
+	e.mu.Lock()
+	e.onNodeUpdate = fn
+	var currentMembers []*entity.Node
+	for _, m := range e.members {
+		if m != nil && m.ID != e.self.ID {
+			currentMembers = append(currentMembers, e.cloneNode(m))
+		}
+	}
+	e.mu.Unlock()
+
+	if fn != nil {
+		for _, m := range currentMembers {
+			fn(m)
+		}
+	}
+}
+
+func (e *Engine) notifyNodeUpdateLocked(n *entity.Node) {
+	if n == nil || e.onNodeUpdate == nil {
+		return
+	}
+	cp := e.cloneNode(n)
+	fn := e.onNodeUpdate
+	go fn(cp)
 }
 
 // BroadcastUpdate queues an update for dissemination and applies locally
@@ -548,6 +597,7 @@ func (e *Engine) handlePing(msg *entity.GossipMessage) (*entity.GossipMessage, e
 		SenderID:    e.self.ID,
 		SenderName:  e.self.Name,
 		SenderAddr:  e.self.Addr,
+		SenderDERP:  e.self.DERP,
 		Incarnation: e.self.Incarnation,
 		Updates:     updatesToSend,
 	}
@@ -614,6 +664,7 @@ func (e *Engine) handleIndirectPing(msg *entity.GossipMessage) (*entity.GossipMe
 		SenderID:    e.self.ID,
 		SenderName:  e.self.Name,
 		SenderAddr:  e.self.Addr,
+		SenderDERP:  e.self.DERP,
 		Incarnation: e.self.Incarnation,
 	}
 
@@ -692,6 +743,7 @@ func (e *Engine) handleSyncReq(msg *entity.GossipMessage) (*entity.GossipMessage
 		SenderID:    e.self.ID,
 		SenderName:  e.self.Name,
 		SenderAddr:  e.self.Addr,
+		SenderDERP:  e.self.DERP,
 		Incarnation: e.self.Incarnation,
 		Updates:     updatesToSend,
 		Digest:      localDigest,
@@ -767,15 +819,25 @@ func (e *Engine) registerOrTouchSenderLocked(msg *entity.GossipMessage) {
 		e.members[msg.SenderID] = sender
 		e.nameToID[msg.SenderName] = msg.SenderID
 
+		if msg.SenderDERP != nil {
+			derpCopy := *msg.SenderDERP
+			sender.DERP = &derpCopy
+		}
 		if e.repo != nil {
 			_ = e.repo.SaveNode(e.cloneNode(sender))
 		}
+		e.notifyNodeUpdateLocked(sender)
 	} else {
 		sender.IsOnline = true
 		sender.GossipState = entity.GossipStateAlive
 		sender.LastSeen = time.Now()
 		if msg.SenderAddr != "" {
 			sender.Addr = msg.SenderAddr
+		}
+		if msg.SenderDERP != nil {
+			derpCopy := *msg.SenderDERP
+			sender.DERP = &derpCopy
+			e.notifyNodeUpdateLocked(sender)
 		}
 		if msg.Incarnation > sender.Incarnation {
 			sender.Incarnation = msg.Incarnation
@@ -853,6 +915,7 @@ func (e *Engine) applyUpdateLocked(u *entity.GossipUpdate) {
 		if e.repo != nil {
 			_ = e.repo.SaveNode(e.cloneNode(newNode))
 		}
+		e.notifyNodeUpdateLocked(newNode)
 		e.queueUpdateLocked(u)
 		return
 	}
@@ -882,6 +945,7 @@ func (e *Engine) applyUpdateLocked(u *entity.GossipUpdate) {
 		if e.repo != nil {
 			_ = e.repo.SaveNode(e.cloneNode(existing))
 		}
+		e.notifyNodeUpdateLocked(existing)
 		e.queueUpdateLocked(u)
 	} else if u.Incarnation == existing.Incarnation {
 		// Priority for equal incarnation: Dead > Suspect > Alive
@@ -903,6 +967,7 @@ func (e *Engine) applyUpdateLocked(u *entity.GossipUpdate) {
 		if e.repo != nil {
 			_ = e.repo.SaveNode(e.cloneNode(existing))
 		}
+		e.notifyNodeUpdateLocked(existing)
 	}
 }
 
@@ -927,6 +992,10 @@ func (e *Engine) mergeNodeMetadata(dest, src *entity.Node) {
 	}
 	if src.Addr != "" {
 		dest.Addr = src.Addr
+	}
+	if src.DERP != nil {
+		derpCopy := *src.DERP
+		dest.DERP = &derpCopy
 	}
 	if src.CPUUsage > 0 {
 		dest.CPUUsage = src.CPUUsage
@@ -1021,6 +1090,7 @@ func (e *Engine) performGossipRound() {
 		SenderID:    e.self.ID,
 		SenderName:  e.self.Name,
 		SenderAddr:  e.self.Addr,
+		SenderDERP:  e.self.DERP,
 		Incarnation: e.self.Incarnation,
 		Updates:     updates,
 	}
@@ -1063,6 +1133,7 @@ func (e *Engine) performGossipRound() {
 			SenderID:    e.self.ID,
 			SenderName:  e.self.Name,
 			SenderAddr:  e.self.Addr,
+		SenderDERP:  e.self.DERP,
 			TargetID:    peer.ID,
 			Incarnation: e.self.Incarnation,
 		}
@@ -1193,13 +1264,23 @@ func (e *Engine) reloadFromRepo() {
 			if len(n.Tags) > 0 {
 				existing.Tags = n.Tags
 			}
+			if n.DERP != nil {
+				derpCopy := *n.DERP
+				existing.DERP = &derpCopy
+			}
+			e.notifyNodeUpdateLocked(existing)
 		} else {
 			nCopy := *n
 			if nCopy.GossipState == "" {
 				nCopy.GossipState = entity.GossipStateAlive
 			}
+			if n.DERP != nil {
+				derpCopy := *n.DERP
+				nCopy.DERP = &derpCopy
+			}
 			e.members[nCopy.ID] = &nCopy
 			e.nameToID[nCopy.Name] = nCopy.ID
+			e.notifyNodeUpdateLocked(&nCopy)
 		}
 	}
 }
@@ -1229,6 +1310,7 @@ func (e *Engine) performAntiEntropySync() {
 		SenderID:    e.self.ID,
 		SenderName:  e.self.Name,
 		SenderAddr:  e.self.Addr,
+		SenderDERP:  e.self.DERP,
 		Incarnation: e.self.Incarnation,
 		Digest:      localDigest,
 	}
@@ -1355,6 +1437,10 @@ func (e *Engine) cloneNode(n *entity.Node) *entity.Node {
 	if len(n.Tags) > 0 {
 		cp.Tags = make([]string, len(n.Tags))
 		copy(cp.Tags, n.Tags)
+	}
+	if n.DERP != nil {
+		derpCopy := *n.DERP
+		cp.DERP = &derpCopy
 	}
 	return &cp
 }

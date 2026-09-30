@@ -304,6 +304,9 @@ func (u *UI) RenderNodeTable(nodes []*entity.Node, wide ...bool) string {
 		} else if n.Addr != "" {
 			hostStr = FormatNodeAddr(n.Addr, false)
 		}
+		if n.DERP != nil {
+			hostStr += " " + u.SecondaryStyle.Render(fmt.Sprintf("[DERP :%d]", n.DERP.Port))
+		}
 
 		statusBadge := u.GossipPill(n.GossipState, n.IsOnline)
 

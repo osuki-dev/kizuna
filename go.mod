@@ -9,12 +9,14 @@ require (
 	github.com/charmbracelet/bubbletea v1.3.10
 	github.com/charmbracelet/lipgloss v1.1.0
 	github.com/kardianos/service v1.3.0
+	github.com/mattn/go-isatty v0.0.23
 	github.com/shirou/gopsutil/v4 v4.26.8
 	github.com/spf13/cobra v1.10.2
 	github.com/tailscale/tailcat v0.7.0
 	golang.org/x/crypto v0.57.0
 	golang.org/x/mod v0.41.0
 	gopkg.in/yaml.v3 v3.0.1
+	tailscale.com v1.103.0-pre.0.20260916030321-a2263542f260
 )
 
 require (
@@ -31,6 +33,7 @@ require (
 	github.com/aws/aws-sdk-go-v2/service/internal/presigned-url v1.14.4 // indirect
 	github.com/aws/aws-sdk-go-v2/service/internal/s3shared v1.19.21 // indirect
 	github.com/aws/smithy-go v1.28.1 // indirect
+	github.com/axiomhq/hyperloglog v0.0.0-20240319100328-84253e514e02 // indirect
 	github.com/aymanbagabas/go-osc52/v2 v2.0.1 // indirect
 	github.com/charmbracelet/colorprofile v0.4.3 // indirect
 	github.com/charmbracelet/x/ansi v0.11.7 // indirect
@@ -42,12 +45,14 @@ require (
 	github.com/creachadair/msync v0.8.1 // indirect
 	github.com/creack/pty v1.1.24 // indirect
 	github.com/dblohm7/wingoes v0.0.0-20240119213807-a09d6be7affa // indirect
+	github.com/dgryski/go-metro v0.0.0-20180109044635-280f6062b5bc // indirect
 	github.com/ebitengine/purego v0.10.2 // indirect
 	github.com/erikgeiser/coninput v0.0.0-20211004153227-1c3628e74d0f // indirect
 	github.com/fxamacker/cbor/v2 v2.9.0 // indirect
 	github.com/gaissmai/bart v0.26.1 // indirect
 	github.com/go-json-experiment/json v0.0.0-20260623181947-01eb4420fa68 // indirect
 	github.com/go-ole/go-ole v1.3.0 // indirect
+	github.com/go4org/hashtriemap v0.0.0-20260824042624-45fcf11fca0e // indirect
 	github.com/godbus/dbus/v5 v5.2.2 // indirect
 	github.com/golang/groupcache v0.0.0-20241129210726-2c02b8208cf8 // indirect
 	github.com/google/btree v1.1.3 // indirect
@@ -59,7 +64,6 @@ require (
 	github.com/kr/fs v0.1.0 // indirect
 	github.com/lucasb-eyer/go-colorful v1.4.0 // indirect
 	github.com/lufia/plan9stats v0.0.0-20211012122336-39d0f177ccd0 // indirect
-	github.com/mattn/go-isatty v0.0.23 // indirect
 	github.com/mattn/go-localereader v0.0.1 // indirect
 	github.com/mattn/go-runewidth v0.0.23 // indirect
 	github.com/mdlayher/netlink v1.7.3-0.20250113171957-fbb4dce95f42 // indirect
@@ -99,5 +103,4 @@ require (
 	golang.zx2c4.com/wintun v0.0.0-20230126152724-0fa3db229ce2 // indirect
 	golang.zx2c4.com/wireguard/windows v0.5.3 // indirect
 	gvisor.dev/gvisor v0.0.0-20260915211658-a6f909f08a72 // indirect
-	tailscale.com v1.103.0-pre.0.20260916030321-a2263542f260 // indirect
 )

@@ -43,6 +43,10 @@ type MeshGateway interface {
 	Listen(ctx context.Context, port uint16, handler func(net.Conn)) (string, error)
 	Dial(ctx context.Context, addr string, port uint16) (net.Conn, error)
 	Close() error
+	SetDERPConfig(cfg *entity.DERPConfig) error
+	AddDiscoveredDERP(info *entity.DERPNodeInfo)
+	GetActiveDERP() *entity.DERPNodeInfo
+	GetDiscoveredDERPs() []*entity.DERPNodeInfo
 }
 
 // AuthManager handles agent-side pairing PIN verification and token validation

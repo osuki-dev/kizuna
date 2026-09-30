@@ -38,6 +38,7 @@ type Project struct {
 	ActiveEnv    string              `json:"active_env,omitempty"`
 	Environments []string            `json:"environments,omitempty"`
 	Services     map[string]*Service `json:"services"`
+	DERP         *DERPConfig         `json:"derp,omitempty" yaml:"derp,omitempty"`
 }
 
 // Service represents an individual deployable workload
@@ -215,8 +216,33 @@ type Node struct {
 	UsedDisk    uint64      `json:"used_disk,omitempty"`
 	CPUCores    int         `json:"cpu_cores,omitempty"`
 	Uptime      uint64      `json:"uptime,omitempty"`
-	Load1       float64     `json:"load1,omitempty"`
-	LatencyMs   int64       `json:"latency_ms,omitempty"`
+	Load1       float64       `json:"load1,omitempty"`
+	LatencyMs   int64         `json:"latency_ms,omitempty"`
+	DERP        *DERPNodeInfo `json:"derp,omitempty" yaml:"derp,omitempty"`
+}
+
+// DERPConfig represents configuration for hosting a private DERP relay
+type DERPConfig struct {
+	Enabled    bool   `json:"enabled" yaml:"enabled"`
+	Host       string `json:"host,omitempty" yaml:"host,omitempty"`             // Reachable hostname or IP (e.g. 10.0.0.4 or vps.example.com)
+	Port       int    `json:"port,omitempty" yaml:"port,omitempty"`             // TLS/TCP port (default 8443)
+	STUNPort   int    `json:"stun_port,omitempty" yaml:"stun_port,omitempty"`   // STUN UDP port (default 3478, or 0 if disabled)
+	RegionID   int    `json:"region_id,omitempty" yaml:"region_id,omitempty"`   // Custom Region ID (range 900-999)
+	RegionCode string `json:"region_code,omitempty" yaml:"region_code,omitempty"`
+	RegionName string `json:"region_name,omitempty" yaml:"region_name,omitempty"`
+}
+
+// DERPNodeInfo represents advertised DERP relay capability of a node
+type DERPNodeInfo struct {
+	RegionID   int    `json:"region_id" yaml:"region_id"`
+	RegionCode string `json:"region_code" yaml:"region_code"`
+	RegionName string `json:"region_name" yaml:"region_name"`
+	HostName   string `json:"host_name" yaml:"host_name"`
+	Port       int    `json:"port" yaml:"port"`
+	STUNPort   int    `json:"stun_port,omitempty" yaml:"stun_port,omitempty"`
+	CertName   string `json:"cert_name,omitempty" yaml:"cert_name,omitempty"` // "sha256-raw:<hex>" for self-signed certs
+	IPv4       string `json:"ipv4,omitempty" yaml:"ipv4,omitempty"`
+	IPv6       string `json:"ipv6,omitempty" yaml:"ipv6,omitempty"`
 }
 
 // GossipState represents node membership lifecycle in the Gossip cluster
@@ -247,6 +273,7 @@ type GossipMessage struct {
 	SenderID    string            `json:"sender_id"`
 	SenderName  string            `json:"sender_name"`
 	SenderAddr  string            `json:"sender_addr"`
+	SenderDERP  *DERPNodeInfo     `json:"sender_derp,omitempty"`
 	TargetID    string            `json:"target_id,omitempty"` // Used for indirect ping
 	Incarnation uint64            `json:"incarnation"`
 	Updates     []*GossipUpdate   `json:"updates,omitempty"`

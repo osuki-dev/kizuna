@@ -350,4 +350,98 @@ func TestGossipRemoveMemberAndTombstone(t *testing.T) {
 	}
 }
 
+func TestGossipDERPDissemination(t *testing.T) {
+	transport := newMockTransport()
+
+	derpInfo := &entity.DERPNodeInfo{
+		RegionID:   901,
+		RegionCode: "tokyo",
+		RegionName: "Tokyo Relay",
+		HostName:   "10.0.0.1",
+		Port:       8443,
+		STUNPort:   3478,
+		CertName:   "sha256-raw:fakefingerprint",
+	}
+
+	engineA := gossip.NewEngine(gossip.Config{
+		NodeID:    "node_A",
+		NodeName:  "relay-node",
+		MeshAddr:  "10.0.0.1",
+		DERP:      derpInfo,
+		Transport: transport,
+	})
+	transport.Register("10.0.0.1", engineA.HandleMessage)
+
+	engineB := gossip.NewEngine(gossip.Config{
+		NodeID:    "node_B",
+		NodeName:  "client-node",
+		MeshAddr:  "10.0.0.2",
+		Transport: transport,
+	})
+	transport.Register("10.0.0.2", engineB.HandleMessage)
+
+	derpDiscoveredCh := make(chan *entity.DERPNodeInfo, 1)
+	engineB.SetOnNodeUpdate(func(n *entity.Node) {
+		if n != nil && n.DERP != nil {
+			select {
+			case derpDiscoveredCh <- n.DERP:
+			default:
+			}
+		}
+	})
+
+	// Node A sends Gossip update to Node B containing its DERP capability
+	updateMsg := &entity.GossipMessage{
+		Type:        entity.GossipMsgPing,
+		SenderID:    "node_A",
+		SenderName:  "relay-node",
+		SenderAddr:  "10.0.0.1",
+		Incarnation: 1,
+		Updates: []*entity.GossipUpdate{
+			{
+				Node: &entity.Node{
+					ID:       "node_A",
+					Name:     "relay-node",
+					Addr:     "10.0.0.1",
+					Host:     "10.0.0.1",
+					IP:       "10.0.0.1",
+					DERP:     derpInfo,
+					IsOnline: true,
+				},
+				State:       entity.GossipStateAlive,
+				Incarnation: 1,
+				Timestamp:   time.Now(),
+			},
+		},
+	}
+
+	reply, err := engineB.HandleMessage(updateMsg)
+	if err != nil {
+		t.Fatalf("HandleMessage failed: %v", err)
+	}
+	if reply.Type != entity.GossipMsgAck {
+		t.Fatalf("expected Ack reply, got %s", reply.Type)
+	}
+
+	// Verify Node B discovered Node A's DERP relay via callback
+	select {
+	case discovered := <-derpDiscoveredCh:
+		if discovered.RegionID != 901 || discovered.RegionCode != "tokyo" || discovered.Port != 8443 {
+			t.Fatalf("unexpected discovered DERP info: %+v", discovered)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatalf("timed out waiting for DERP discovery callback")
+	}
+
+	// Verify GetMember also returns the DERP metadata
+	memberA, ok := engineB.GetMember("node_A")
+	if !ok {
+		t.Fatalf("expected memberA to be present in engineB")
+	}
+	if memberA.DERP == nil || memberA.DERP.RegionID != 901 {
+		t.Fatalf("expected memberA to have DERP info, got %+v", memberA.DERP)
+	}
+}
+
+
 
