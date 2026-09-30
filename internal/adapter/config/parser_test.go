@@ -246,3 +246,55 @@ environments:
 		t.Errorf("unexpected first prod target: %s", prodProj.Targets[0])
 	}
 }
+
+func TestLoadSSHConfig(t *testing.T) {
+	yamlContent := `
+version: "1.0"
+name: "secure-app"
+ssh:
+  enabled: true
+  allow_tags:
+    - admin
+    - devops
+  deny_tags:
+    - guest
+  allow_nodes:
+    - bastion
+  deny_nodes:
+    - untrusted-node
+`
+	tmpDir := t.TempDir()
+	cfgPath := tmpDir + "/kizuna.yaml"
+	if err := os.WriteFile(cfgPath, []byte(yamlContent), 0644); err != nil {
+		t.Fatalf("failed to write config: %v", err)
+	}
+
+	proj, err := config.LoadProject(cfgPath)
+	if err != nil {
+		t.Fatalf("failed to load project with ssh config: %v", err)
+	}
+
+	if proj.SSH == nil {
+		t.Fatalf("expected SSH config to be non-nil")
+	}
+
+	if !proj.SSH.IsEnabled() {
+		t.Errorf("expected SSH to be enabled")
+	}
+
+	if len(proj.SSH.AllowTags) != 2 || proj.SSH.AllowTags[0] != "admin" {
+		t.Errorf("expected allow_tags [admin, devops], got %v", proj.SSH.AllowTags)
+	}
+
+	if len(proj.SSH.DenyTags) != 1 || proj.SSH.DenyTags[0] != "guest" {
+		t.Errorf("expected deny_tags [guest], got %v", proj.SSH.DenyTags)
+	}
+
+	if len(proj.SSH.AllowNodes) != 1 || proj.SSH.AllowNodes[0] != "bastion" {
+		t.Errorf("expected allow_nodes [bastion], got %v", proj.SSH.AllowNodes)
+	}
+
+	if len(proj.SSH.DenyNodes) != 1 || proj.SSH.DenyNodes[0] != "untrusted-node" {
+		t.Errorf("expected deny_nodes [untrusted-node], got %v", proj.SSH.DenyNodes)
+	}
+}

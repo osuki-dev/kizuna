@@ -47,6 +47,7 @@ type MeshGateway interface {
 	AddDiscoveredDERP(info *entity.DERPNodeInfo)
 	GetActiveDERP() *entity.DERPNodeInfo
 	GetDiscoveredDERPs() []*entity.DERPNodeInfo
+	SetSSHPolicy(policy *entity.SSHConfig, peerLookup func(pubKey string) *entity.Node)
 }
 
 // AuthManager handles agent-side pairing PIN verification and token validation

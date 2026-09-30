@@ -22,6 +22,7 @@ type RawConfig struct {
 	Services     map[string]*RawServiceConfig          `yaml:"services,omitempty"`
 	Environments map[string]*entity.EnvironmentConfig  `yaml:"environments,omitempty"`
 	DERP         *entity.DERPConfig                    `yaml:"derp,omitempty"`
+	SSH          *entity.SSHConfig                     `yaml:"ssh,omitempty"`
 
 	// Shorthand fields for single-service projects
 	Type        string                `yaml:"type,omitempty"`
@@ -115,6 +116,7 @@ func LoadProjectWithEnv(filePath string, envName string) (*entity.Project, error
 		Environments: envList,
 		Services:     make(map[string]*entity.Service),
 		DERP:         raw.DERP,
+		SSH:          raw.SSH,
 	}
 	if project.Name == "" {
 		project.Name = filepath.Base(filepath.Dir(filePath))

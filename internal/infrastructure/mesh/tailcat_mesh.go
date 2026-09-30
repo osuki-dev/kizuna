@@ -81,6 +81,8 @@ type TailcatMesh struct {
 	activeDERP      *entity.DERPNodeInfo
 	isBenchmarking  bool
 	clients         map[string]*tailcat.Client
+	sshPolicy       *entity.SSHConfig
+	sshPeerLookup   func(pubKey string) *entity.Node
 }
 
 // NewMeshGateway creates a new instance of TailcatMesh
@@ -188,6 +190,154 @@ func (m *TailcatMesh) GetDiscoveredDERPs() []*entity.DERPNodeInfo {
 	return list
 }
 
+// SetSSHPolicy configures inbound SSH access control and peer resolver
+func (m *TailcatMesh) SetSSHPolicy(policy *entity.SSHConfig, peerLookup func(pubKey string) *entity.Node) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.sshPolicy = policy
+	m.sshPeerLookup = peerLookup
+}
+
+// ExtractNodePublicKey extracts the WireGuard public key from a node's Tailcat address
+func ExtractNodePublicKey(addr string) string {
+	if ci, err := tailcat.ParseAddr(tailcat.Addr(addr)); err == nil {
+		return ci.ServerPublic.String()
+	}
+	return ""
+}
+
+// CheckSSHPermission evaluates whether an incoming SSH connection is permitted
+// based on the configured SSH policy and caller node identity/tags.
+func CheckSSHPermission(policy *entity.SSHConfig, caller *entity.Node, peerKey string) error {
+	if policy == nil {
+		return nil
+	}
+	if !policy.IsEnabled() {
+		return fmt.Errorf("inbound SSH is disabled on this node")
+	}
+
+	// If no access control rules (allow/deny tags/nodes) are configured, permit by default
+	if len(policy.AllowTags) == 0 && len(policy.DenyTags) == 0 &&
+		len(policy.AllowNodes) == 0 && len(policy.DenyNodes) == 0 {
+		return nil
+	}
+
+	// If ACL rules are defined but caller node could not be identified
+	if caller == nil {
+		cleanKey := strings.TrimPrefix(peerKey, "nodekey:")
+		if len(cleanKey) > 16 {
+			cleanKey = cleanKey[:16] + "..."
+		}
+		if cleanKey == "" {
+			cleanKey = "unknown"
+		}
+		return fmt.Errorf("peer identity '%s' not recognized in paired cluster", cleanKey)
+	}
+
+	// 1. Check DenyNodes
+	for _, denied := range policy.DenyNodes {
+		d := strings.TrimSpace(denied)
+		if d != "" && (strings.EqualFold(caller.Name, d) || strings.EqualFold(caller.ID, d)) {
+			return fmt.Errorf("node '%s' is explicitly denied by deny_nodes policy", caller.Name)
+		}
+	}
+
+	// 2. Check DenyTags
+	for _, denyTag := range policy.DenyTags {
+		dt := strings.TrimSpace(denyTag)
+		if dt == "" {
+			continue
+		}
+		for _, tag := range caller.Tags {
+			if strings.EqualFold(strings.TrimSpace(tag), dt) {
+				return fmt.Errorf("node '%s' has tag '%s' which is denied by deny_tags policy", caller.Name, tag)
+			}
+		}
+	}
+
+	// 3. Check AllowNodes and AllowTags
+	hasAllowNodes := len(policy.AllowNodes) > 0
+	hasAllowTags := len(policy.AllowTags) > 0
+
+	// If neither allow list is configured, passing deny checks is sufficient
+	if !hasAllowNodes && !hasAllowTags {
+		return nil
+	}
+
+	nodeAllowed := false
+	if hasAllowNodes {
+		for _, allowed := range policy.AllowNodes {
+			a := strings.TrimSpace(allowed)
+			if a != "" && (strings.EqualFold(caller.Name, a) || strings.EqualFold(caller.ID, a)) {
+				nodeAllowed = true
+				break
+			}
+		}
+	}
+
+	tagAllowed := false
+	if hasAllowTags {
+		for _, allowTag := range policy.AllowTags {
+			at := strings.TrimSpace(allowTag)
+			if at == "" {
+				continue
+			}
+			for _, tag := range caller.Tags {
+				if strings.EqualFold(strings.TrimSpace(tag), at) {
+					tagAllowed = true
+					break
+				}
+			}
+			if tagAllowed {
+				break
+			}
+		}
+	}
+
+	if nodeAllowed || tagAllowed {
+		return nil
+	}
+
+	if hasAllowTags && !hasAllowNodes {
+		return fmt.Errorf("node '%s' (tags: %v) does not have any allowed tags (%v)", caller.Name, caller.Tags, policy.AllowTags)
+	}
+	if hasAllowNodes && !hasAllowTags {
+		return fmt.Errorf("node '%s' is not in allow_nodes list (%v)", caller.Name, policy.AllowNodes)
+	}
+	return fmt.Errorf("node '%s' does not match allow_tags (%v) or allow_nodes (%v)", caller.Name, policy.AllowTags, policy.AllowNodes)
+}
+
+func (m *TailcatMesh) checkSSHAccess(s *tailcat.Server, c net.Conn) error {
+	m.mu.Lock()
+	policy := m.sshPolicy
+	peerLookup := m.sshPeerLookup
+	m.mu.Unlock()
+
+	if policy == nil {
+		return nil
+	}
+	if !policy.IsEnabled() {
+		return fmt.Errorf("inbound SSH is disabled on this node")
+	}
+
+	var peerKey string
+	if s != nil {
+		for _, env := range s.PeerEnv(c.LocalAddr(), c.RemoteAddr()) {
+			if strings.HasPrefix(env, "TAILCAT_PEER_KEY=") {
+				peerKey = strings.TrimPrefix(env, "TAILCAT_PEER_KEY=")
+				break
+			}
+		}
+	}
+
+	var caller *entity.Node
+	if peerLookup != nil && peerKey != "" {
+		caller = peerLookup(peerKey)
+	}
+
+	return CheckSSHPermission(policy, caller, peerKey)
+}
+
 // Listen starts a tailcat server or local fallback on the specified port
 func (m *TailcatMesh) Listen(ctx context.Context, port uint16, handler func(net.Conn)) (string, error) {
 	m.mu.Lock()
@@ -215,6 +365,15 @@ func (m *TailcatMesh) Listen(ctx context.Context, port uint16, handler func(net.
 					Shell: true,
 				})
 				return func(c net.Conn) {
+					// Enforce SSH tag-based access control policy
+					if err := m.checkSSHAccess(s, c); err != nil {
+						msg := fmt.Sprintf("Access denied by Kizuna SSH policy: %v\r\n", err)
+						_, _ = c.Write([]byte(msg))
+						time.Sleep(50 * time.Millisecond)
+						_ = c.Close()
+						return
+					}
+
 					// 1. Check if local OpenSSH daemon is reachable dynamically
 					target, err := net.DialTimeout("tcp", "127.0.0.1:22", 200*time.Millisecond)
 					if err == nil {

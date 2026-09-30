@@ -28,6 +28,7 @@ import (
 	"github.com/osuki-dev/kizuna/internal/adapter/config"
 	"github.com/osuki-dev/kizuna/internal/adapter/presenter"
 	"github.com/osuki-dev/kizuna/internal/adapter/strategy"
+	"github.com/osuki-dev/kizuna/internal/domain"
 	"github.com/osuki-dev/kizuna/internal/domain/entity"
 	"github.com/osuki-dev/kizuna/internal/infrastructure/auth"
 	"github.com/osuki-dev/kizuna/internal/infrastructure/backup"
@@ -63,6 +64,14 @@ var (
 	flagDERPSTUNPort   int
 	flagDERPRegionID   int
 	flagDERPRegionName string
+
+	// SSH Access Control CLI flags
+	flagSSH           bool = true
+	flagNoSSH         bool
+	flagSSHAllowTags  string
+	flagSSHDenyTags   string
+	flagSSHAllowNodes string
+	flagSSHDenyNodes  string
 )
 
 func main() {
@@ -351,6 +360,23 @@ func newServiceCmd() *cobra.Command {
 				}
 			}
 
+			if flagNoSSH || !flagSSH {
+				serviceArgs = append(serviceArgs, "--no-ssh")
+			} else {
+				if flagSSHAllowTags != "" {
+					serviceArgs = append(serviceArgs, fmt.Sprintf("--ssh-allow-tags=%s", flagSSHAllowTags))
+				}
+				if flagSSHDenyTags != "" {
+					serviceArgs = append(serviceArgs, fmt.Sprintf("--ssh-deny-tags=%s", flagSSHDenyTags))
+				}
+				if flagSSHAllowNodes != "" {
+					serviceArgs = append(serviceArgs, fmt.Sprintf("--ssh-allow-nodes=%s", flagSSHAllowNodes))
+				}
+				if flagSSHDenyNodes != "" {
+					serviceArgs = append(serviceArgs, fmt.Sprintf("--ssh-deny-nodes=%s", flagSSHDenyNodes))
+				}
+			}
+
 			daemonCfg := service.DaemonConfig{
 				Name:        "kizuna-server",
 				DisplayName: "Kizuna Service",
@@ -507,6 +533,13 @@ func newServiceCmd() *cobra.Command {
 		c.Flags().IntVar(&flagDERPSTUNPort, "derp-stun-port", 3478, "UDP STUN port for NAT traversal (default: 3478, 0 to disable)")
 		c.Flags().IntVar(&flagDERPRegionID, "derp-region-id", 901, "Custom region ID for this DERP relay (default: 901)")
 		c.Flags().StringVar(&flagDERPRegionName, "derp-region-name", "Kizuna Private Relay", "Human-readable region name for this DERP relay")
+
+		c.Flags().BoolVar(&flagSSH, "ssh", true, "Enable inbound SSH tunneling on port 22")
+		c.Flags().BoolVar(&flagNoSSH, "no-ssh", false, "Disable inbound SSH tunneling on this node entirely")
+		c.Flags().StringVar(&flagSSHAllowTags, "ssh-allow-tags", "", "Comma-separated list of allowed caller node tags for SSH (e.g. 'admin,ops')")
+		c.Flags().StringVar(&flagSSHDenyTags, "ssh-deny-tags", "", "Comma-separated list of denied caller node tags for SSH (e.g. 'guest,untrusted')")
+		c.Flags().StringVar(&flagSSHAllowNodes, "ssh-allow-nodes", "", "Comma-separated list of allowed caller node names/IDs for SSH")
+		c.Flags().StringVar(&flagSSHDenyNodes, "ssh-deny-nodes", "", "Comma-separated list of denied caller node names/IDs for SSH")
 	}
 
 	svcCmd.AddCommand(runCmd, installCmd, startCmd, stopCmd, restartCmd, serviceStatusCmd, uninstallCmd)
@@ -520,7 +553,7 @@ func runServer() error {
 	meshGw := mesh.NewMeshGateway()
 	defer func() { _ = meshGw.Close() }()
 
-	// Resolve DERP relay configuration (from CLI flags or kizuna.yaml)
+	// Resolve DERP relay and SSH access control configurations (from CLI flags or kizuna.yaml)
 	var derpCfg *entity.DERPConfig
 	if flagDERP {
 		derpCfg = &entity.DERPConfig{
@@ -531,15 +564,45 @@ func runServer() error {
 			RegionID:   flagDERPRegionID,
 			RegionName: flagDERPRegionName,
 		}
-	} else {
-		cfgPath := flagConfig
-		if cfgPath == "" {
-			cfgPath, _ = config.FindConfigFile()
-		}
-		if cfgPath != "" {
-			if proj, err := config.LoadProject(cfgPath); err == nil && proj != nil && proj.DERP != nil {
+	}
+
+	var projSSH *entity.SSHConfig
+	cfgPath := flagConfig
+	if cfgPath == "" {
+		cfgPath, _ = config.FindConfigFile()
+	}
+	if cfgPath != "" {
+		if proj, err := config.LoadProject(cfgPath); err == nil && proj != nil {
+			if proj.DERP != nil && derpCfg == nil && !flagDERP {
 				derpCfg = proj.DERP
 			}
+			if proj.SSH != nil {
+				projSSH = proj.SSH
+			}
+		}
+	}
+
+	var sshCfg *entity.SSHConfig
+	if flagNoSSH || !flagSSH {
+		enabled := false
+		sshCfg = &entity.SSHConfig{
+			Enabled: &enabled,
+		}
+	} else if flagSSHAllowTags != "" || flagSSHDenyTags != "" || flagSSHAllowNodes != "" || flagSSHDenyNodes != "" {
+		enabled := true
+		sshCfg = &entity.SSHConfig{
+			Enabled:    &enabled,
+			AllowTags:  parseTags(strings.Split(flagSSHAllowTags, ",")),
+			DenyTags:   parseTags(strings.Split(flagSSHDenyTags, ",")),
+			AllowNodes: parseTags(strings.Split(flagSSHAllowNodes, ",")),
+			DenyNodes:  parseTags(strings.Split(flagSSHDenyNodes, ",")),
+		}
+	} else if projSSH != nil {
+		sshCfg = projSSH
+	} else {
+		enabled := true
+		sshCfg = &entity.SSHConfig{
+			Enabled: &enabled,
 		}
 	}
 
@@ -582,6 +645,52 @@ func runServer() error {
 	}
 	nodeID := "node_" + nodeName
 
+	var gossipEng *gossip.Engine
+	var nodeRepo domain.NodeRepository
+
+	peerLookup := func(pubKey string) *entity.Node {
+		cleanKey := strings.TrimPrefix(pubKey, "nodekey:")
+		match := func(n *entity.Node) bool {
+			if n == nil {
+				return false
+			}
+			if n.PublicKey != "" {
+				if strings.EqualFold(strings.TrimPrefix(n.PublicKey, "nodekey:"), cleanKey) {
+					return true
+				}
+			}
+			if n.Addr != "" {
+				nodePub := mesh.ExtractNodePublicKey(n.Addr)
+				if nodePub != "" {
+					n.PublicKey = nodePub
+					if strings.EqualFold(strings.TrimPrefix(nodePub, "nodekey:"), cleanKey) {
+						return true
+					}
+				}
+			}
+			return false
+		}
+
+		if gossipEng != nil {
+			for _, m := range gossipEng.GetMembers() {
+				if match(m) {
+					return m
+				}
+			}
+		}
+		if nodeRepo != nil {
+			if nodes, err := nodeRepo.ListNodes(); err == nil {
+				for _, n := range nodes {
+					if match(n) {
+						return n
+					}
+				}
+			}
+		}
+		return nil
+	}
+	meshGw.SetSSHPolicy(sshCfg, peerLookup)
+
 	apiServer := api.NewServer(authStore, workloadRunner, ingressMgr, backupMgr, nodeID, nodeName)
 
 	addr, err := meshGw.Listen(ctx, 19800, func(conn net.Conn) {
@@ -592,14 +701,14 @@ func runServer() error {
 	}
 
 	// Initialize and launch decentralized Gossip Engine
-	nodeRepo, _ := config.NewNodeRepository("")
+	nodeRepo, _ = config.NewNodeRepository("")
 	var seeds []*entity.Node
 	if nodeRepo != nil {
 		seeds, _ = nodeRepo.ListNodes()
 	}
 
 	gossipTransport := gossip.NewMeshTransport(meshGw)
-	gossipEng := gossip.NewEngine(gossip.Config{
+	gossipEng = gossip.NewEngine(gossip.Config{
 		NodeID:    nodeID,
 		NodeName:  nodeName,
 		MeshAddr:  addr,
@@ -630,9 +739,29 @@ func runServer() error {
 			"mesh_address": addr,
 			"pairing_pin":  pin,
 			"mesh_peers":   len(gossipEng.GetMembers()),
+			"ssh_enabled":  sshCfg.IsEnabled(),
+			"ssh_policy":   sshCfg,
 		})
 	} else {
 		fmt.Println(ui.RenderServerStart(addr, pin))
+		if !sshCfg.IsEnabled() {
+			fmt.Println("  🔒 SSH Access: Disabled (--no-ssh)")
+		} else if len(sshCfg.AllowTags) > 0 || len(sshCfg.DenyTags) > 0 || len(sshCfg.AllowNodes) > 0 || len(sshCfg.DenyNodes) > 0 {
+			var aclParts []string
+			if len(sshCfg.AllowTags) > 0 {
+				aclParts = append(aclParts, fmt.Sprintf("allow_tags=[%s]", strings.Join(sshCfg.AllowTags, ",")))
+			}
+			if len(sshCfg.DenyTags) > 0 {
+				aclParts = append(aclParts, fmt.Sprintf("deny_tags=[%s]", strings.Join(sshCfg.DenyTags, ",")))
+			}
+			if len(sshCfg.AllowNodes) > 0 {
+				aclParts = append(aclParts, fmt.Sprintf("allow_nodes=[%s]", strings.Join(sshCfg.AllowNodes, ",")))
+			}
+			if len(sshCfg.DenyNodes) > 0 {
+				aclParts = append(aclParts, fmt.Sprintf("deny_nodes=[%s]", strings.Join(sshCfg.DenyNodes, ",")))
+			}
+			fmt.Printf("  🔒 SSH Access Policy: %s\n", strings.Join(aclParts, " "))
+		}
 	}
 
 	<-ctx.Done()
@@ -1068,11 +1197,21 @@ Examples:
   kizuna node ssh worker-1 -- uptime
   kizuna node ssh worker-1 -- -L 8080:localhost:8080`,
 		Args: cobra.MinimumNArgs(1),
+		FParseErrWhitelist: cobra.FParseErrWhitelist{
+			UnknownFlags: true,
+		},
 		RunE: func(cmd *cobra.Command, args []string) error {
-			rawTarget := args[0]
+			var rawTarget string
 			var extraArgs []string
-			if len(args) > 1 {
-				extraArgs = args[1:]
+			for _, arg := range args {
+				if rawTarget == "" && !strings.HasPrefix(arg, "-") {
+					rawTarget = arg
+				} else {
+					extraArgs = append(extraArgs, arg)
+				}
+			}
+			if rawTarget == "" {
+				return fmt.Errorf("node target required (e.g. 'kizuna node ssh ubuntu@puffincn')")
 			}
 
 			user := sshUser

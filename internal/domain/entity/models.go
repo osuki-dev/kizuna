@@ -39,6 +39,7 @@ type Project struct {
 	Environments []string            `json:"environments,omitempty"`
 	Services     map[string]*Service `json:"services"`
 	DERP         *DERPConfig         `json:"derp,omitempty" yaml:"derp,omitempty"`
+	SSH          *SSHConfig          `json:"ssh,omitempty" yaml:"ssh,omitempty"`
 }
 
 // Service represents an individual deployable workload
@@ -219,6 +220,24 @@ type Node struct {
 	Load1       float64       `json:"load1,omitempty"`
 	LatencyMs   int64         `json:"latency_ms,omitempty"`
 	DERP        *DERPNodeInfo `json:"derp,omitempty" yaml:"derp,omitempty"`
+	PublicKey   string        `json:"public_key,omitempty" yaml:"public_key,omitempty"` // WireGuard public identity key (e.g. nodekey:xxx)
+}
+
+// SSHConfig defines the SSH access control and tag-based firewall policy for this node
+type SSHConfig struct {
+	Enabled    *bool    `json:"enabled,omitempty" yaml:"enabled,omitempty"`       // Whether SSH tunneling on port 22 is allowed (default true)
+	AllowTags  []string `json:"allow_tags,omitempty" yaml:"allow_tags,omitempty"` // Only caller nodes with at least one matching tag can SSH in
+	DenyTags   []string `json:"deny_tags,omitempty" yaml:"deny_tags,omitempty"`   // Caller nodes with any matching tag are rejected
+	AllowNodes []string `json:"allow_nodes,omitempty" yaml:"allow_nodes,omitempty"` // Specific allowed node names or IDs
+	DenyNodes  []string `json:"deny_nodes,omitempty" yaml:"deny_nodes,omitempty"`   // Specific denied node names or IDs
+}
+
+// IsEnabled reports whether SSH access is enabled (defaults to true if unset)
+func (s *SSHConfig) IsEnabled() bool {
+	if s == nil || s.Enabled == nil {
+		return true
+	}
+	return *s.Enabled
 }
 
 // DERPConfig represents configuration for hosting a private DERP relay
