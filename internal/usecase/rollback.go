@@ -2,150 +2,233 @@ package usecase
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"os"
 	"path/filepath"
-	"time"
+	"sort"
+	"strings"
+	"sync"
 
 	"github.com/osuki-dev/kizuna/internal/domain/entity"
 	"github.com/osuki-dev/kizuna/internal/infrastructure/i18n"
 )
 
-// RollbackUseCase handles one-click rollback to the previous healthy revision
+// RollbackUseCase restores a recorded application configuration and immutable image.
+// It does not restore databases, volumes, or mutable build artifacts.
 type RollbackUseCase struct {
 	deployUC *DeployUseCase
 	baseDir  string
 }
 
-// NewRollbackUseCase initializes RollbackUseCase
 func NewRollbackUseCase(deployUC *DeployUseCase, baseDir string) *RollbackUseCase {
 	if baseDir == "" {
-		home, _ := os.UserHomeDir()
-		baseDir = filepath.Join(home, ".kizuna", "releases")
+		baseDir = deployUC.releaseDir
 	}
-	_ = os.MkdirAll(baseDir, 0755)
-	return &RollbackUseCase{
-		deployUC: deployUC,
-		baseDir:  baseDir,
-	}
+	return &RollbackUseCase{deployUC: deployUC, baseDir: baseDir}
 }
 
-// RecordRelease appends a new release record to the service history
-func RecordRelease(baseDir string, rec *entity.ReleaseRecord) error {
-	if baseDir == "" {
-		home, _ := os.UserHomeDir()
-		baseDir = filepath.Join(home, ".kizuna", "releases")
-	}
-	svcDir := filepath.Join(baseDir, rec.ServiceName)
-	_ = os.MkdirAll(svcDir, 0755)
-	historyFile := filepath.Join(svcDir, "history.json")
+var releaseMu sync.Mutex
 
-	var history []*entity.ReleaseRecord
-	if data, err := os.ReadFile(historyFile); err == nil {
-		_ = json.Unmarshal(data, &history)
-	}
-
-	history = append(history, rec)
-	// Keep up to 20 releases
-	if len(history) > 20 {
-		history = history[len(history)-20:]
-	}
-
-	data, err := json.MarshalIndent(history, "", "  ")
-	if err != nil {
-		return err
-	}
-	return os.WriteFile(historyFile, data, 0644)
+type storedRelease struct {
+	*entity.ReleaseRecord
+	Service *entity.Service `json:"service,omitempty"`
 }
 
-// GetReleaseHistory returns release records for a service (newest first)
-func GetReleaseHistory(baseDir, svcName string) ([]*entity.ReleaseRecord, error) {
-	if baseDir == "" {
-		home, _ := os.UserHomeDir()
-		baseDir = filepath.Join(home, ".kizuna", "releases")
+func releaseBase(baseDir string) (string, error) {
+	if baseDir != "" {
+		return baseDir, nil
 	}
-	historyFile := filepath.Join(baseDir, svcName, "history.json")
-	data, err := os.ReadFile(historyFile)
+	home, err := os.UserHomeDir()
 	if err != nil {
-		return nil, fmt.Errorf("no release history found for service '%s'", svcName)
+		return "", err
 	}
+	return filepath.Join(home, ".kizuna", "releases"), nil
+}
 
-	var history []*entity.ReleaseRecord
-	if err := json.Unmarshal(data, &history); err != nil {
+func historyPath(baseDir, key string) (string, error) {
+	base, err := releaseBase(baseDir)
+	if err != nil {
+		return "", err
+	}
+	// Hash even legacy keys: service names must never become filesystem paths.
+	sum := sha256.Sum256([]byte(key))
+	return filepath.Join(base, hex.EncodeToString(sum[:]), "history.json"), nil
+}
+
+func projectReleaseKey(project *entity.Project, svc *entity.Service) string {
+	targets := serviceTargets(project, svc)
+	for i, target := range targets {
+		host := entity.ParseTargetHost(target)
+		targets[i] = fmt.Sprintf("%s:%s:%s:%d", host.Type, host.User, host.Host, host.Port)
+	}
+	sort.Strings(targets)
+	key, _ := json.Marshal([]any{project.Name, project.ActiveEnv, targets, svc.Name})
+	return string(key)
+}
+
+func cloneService(svc *entity.Service) (*entity.Service, error) {
+	data, err := json.Marshal(svc)
+	if err != nil {
 		return nil, err
 	}
+	var clone entity.Service
+	if err := json.Unmarshal(data, &clone); err != nil {
+		return nil, err
+	}
+	return &clone, nil
+}
 
-	// Reverse to newest first
-	n := len(history)
-	for i := 0; i < n/2; i++ {
-		history[i], history[n-1-i] = history[n-1-i], history[i]
+func readHistory(baseDir, key string) ([]*storedRelease, error) {
+	path, err := historyPath(baseDir, key)
+	if err != nil {
+		return nil, err
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, err
+	}
+	var history []*storedRelease
+	if err := json.Unmarshal(data, &history); err != nil {
+		return nil, fmt.Errorf("invalid release history: %w", err)
+	}
+	for _, rec := range history {
+		if rec == nil || rec.ReleaseRecord == nil {
+			return nil, fmt.Errorf("invalid release history entry")
+		}
 	}
 	return history, nil
 }
 
-// Execute rolls back the given service to its previous release
+func appendRelease(baseDir, key string, rec *storedRelease) error {
+	releaseMu.Lock()
+	defer releaseMu.Unlock()
+	path, err := historyPath(baseDir, key)
+	if err != nil {
+		return err
+	}
+	history, err := readHistory(baseDir, key)
+	if err != nil && !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+	history = append(history, rec)
+	if len(history) > 20 {
+		history = history[len(history)-20:]
+	}
+	data, err := json.MarshalIndent(history, "", "  ")
+	if err != nil {
+		return err
+	}
+	if err := os.MkdirAll(filepath.Dir(path), 0700); err != nil {
+		return err
+	}
+	file, err := os.CreateTemp(filepath.Dir(path), ".history-*")
+	if err != nil {
+		return err
+	}
+	defer func() { _ = os.Remove(file.Name()) }()
+	if _, err := file.Write(data); err != nil {
+		return errors.Join(err, file.Close())
+	}
+	if err := file.Sync(); err != nil {
+		return errors.Join(err, file.Close())
+	}
+	if err := file.Close(); err != nil {
+		return err
+	}
+	return os.Rename(file.Name(), path)
+}
+
+// RecordRelease records legacy unscoped history. Unscoped records are never used
+// for rollback because their project, environment and target cannot be verified.
+func RecordRelease(baseDir string, rec *entity.ReleaseRecord) error {
+	if rec == nil {
+		return fmt.Errorf("release record is required")
+	}
+	return appendRelease(baseDir, rec.ServiceName, &storedRelease{ReleaseRecord: rec})
+}
+
+func recordProjectRelease(baseDir string, project *entity.Project, svc *entity.Service, rec *entity.ReleaseRecord) error {
+	snapshot, err := cloneService(svc)
+	if err != nil {
+		return err
+	}
+	return appendRelease(baseDir, projectReleaseKey(project, svc), &storedRelease{ReleaseRecord: rec, Service: snapshot})
+}
+
+// GetReleaseHistory returns legacy unscoped release records, newest first.
+func GetReleaseHistory(baseDir, svcName string) ([]*entity.ReleaseRecord, error) {
+	history, err := readHistory(baseDir, svcName)
+	if err != nil {
+		return nil, err
+	}
+	result := make([]*entity.ReleaseRecord, len(history))
+	for i, rec := range history {
+		result[len(history)-1-i] = rec.ReleaseRecord
+	}
+	return result, nil
+}
+
+func ingressIdentity(svc *entity.Service) string {
+	if svc.Ingress == nil || svc.Ingress.Provider == "" || svc.Ingress.Provider == "none" || svc.Ingress.Domain == "" {
+		return ""
+	}
+	return svc.Ingress.Provider + ":" + svc.Ingress.Domain
+}
+
 func (uc *RollbackUseCase) Execute(ctx context.Context, project *entity.Project, serviceName string, logWriter io.Writer) (*entity.ReleaseRecord, error) {
 	if logWriter == nil {
 		logWriter = os.Stdout
 	}
-
 	svc, ok := project.Services[serviceName]
 	if !ok {
-		if len(project.Services) == 1 {
-			for _, s := range project.Services {
-				svc = s
-				serviceName = s.Name
-				break
-			}
-		} else {
-			return nil, fmt.Errorf("service '%s' not found in configuration", serviceName)
-		}
+		return nil, fmt.Errorf("service %q not found in configuration", serviceName)
 	}
-
-	history, err := GetReleaseHistory(uc.baseDir, serviceName)
-	if err != nil || len(history) < 2 {
-		return nil, fmt.Errorf("no previous revision available to rollback for service '%s'", serviceName)
+	history, err := readHistory(uc.baseDir, projectReleaseKey(project, svc))
+	if err != nil {
+		return nil, fmt.Errorf("read scoped release history: %w", err)
 	}
-
-	currentRev := history[0]
-	targetRev := history[1]
-
-	_, _ = fmt.Fprintln(logWriter, i18n.T("rollback_starting", serviceName, currentRev.Revision, targetRev.Revision))
-
-	// Revert service attributes to previous revision
-	if targetRev.Image != "" {
-		svc.Image = targetRev.Image
+	if len(history) < 2 {
+		return nil, fmt.Errorf("no previous revision available for service %q", serviceName)
 	}
-	if len(targetRev.Ports) > 0 {
-		svc.Ports = targetRev.Ports
+	current, target := history[len(history)-1], history[len(history)-2]
+	if target.Service == nil {
+		return nil, fmt.Errorf("release has no complete service snapshot; rollback is unsafe")
 	}
-	if targetRev.Replicas > 0 {
-		svc.Replicas = targetRev.Replicas
-	}
-	if svc.Ingress != nil && len(targetRev.Upstreams) > 0 {
-		svc.Ingress.Upstreams = targetRev.Upstreams
-	}
-
-	// Deploy restored revision
-	if err := uc.deployUC.Execute(ctx, project, serviceName, logWriter); err != nil {
-		_, _ = fmt.Fprintln(logWriter, i18n.T("rollback_failed", serviceName, err))
+	restored, err := cloneService(target.Service)
+	if err != nil {
 		return nil, err
 	}
-
-	// Record the rollback as a new release event
-	newRec := &entity.ReleaseRecord{
-		Revision:    fmt.Sprintf("rollback-to-%s", targetRev.Revision),
-		ServiceName: serviceName,
-		Image:       svc.Image,
-		Ports:       svc.Ports,
-		Replicas:    svc.Replicas,
-		Upstreams:   targetRev.Upstreams,
-		CreatedAt:   time.Now(),
+	if restored.Type != entity.TypeDocker || (!strings.HasPrefix(restored.Image, "sha256:") && !strings.Contains(restored.Image, "@sha256:")) {
+		return nil, fmt.Errorf("rollback requires a recorded immutable Docker image; Compose, process and mutable artifact rollback are unsupported")
 	}
-	_ = RecordRelease(uc.baseDir, newRec)
-
-	_, _ = fmt.Fprintln(logWriter, i18n.T("rollback_success", serviceName, targetRev.Revision))
-	return targetRev, nil
+	if len(serviceTargets(project, restored)) > 1 && restored.Dockerfile != "" {
+		return nil, fmt.Errorf("multi-target build rollback requires per-target immutable artifact records")
+	}
+	if ingressIdentity(svc) != ingressIdentity(restored) {
+		return nil, fmt.Errorf("rollback changes the ingress domain or enables/disables ingress; migrate the current route manually before rollback")
+	}
+	// Do not rerun a local build or rebuild changed Dockerfile sources.
+	restored.Build = nil
+	restored.Dockerfile = ""
+	_, _ = fmt.Fprintln(logWriter, i18n.T("rollback_starting", serviceName, current.Revision, target.Revision))
+	copiedProject := *project
+	copiedProject.Services = make(map[string]*entity.Service, len(project.Services))
+	for name, service := range project.Services {
+		copiedProject.Services[name] = service
+	}
+	copiedProject.Services[serviceName] = restored
+	// Record exactly once in the same history directory as rollback's lookup.
+	deploy := *uc.deployUC
+	deploy.releaseDir = uc.baseDir
+	if err := deploy.Execute(ctx, &copiedProject, serviceName, logWriter); err != nil {
+		return nil, fmt.Errorf("rollback failed: %w", err)
+	}
+	project.Services[serviceName] = restored
+	_, _ = fmt.Fprintln(logWriter, i18n.T("rollback_success", serviceName, target.Revision))
+	return target.ReleaseRecord, nil
 }

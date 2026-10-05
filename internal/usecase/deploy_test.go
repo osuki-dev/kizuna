@@ -14,8 +14,8 @@ import (
 )
 
 type mockStrategy struct {
-	mu           sync.Mutex
-	proto        entity.TargetType
+	mu            sync.Mutex
+	proto         entity.TargetType
 	deployedHosts []string
 }
 
@@ -53,7 +53,7 @@ func (r *mockStrategyResolver) GetStrategy(target *entity.TargetHost) (domain.Ta
 }
 
 type mockIngressManager struct {
-	mu            sync.Mutex
+	mu             sync.Mutex
 	lastConfigured *entity.IngressConfig
 }
 
@@ -76,7 +76,7 @@ func TestDeployUseCase_ScaleOut(t *testing.T) {
 	mockStrat := &mockStrategy{proto: entity.TargetTypeSSH}
 	mockIngress := &mockIngressManager{}
 
-	uc := usecase.NewDeployUseCase(nil, nil).
+	uc := usecase.NewDeployUseCase(nil, nil).WithReleaseDirectory(t.TempDir()).
 		WithStrategyResolver(&mockStrategyResolver{strat: mockStrat}).
 		WithIngressManager(mockIngress)
 
@@ -140,7 +140,7 @@ func TestDeployUseCase_SingleTarget(t *testing.T) {
 	mockStrat := &mockStrategy{proto: entity.TargetTypeSSH}
 	mockIngress := &mockIngressManager{}
 
-	uc := usecase.NewDeployUseCase(nil, nil).
+	uc := usecase.NewDeployUseCase(nil, nil).WithReleaseDirectory(t.TempDir()).
 		WithStrategyResolver(&mockStrategyResolver{strat: mockStrat}).
 		WithIngressManager(mockIngress)
 
@@ -190,7 +190,7 @@ func TestScaleUseCase(t *testing.T) {
 	mockStrat := &mockStrategy{proto: entity.TargetTypeLocal}
 	mockIngress := &mockIngressManager{}
 
-	deployUC := usecase.NewDeployUseCase(nil, nil).
+	deployUC := usecase.NewDeployUseCase(nil, nil).WithReleaseDirectory(t.TempDir()).
 		WithStrategyResolver(&mockStrategyResolver{strat: mockStrat}).
 		WithIngressManager(mockIngress)
 
@@ -230,43 +230,28 @@ func TestRollbackUseCase(t *testing.T) {
 	mockStrat := &mockStrategy{proto: entity.TargetTypeLocal}
 	mockIngress := &mockIngressManager{}
 
-	deployUC := usecase.NewDeployUseCase(nil, nil).
+	deployUC := usecase.NewDeployUseCase(nil, nil).WithReleaseDirectory(t.TempDir()).
 		WithStrategyResolver(&mockStrategyResolver{strat: mockStrat}).
 		WithIngressManager(mockIngress)
 
 	rollbackUC := usecase.NewRollbackUseCase(deployUC, tmpDir)
 
-	// Record two revisions
-	rec1 := &entity.ReleaseRecord{
-		Revision:    "rev-1",
-		ServiceName: "web",
-		Image:       "app:v1.0",
-		Ports:       []string{"3000:3000"},
-		Replicas:    1,
-		CreatedAt:   time.Now().Add(-10 * time.Minute),
-	}
-	_ = usecase.RecordRelease(tmpDir, rec1)
-
-	rec2 := &entity.ReleaseRecord{
-		Revision:    "rev-2",
-		ServiceName: "web",
-		Image:       "app:v2.0-broken",
-		Ports:       []string{"3000:3000"},
-		Replicas:    1,
-		CreatedAt:   time.Now(),
-	}
-	_ = usecase.RecordRelease(tmpDir, rec2)
-
 	project := &entity.Project{
 		Name:    "rollback-app",
 		Targets: []string{"localhost"},
 		Services: map[string]*entity.Service{
-			"web": {
-				Name:  "web",
-				Type:  entity.TypeDocker,
-				Image: "app:v2.0-broken",
-			},
+			"web": {Name: "web", Type: entity.TypeDocker, Image: "sha256:aaa", Ports: []string{"3000:3000"}, Env: map[string]string{"VERSION": "one"}},
 		},
+	}
+	deployUC.WithReleaseDirectory(tmpDir)
+	if err := deployUC.Execute(context.Background(), project, "web", io.Discard); err != nil {
+		t.Fatal(err)
+	}
+	project.Services["web"].Image = "sha256:bbb"
+	project.Services["web"].Ports = nil
+	project.Services["web"].Env = map[string]string{"VERSION": "two"}
+	if err := deployUC.Execute(context.Background(), project, "web", io.Discard); err != nil {
+		t.Fatal(err)
 	}
 
 	var logBuf bytes.Buffer
@@ -275,10 +260,10 @@ func TestRollbackUseCase(t *testing.T) {
 		t.Fatalf("unexpected rollback error: %v", err)
 	}
 
-	if rolledBack.Revision != "rev-1" {
-		t.Errorf("expected rollback to rev-1, got %s", rolledBack.Revision)
+	if rolledBack.Image != "sha256:aaa" {
+		t.Errorf("wrong restored record: %#v", rolledBack)
 	}
-	if project.Services["web"].Image != "app:v1.0" {
-		t.Errorf("expected restored image app:v1.0, got %s", project.Services["web"].Image)
+	if project.Services["web"].Image != "sha256:aaa" || project.Services["web"].Env["VERSION"] != "one" || len(project.Services["web"].Ports) != 1 {
+		t.Errorf("incomplete restored snapshot: %#v", project.Services["web"])
 	}
 }

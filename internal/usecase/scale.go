@@ -33,17 +33,19 @@ func (uc *ScaleUseCase) Execute(ctx context.Context, project *entity.Project, se
 
 	svc, ok := project.Services[serviceName]
 	if !ok {
-		// If project has only 1 service, default to that service
-		if len(project.Services) == 1 {
-			for _, s := range project.Services {
-				svc = s
-				serviceName = s.Name
-				break
-			}
-		} else {
-			return fmt.Errorf("service '%s' not found in configuration", serviceName)
-		}
+		return fmt.Errorf("service %q not found in configuration", serviceName)
 	}
+	original := svc
+	svc, err := cloneService(svc)
+	if err != nil {
+		return err
+	}
+	copiedProject := *project
+	copiedProject.Services = make(map[string]*entity.Service, len(project.Services))
+	for name, service := range project.Services {
+		copiedProject.Services[name] = service
+	}
+	copiedProject.Services[serviceName] = svc
 
 	_, _ = fmt.Fprintln(logWriter, i18n.T("scale_starting", serviceName, replicas))
 
@@ -51,11 +53,12 @@ func (uc *ScaleUseCase) Execute(ctx context.Context, project *entity.Project, se
 	svc.Replicas = replicas
 
 	// Execute deployment with updated replicas
-	if err := uc.deployUC.Execute(ctx, project, serviceName, logWriter); err != nil {
+	if err := uc.deployUC.Execute(ctx, &copiedProject, serviceName, logWriter); err != nil {
 		_, _ = fmt.Fprintln(logWriter, i18n.T("scale_failed", serviceName, err))
 		return err
 	}
 
+	*original = *svc
 	upstreamsStr := "-"
 	if svc.Ingress != nil && len(svc.Ingress.Upstreams) > 0 {
 		upstreamsStr = strings.Join(svc.Ingress.Upstreams, ", ")

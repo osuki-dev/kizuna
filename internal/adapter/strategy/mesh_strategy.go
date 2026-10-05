@@ -72,8 +72,7 @@ func (s *MeshStrategy) Deploy(ctx context.Context, target *entity.TargetHost, sv
 
 // Stop stops the service on the mesh node
 func (s *MeshStrategy) Stop(ctx context.Context, target *entity.TargetHost, serviceName string) error {
-	// Mesh agent RPC stop can be executed via client or deploy update
-	return nil
+	return fmt.Errorf("mesh stop is not supported by this client")
 }
 
 // GetStatus checks service status on mesh node
@@ -107,9 +106,7 @@ func (s *MeshStrategy) resolveNode(target *entity.TargetHost) (*entity.Node, err
 					return n, nil
 				}
 			}
-			if target.Host == "" || target.Host == "default" {
-				return nodes[0], nil
-			}
+
 		}
 	}
 
@@ -117,11 +114,5 @@ func (s *MeshStrategy) resolveNode(target *entity.TargetHost) (*entity.Node, err
 		return nil, fmt.Errorf("no mesh nodes available")
 	}
 
-	// Ad-hoc node
-	return &entity.Node{
-		Name:      target.Host,
-		Addr:      target.Host,
-		AuthToken: "kzn_adhoc",
-		IsOnline:  true,
-	}, nil
+	return nil, fmt.Errorf("%w: %s", domain.ErrNodeNotFound, target.Host)
 }
