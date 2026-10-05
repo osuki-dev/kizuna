@@ -1,7 +1,9 @@
 package config
 
 import (
+	"bytes"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"sort"
@@ -13,17 +15,18 @@ import (
 
 // RawConfig represents the YAML structure supporting monorepo, single-project, and multi-environment
 type RawConfig struct {
-	Version      string                                `yaml:"version"`
-	Name         string                                `yaml:"name"`
-	Target       string                                `yaml:"target,omitempty"`
-	Targets      []string                              `yaml:"targets,omitempty"`
-	Theme        string                                `yaml:"theme,omitempty"`
-	CustomTheme  *entity.Theme                         `yaml:"custom_theme,omitempty"`
-	Services     map[string]*RawServiceConfig          `yaml:"services,omitempty"`
-	Environments map[string]*entity.EnvironmentConfig  `yaml:"environments,omitempty"`
-	DERP         *entity.DERPConfig                    `yaml:"derp,omitempty"`
-	SSH          *entity.SSHConfig                     `yaml:"ssh,omitempty"`
-	Mesh         *entity.MeshConfig                    `yaml:"mesh,omitempty"`
+	Compose      *entity.ComposeConfig                `yaml:"compose,omitempty"`
+	Version      string                               `yaml:"version"`
+	Name         string                               `yaml:"name"`
+	Target       string                               `yaml:"target,omitempty"`
+	Targets      []string                             `yaml:"targets,omitempty"`
+	Theme        string                               `yaml:"theme,omitempty"`
+	CustomTheme  *entity.Theme                        `yaml:"custom_theme,omitempty"`
+	Services     map[string]*RawServiceConfig         `yaml:"services,omitempty"`
+	Environments map[string]*entity.EnvironmentConfig `yaml:"environments,omitempty"`
+	DERP         *entity.DERPConfig                   `yaml:"derp,omitempty"`
+	SSH          *entity.SSHConfig                    `yaml:"ssh,omitempty"`
+	Mesh         *entity.MeshConfig                   `yaml:"mesh,omitempty"`
 
 	// Shorthand fields for single-service projects
 	Type        string                `yaml:"type,omitempty"`
@@ -43,6 +46,8 @@ type RawConfig struct {
 
 // RawServiceConfig defines YAML service configuration
 type RawServiceConfig struct {
+	Target      string                `yaml:"target,omitempty"`
+	Compose     *entity.ComposeConfig `yaml:"compose,omitempty"`
 	Type        string                `yaml:"type"`
 	Root        string                `yaml:"root,omitempty"`
 	Dockerfile  string                `yaml:"dockerfile,omitempty"`
@@ -87,18 +92,57 @@ func LoadProject(filePath string) (*entity.Project, error) {
 
 // LoadProjectWithEnv parses kizuna.yaml and applies specific environment overrides (dev, staging, prod, etc.)
 func LoadProjectWithEnv(filePath string, envName string) (*entity.Project, error) {
+	filePath, err := filepath.Abs(filePath)
+	if err != nil {
+		return nil, fmt.Errorf("resolve config path: %w", err)
+	}
 	data, err := os.ReadFile(filePath)
 	if err != nil {
 		return nil, fmt.Errorf("failed to read config: %w", err)
 	}
 
 	var raw RawConfig
-	if err := yaml.Unmarshal(data, &raw); err != nil {
+	decoder := yaml.NewDecoder(bytes.NewReader(data))
+	decoder.KnownFields(true)
+	if err := decoder.Decode(&raw); err != nil {
 		return nil, fmt.Errorf("failed to parse yaml: %w", err)
 	}
 
+	var extra any
+	if err := decoder.Decode(&extra); err != io.EOF {
+		return nil, fmt.Errorf("configuration must contain exactly one YAML document")
+	}
+	for name, svc := range raw.Services {
+		if svc == nil {
+			return nil, fmt.Errorf("service %q cannot be null", name)
+		}
+	}
+	for name, env := range raw.Environments {
+		if env == nil {
+			return nil, fmt.Errorf("environment %q cannot be null", name)
+		}
+		for serviceName, override := range env.Services {
+			_, ok := raw.Services[serviceName]
+			shorthandName := raw.Name
+			if shorthandName == "" {
+				shorthandName = "app"
+			}
+			if !ok && (len(raw.Services) != 0 || serviceName != shorthandName) {
+				return nil, fmt.Errorf("environment %q references unknown service %q", name, serviceName)
+			}
+			if override == nil {
+				return nil, fmt.Errorf("environment %q service %q cannot be null", name, serviceName)
+			}
+		}
+	}
 	if envName == "" {
 		envName = os.Getenv("KIZUNA_ENV")
+	}
+
+	if envName != "" {
+		if _, ok := raw.Environments[envName]; !ok {
+			return nil, fmt.Errorf("unknown environment %q", envName)
+		}
 	}
 
 	var envList []string
@@ -141,9 +185,9 @@ func LoadProjectWithEnv(filePath string, envName string) (*entity.Project, error
 		}
 		svcType := entity.ServiceType(s.Type)
 		if svcType == "" {
-			if s.ComposeFile != "" {
+			if s.ComposeFile != "" || s.Compose != nil {
 				svcType = entity.TypeCompose
-			} else if s.Dockerfile != "" {
+			} else if s.Dockerfile != "" || s.Image != "" {
 				svcType = entity.TypeDocker
 			} else {
 				svcType = entity.TypeProcess
@@ -152,6 +196,8 @@ func LoadProjectWithEnv(filePath string, envName string) (*entity.Project, error
 
 		project.Services[name] = &entity.Service{
 			Name:        name,
+			Target:      s.Target,
+			Compose:     s.Compose,
 			Type:        svcType,
 			Root:        root,
 			Dockerfile:  s.Dockerfile,
@@ -171,16 +217,16 @@ func LoadProjectWithEnv(filePath string, envName string) (*entity.Project, error
 	}
 
 	// 2. Process shorthand single-service config if services map was empty
-	if len(project.Services) == 0 && (raw.Type != "" || raw.Dockerfile != "" || raw.ComposeFile != "" || raw.Build != nil || raw.Deploy != nil || raw.Image != "") {
+	if len(project.Services) == 0 && (raw.Type != "" || raw.Dockerfile != "" || raw.ComposeFile != "" || raw.Compose != nil || raw.Build != nil || raw.Deploy != nil || raw.Image != "") {
 		name := raw.Name
 		if name == "" {
 			name = "app"
 		}
 		svcType := entity.ServiceType(raw.Type)
 		if svcType == "" {
-			if raw.ComposeFile != "" {
+			if raw.ComposeFile != "" || raw.Compose != nil {
 				svcType = entity.TypeCompose
-			} else if raw.Dockerfile != "" {
+			} else if raw.Dockerfile != "" || raw.Image != "" {
 				svcType = entity.TypeDocker
 			} else {
 				svcType = entity.TypeProcess
@@ -189,6 +235,7 @@ func LoadProjectWithEnv(filePath string, envName string) (*entity.Project, error
 
 		project.Services[name] = &entity.Service{
 			Name:        name,
+			Compose:     raw.Compose,
 			Type:        svcType,
 			Root:        raw.Root,
 			Dockerfile:  raw.Dockerfile,
@@ -214,6 +261,12 @@ func LoadProjectWithEnv(filePath string, envName string) (*entity.Project, error
 		}
 	}
 
+	for _, svc := range project.Services {
+		if !filepath.IsAbs(svc.Root) {
+			svc.Root = filepath.Join(filepath.Dir(filePath), svc.Root)
+		}
+		svc.Root = filepath.Clean(svc.Root)
+	}
 	return project, nil
 }
 
@@ -237,6 +290,9 @@ func applyEnvOverrides(project *entity.Project, envCfg *entity.EnvironmentConfig
 	// For shorthand/single-service project
 	if len(project.Services) == 1 {
 		for _, svc := range project.Services {
+			if envCfg.Compose != nil {
+				svc.Compose = envCfg.Compose
+			}
 			if len(envCfg.Ports) > 0 {
 				svc.Ports = envCfg.Ports
 			}
@@ -260,7 +316,7 @@ func applyEnvOverrides(project *entity.Project, envCfg *entity.EnvironmentConfig
 			if envCfg.Backup != nil {
 				svc.Backup = envCfg.Backup
 			}
-			if envCfg.Replicas > 0 {
+			if envCfg.Replicas != 0 {
 				svc.Replicas = envCfg.Replicas
 			}
 			if envCfg.Logging != nil {
@@ -272,6 +328,12 @@ func applyEnvOverrides(project *entity.Project, envCfg *entity.EnvironmentConfig
 	// For multi-service projects with specific service overrides
 	for sName, sOverride := range envCfg.Services {
 		if svc, ok := project.Services[sName]; ok && sOverride != nil {
+			if sOverride.Target != "" {
+				svc.Target = sOverride.Target
+			}
+			if sOverride.Compose != nil {
+				svc.Compose = sOverride.Compose
+			}
 			if len(sOverride.Ports) > 0 {
 				svc.Ports = sOverride.Ports
 			}
@@ -295,7 +357,7 @@ func applyEnvOverrides(project *entity.Project, envCfg *entity.EnvironmentConfig
 			if sOverride.Backup != nil {
 				svc.Backup = sOverride.Backup
 			}
-			if sOverride.Replicas > 0 {
+			if sOverride.Replicas != 0 {
 				svc.Replicas = sOverride.Replicas
 			}
 			if sOverride.Logging != nil {
