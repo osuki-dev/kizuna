@@ -9,6 +9,7 @@ import (
 	"mime/multipart"
 	"net"
 	"net/http"
+	"net/url"
 	"strings"
 
 	"github.com/osuki-dev/kizuna/internal/domain"
@@ -112,6 +113,15 @@ func (c *MeshClient) DeployService(ctx context.Context, node *entity.Node, svc *
 		return fmt.Errorf("agent error (status %d): %s", resp.StatusCode, strings.TrimSpace(string(respBody)))
 	}
 
+	var result struct {
+		Image string `json:"image"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		return fmt.Errorf("decode deployment result: %w", err)
+	}
+	if result.Image != "" {
+		svc.Image = result.Image
+	}
 	return nil
 }
 
@@ -156,6 +166,10 @@ func (c *MeshClient) GetStatus(ctx context.Context, node *entity.Node) (*entity.
 	}
 	defer func() { _ = resp.Body.Close() }()
 
+	if resp.StatusCode != http.StatusOK {
+		return nil, nil, fmt.Errorf("status request failed (HTTP %d)", resp.StatusCode)
+	}
+
 	var data struct {
 		Node     entity.Node       `json:"node"`
 		Services []*entity.Service `json:"services"`
@@ -171,7 +185,7 @@ func (c *MeshClient) GetStatus(ctx context.Context, node *entity.Node) (*entity.
 func (c *MeshClient) StreamLogs(ctx context.Context, node *entity.Node, serviceName string, writer io.Writer) error {
 	client := c.getHTTPClient(ctx, node.Addr, 19800)
 
-	url := fmt.Sprintf("http://node/api/v1/logs?service=%s", serviceName)
+	url := fmt.Sprintf("http://node/api/v1/logs?service=%s", url.QueryEscape(serviceName))
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
 		return err
@@ -184,6 +198,9 @@ func (c *MeshClient) StreamLogs(ctx context.Context, node *entity.Node, serviceN
 	}
 	defer func() { _ = resp.Body.Close() }()
 
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("logs request failed (HTTP %d)", resp.StatusCode)
+	}
 	_, err = io.Copy(writer, resp.Body)
 	return err
 }

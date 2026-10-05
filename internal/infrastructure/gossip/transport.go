@@ -21,7 +21,8 @@ type Transport interface {
 
 // MeshTransport implements Transport using Kizuna's MeshGateway (Tailcat / TCP)
 type MeshTransport struct {
-	mesh domain.MeshGateway
+	mesh  domain.MeshGateway
+	token string
 }
 
 // NewMeshTransport creates a new MeshTransport
@@ -29,8 +30,14 @@ func NewMeshTransport(mesh domain.MeshGateway) *MeshTransport {
 	return &MeshTransport{mesh: mesh}
 }
 
+// SetAuthToken configures the shared gossip authentication token before starting the engine.
+func (t *MeshTransport) SetAuthToken(token string) { t.token = token }
+
 // SendMessage sends an HTTP POST request carrying the GossipMessage envelope to the target node
 func (t *MeshTransport) SendMessage(ctx context.Context, targetAddr string, port uint16, msg *entity.GossipMessage) (*entity.GossipMessage, error) {
+	if t.token == "" {
+		return nil, fmt.Errorf("gossip authentication token is not configured")
+	}
 	if port == 0 {
 		port = 19800
 	}
@@ -63,6 +70,7 @@ func (t *MeshTransport) SendMessage(ctx context.Context, targetAddr string, port
 		return nil, err
 	}
 	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer "+t.token)
 
 	resp, err := httpClient.Do(req)
 	if err != nil {
