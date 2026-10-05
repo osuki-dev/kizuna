@@ -14,7 +14,6 @@ import (
 	"path/filepath"
 	"runtime"
 	"sort"
-	"strconv"
 	"strings"
 	"sync"
 	"syscall"
@@ -37,6 +36,7 @@ import (
 	"github.com/osuki-dev/kizuna/internal/infrastructure/ingress"
 	"github.com/osuki-dev/kizuna/internal/infrastructure/mesh"
 	"github.com/osuki-dev/kizuna/internal/infrastructure/service"
+	sshinfra "github.com/osuki-dev/kizuna/internal/infrastructure/ssh"
 	"github.com/osuki-dev/kizuna/internal/infrastructure/telemetry"
 	"github.com/osuki-dev/kizuna/internal/infrastructure/updater"
 	"github.com/osuki-dev/kizuna/internal/infrastructure/workload"
@@ -707,6 +707,8 @@ func runServer() error {
 	}
 
 	apiServer := api.NewServer(authStore, workloadRunner, ingressMgr, backupMgr, nodeID, nodeName)
+	gossipToken := os.Getenv("KIZUNA_GOSSIP_TOKEN")
+	apiServer.SetGossipToken(gossipToken)
 
 	meshPort := gossip.DefaultPort
 	var meshInterval time.Duration
@@ -727,6 +729,7 @@ func runServer() error {
 
 	// Initialize and launch decentralized Gossip Engine
 	gossipTransport := gossip.NewMeshTransport(meshGw)
+	gossipTransport.SetAuthToken(gossipToken)
 	gossipEng = gossip.NewEngine(gossip.Config{
 		NodeID:    nodeID,
 		NodeName:  nodeName,
@@ -856,7 +859,7 @@ func newNodeCmd() *cobra.Command {
 			// Notify running daemon if active
 			clientHTTP := &http.Client{Timeout: 1200 * time.Millisecond}
 			if reqBody, err := json.Marshal(node); err == nil {
-				if resp, err := clientHTTP.Post("http://127.0.0.1:19800/api/v1/node/add", "application/json", bytes.NewReader(reqBody)); err == nil {
+				if resp, err := localDaemonRequest(cmd.Context(), clientHTTP, http.MethodPost, "/api/v1/node/add", bytes.NewReader(reqBody)); err == nil {
 					_ = resp.Body.Close()
 				}
 			}
@@ -864,7 +867,7 @@ func newNodeCmd() *cobra.Command {
 			if flagJSON {
 				return presenter.PrintJSON(os.Stdout, map[string]any{
 					"success": true,
-					"node":    node,
+					"node":    api.PublicNode(node),
 				})
 			}
 
@@ -915,7 +918,7 @@ func newNodeCmd() *cobra.Command {
 			// Notify running daemon to drop from memory & active gossip
 			clientHTTP := &http.Client{Timeout: 1500 * time.Millisecond}
 			reqBody, _ := json.Marshal(map[string]string{"name": realName, "id": id})
-			if resp, err := clientHTTP.Post("http://127.0.0.1:19800/api/v1/node/remove", "application/json", bytes.NewReader(reqBody)); err == nil {
+			if resp, err := localDaemonRequest(cmd.Context(), clientHTTP, http.MethodPost, "/api/v1/node/remove", bytes.NewReader(reqBody)); err == nil {
 				_ = resp.Body.Close()
 			}
 
@@ -1022,7 +1025,7 @@ func newNodeCmd() *cobra.Command {
 			// Notify running daemon if active
 			clientHTTP := &http.Client{Timeout: 1200 * time.Millisecond}
 			if reqBody, err := json.Marshal(node); err == nil {
-				if resp, err := clientHTTP.Post("http://127.0.0.1:19800/api/v1/node/add", "application/json", bytes.NewReader(reqBody)); err == nil {
+				if resp, err := localDaemonRequest(cmd.Context(), clientHTTP, http.MethodPost, "/api/v1/node/add", bytes.NewReader(reqBody)); err == nil {
 					_ = resp.Body.Close()
 				}
 			}
@@ -1103,7 +1106,7 @@ func newNodeCmd() *cobra.Command {
 			// Notify running daemon if active
 			clientHTTP := &http.Client{Timeout: 1200 * time.Millisecond}
 			if reqBody, err := json.Marshal(node); err == nil {
-				if resp, err := clientHTTP.Post("http://127.0.0.1:19800/api/v1/node/add", "application/json", bytes.NewReader(reqBody)); err == nil {
+				if resp, err := localDaemonRequest(cmd.Context(), clientHTTP, http.MethodPost, "/api/v1/node/add", bytes.NewReader(reqBody)); err == nil {
 					_ = resp.Body.Close()
 				}
 			}
@@ -1125,7 +1128,7 @@ func newNodeCmd() *cobra.Command {
 			if flagJSON {
 				return presenter.PrintJSON(os.Stdout, map[string]any{
 					"success":     true,
-					"node":        node,
+					"node":        api.PublicNode(node),
 					"remote_sync": syncErr == nil,
 				})
 			}
@@ -1191,7 +1194,7 @@ func newNodeCmd() *cobra.Command {
 			// 4. Notify local daemon to remove from memory and active gossip
 			clientHTTP := &http.Client{Timeout: 1500 * time.Millisecond}
 			reqBody, _ := json.Marshal(map[string]string{"name": node.Name, "id": node.ID})
-			if resp, err := clientHTTP.Post("http://127.0.0.1:19800/api/v1/node/remove", "application/json", bytes.NewReader(reqBody)); err == nil {
+			if resp, err := localDaemonRequest(cmd.Context(), clientHTTP, http.MethodPost, "/api/v1/node/remove", bytes.NewReader(reqBody)); err == nil {
 				_ = resp.Body.Close()
 			}
 
@@ -1372,7 +1375,7 @@ Examples:
 			// Update daemon memory if running
 			clientHTTP := &http.Client{Timeout: 500 * time.Millisecond}
 			if reqBody, err := json.Marshal(node); err == nil {
-				if resp, err := clientHTTP.Post("http://127.0.0.1:19800/api/v1/node/add", "application/json", bytes.NewReader(reqBody)); err == nil {
+				if resp, err := localDaemonRequest(cmd.Context(), clientHTTP, http.MethodPost, "/api/v1/node/add", bytes.NewReader(reqBody)); err == nil {
 					_ = resp.Body.Close()
 				}
 			}
@@ -1448,7 +1451,7 @@ func resolveNode(nameOrID string) (*entity.Node, error) {
 
 	// Fallback to querying running local daemon members
 	clientHTTP := &http.Client{Timeout: 1200 * time.Millisecond}
-	resp, httpErr := clientHTTP.Get("http://127.0.0.1:19800/api/v1/node/members")
+	resp, httpErr := localDaemonRequest(context.Background(), clientHTTP, http.MethodGet, "/api/v1/node/members", nil)
 	if httpErr == nil && resp.StatusCode == http.StatusOK {
 		defer func() { _ = resp.Body.Close() }()
 		var gm []*entity.Node
@@ -1477,7 +1480,7 @@ func listNodes(wide bool) error {
 	// 1. Check if local daemon is running and has live mesh members
 	var meshNodes []*entity.Node
 	clientHTTP := &http.Client{Timeout: 1200 * time.Millisecond}
-	resp, httpErr := clientHTTP.Get("http://127.0.0.1:19800/api/v1/node/members")
+	resp, httpErr := localDaemonRequest(context.Background(), clientHTTP, http.MethodGet, "/api/v1/node/members", nil)
 	if httpErr == nil && resp.StatusCode == http.StatusOK {
 		defer func() { _ = resp.Body.Close() }()
 		var gm []*entity.Node
@@ -1487,13 +1490,16 @@ func listNodes(wide bool) error {
 	}
 
 	nodeMap := make(map[string]*entity.Node)
+	var nodeMapMu sync.Mutex
 	var orderedKeys []string
 
 	upsert := func(key string, n *entity.Node) {
 		if _, exists := nodeMap[key]; !exists {
 			orderedKeys = append(orderedKeys, key)
 		}
+		nodeMapMu.Lock()
 		nodeMap[key] = n
+		nodeMapMu.Unlock()
 	}
 
 	// First include all nodes known in the persistent repository
@@ -1577,12 +1583,14 @@ func listNodes(wide bool) error {
 							upNode.Tags = t.Tags
 						}
 						upNode.GossipState = entity.GossipStateAlive
+						nodeMapMu.Lock()
 						nodeMap[key] = upNode
+						nodeMapMu.Unlock()
 						_ = repo.SaveNode(upNode)
 
 						clientHTTP := &http.Client{Timeout: 500 * time.Millisecond}
 						if reqBody, err := json.Marshal(upNode); err == nil {
-							if resp, err := clientHTTP.Post("http://127.0.0.1:19800/api/v1/node/add", "application/json", bytes.NewReader(reqBody)); err == nil {
+							if resp, err := localDaemonRequest(ctx, clientHTTP, http.MethodPost, "/api/v1/node/add", bytes.NewReader(reqBody)); err == nil {
 								_ = resp.Body.Close()
 							}
 						}
@@ -1615,7 +1623,9 @@ func listNodes(wide bool) error {
 					nCopy.IsOnline = false
 					nCopy.Status = "offline"
 					nCopy.GossipState = entity.GossipStateDead
+					nodeMapMu.Lock()
 					nodeMap[key] = &nCopy
+					nodeMapMu.Unlock()
 				} else {
 					if upNode != nil {
 						upNode.IsOnline = true
@@ -1635,12 +1645,16 @@ func listNodes(wide bool) error {
 							upNode.Tags = t.Tags
 						}
 						upNode.GossipState = entity.GossipStateAlive
+						nodeMapMu.Lock()
 						nodeMap[key] = upNode
+						nodeMapMu.Unlock()
 					} else {
 						nCopy.IsOnline = true
 						nCopy.Status = "alive"
 						nCopy.GossipState = entity.GossipStateAlive
+						nodeMapMu.Lock()
 						nodeMap[key] = &nCopy
+						nodeMapMu.Unlock()
 					}
 				}
 			}(target)
@@ -1667,6 +1681,9 @@ func listNodes(wide bool) error {
 	}
 
 	if flagJSON {
+		for i, node := range finalNodes {
+			finalNodes[i] = api.PublicNode(node)
+		}
 		return presenter.PrintJSON(os.Stdout, finalNodes)
 	}
 
@@ -1704,11 +1721,7 @@ func newDeployCmd() *cobra.Command {
 			}
 			if hasErrors {
 				if flagJSON {
-					return presenter.PrintJSON(os.Stdout, map[string]any{
-						"success": false,
-						"error":   "configuration validation failed",
-						"issues":  issues,
-					})
+					return printJSONError(os.Stdout, fmt.Errorf("configuration validation failed"), map[string]any{"issues": issues})
 				}
 				return fmt.Errorf("configuration validation failed; fix errors or run 'kizuna check'")
 			}
@@ -1744,7 +1757,7 @@ func newDeployCmd() *cobra.Command {
 
 			if err := deployUC.Execute(cmd.Context(), project, targetSvc, out); err != nil {
 				if flagJSON {
-					return presenter.PrintJSON(os.Stdout, map[string]any{"success": false, "error": err.Error()})
+					return printJSONError(os.Stdout, err, nil)
 				}
 				return err
 			}
@@ -1791,27 +1804,9 @@ func newScaleCmd() *cobra.Command {
 				return err
 			}
 
-			targetSvc := ""
-			replicas := 1
-
-			if len(args) == 1 {
-				arg := args[0]
-				if strings.Contains(arg, "=") {
-					parts := strings.Split(arg, "=")
-					targetSvc = parts[0]
-					replicas, _ = strconv.Atoi(parts[1])
-				} else if r, err := strconv.Atoi(arg); err == nil {
-					replicas = r
-				} else {
-					targetSvc = arg
-				}
-			} else if len(args) >= 2 {
-				targetSvc = args[0]
-				replicas, _ = strconv.Atoi(args[1])
-			}
-
-			if replicas <= 0 {
-				return fmt.Errorf("replica count must be at least 1, got %d", replicas)
+			targetSvc, replicas, err := scaleArguments(project, args)
+			if err != nil {
+				return operationError(err)
 			}
 
 			repo, err := config.NewNodeRepository("")
@@ -1842,7 +1837,7 @@ func newScaleCmd() *cobra.Command {
 
 			if err := scaleUC.Execute(cmd.Context(), project, targetSvc, replicas, out); err != nil {
 				if flagJSON {
-					return presenter.PrintJSON(os.Stdout, map[string]any{"success": false, "error": err.Error()})
+					return printJSONError(os.Stdout, err, nil)
 				}
 				return err
 			}
@@ -1890,6 +1885,14 @@ func newRollbackCmd() *cobra.Command {
 			if len(args) > 0 {
 				targetSvc = args[0]
 			}
+			if targetSvc == "" {
+				if len(project.Services) != 1 {
+					return operationError(fmt.Errorf("specify a service to roll back"))
+				}
+				for name := range project.Services {
+					targetSvc = name
+				}
+			}
 
 			repo, err := config.NewNodeRepository("")
 			if err != nil {
@@ -1920,7 +1923,7 @@ func newRollbackCmd() *cobra.Command {
 			targetRev, err := rollbackUC.Execute(cmd.Context(), project, targetSvc, out)
 			if err != nil {
 				if flagJSON {
-					return presenter.PrintJSON(os.Stdout, map[string]any{"success": false, "error": err.Error()})
+					return printJSONError(os.Stdout, err, nil)
 				}
 				return err
 			}
@@ -1957,7 +1960,7 @@ func runDashboard() error {
 
 	// Also check if local daemon has live mesh members and merge them
 	clientHTTP := &http.Client{Timeout: 800 * time.Millisecond}
-	resp, httpErr := clientHTTP.Get("http://127.0.0.1:19800/api/v1/node/members")
+	resp, httpErr := localDaemonRequest(context.Background(), clientHTTP, http.MethodGet, "/api/v1/node/members", nil)
 	if httpErr == nil && resp.StatusCode == http.StatusOK {
 		defer func() { _ = resp.Body.Close() }()
 		var gm []*entity.Node
@@ -2060,10 +2063,9 @@ func newStatusCmd() *cobra.Command {
 				nodes, _ = repo.ListNodes()
 			}
 
-
-
-			// If no remote nodes configured, register local machine as node
-			if len(nodes) == 0 {
+			// Local deployment does not require a daemon for status inspection.
+			localOnly := len(nodes) == 0
+			if localOnly {
 				nodes = []*entity.Node{
 					{
 						Name:      "local-node",
@@ -2094,24 +2096,6 @@ func newStatusCmd() *cobra.Command {
 				}
 			}
 
-			// Check if local daemon is running and has live cluster members
-			daemonMembers := make(map[string]*entity.Node)
-			clientHTTP := &http.Client{Timeout: 1200 * time.Millisecond}
-			if resp, err := clientHTTP.Get("http://127.0.0.1:19800/api/v1/node/members"); err == nil && resp.StatusCode == http.StatusOK {
-				defer func() { _ = resp.Body.Close() }()
-				var members []*entity.Node
-				if json.NewDecoder(resp.Body).Decode(&members) == nil {
-					for _, m := range members {
-						if m != nil {
-							daemonMembers[m.ID] = m
-							if m.Name != "" {
-								daemonMembers[m.Name] = m
-							}
-						}
-					}
-				}
-			}
-
 			// 4. Concurrently probe nodes with strict timeout so unreachable nodes never block the CLI!
 			meshGw := newMeshGatewayWithDiscoveredDERPs()
 			defer func() { _ = meshGw.Close() }()
@@ -2133,19 +2117,17 @@ func newStatusCmd() *cobra.Command {
 				go func(idx int, target *entity.Node) {
 					defer wg.Done()
 
-					// If the local daemon is alive and actively tracking this node as alive, reuse live state
-					if live, ok := daemonMembers[target.ID]; ok && live != nil && live.IsOnline && live.GossipState == entity.GossipStateAlive {
-						resChan <- nodeResult{index: idx, node: live, latency: time.Duration(live.LatencyMs) * time.Millisecond, err: nil}
+					start := time.Now()
+					if localOnly {
+						services, statusErr := workload.NewWorkloadRunner("").ListServices(cmd.Context())
+						localNode := *target
+						localNode.CPUUsage = localMetrics.CPUUsage
+						localNode.MemoryUsage = localMetrics.MemoryUsage
+						localNode.DiskUsage = localMetrics.DiskUsage
+						localNode.GossipState = entity.GossipStateAlive
+						resChan <- nodeResult{index: idx, node: &localNode, services: services, latency: time.Since(start), err: statusErr}
 						return
 					}
-					if target.Name != "" {
-						if live, ok := daemonMembers[target.Name]; ok && live != nil && live.IsOnline && live.GossipState == entity.GossipStateAlive {
-							resChan <- nodeResult{index: idx, node: live, latency: time.Duration(live.LatencyMs) * time.Millisecond, err: nil}
-							return
-						}
-					}
-
-					start := time.Now()
 					probeCtx, probeCancel := context.WithTimeout(cmd.Context(), resolveProbeTimeout())
 					defer probeCancel()
 
@@ -2199,11 +2181,11 @@ func newStatusCmd() *cobra.Command {
 
 			for res := range resChan {
 				probedNodes[res.index] = res.node
-				if res.err == nil && res.node != nil {
+				if res.err == nil && res.node != nil && !localOnly {
 					_ = repo.SaveNode(res.node)
 					clientHTTP := &http.Client{Timeout: 500 * time.Millisecond}
 					if reqBody, err := json.Marshal(res.node); err == nil {
-						if resp, err := clientHTTP.Post("http://127.0.0.1:19800/api/v1/node/add", "application/json", bytes.NewReader(reqBody)); err == nil {
+						if resp, err := localDaemonRequest(cmd.Context(), clientHTTP, http.MethodPost, "/api/v1/node/add", bytes.NewReader(reqBody)); err == nil {
 							_ = resp.Body.Close()
 						}
 					}
@@ -2226,6 +2208,12 @@ func newStatusCmd() *cobra.Command {
 			}
 
 			if flagJSON {
+				for i, node := range probedNodes {
+					probedNodes[i] = api.PublicNode(node)
+				}
+				for i, svc := range activeServices {
+					activeServices[i] = api.PublicService(svc)
+				}
 				return presenter.PrintJSON(os.Stdout, map[string]any{
 					"system":    localMetrics,
 					"nodes":     probedNodes,
@@ -2256,100 +2244,79 @@ func newStatusCmd() *cobra.Command {
 
 func newLogsCmd() *cobra.Command {
 	return &cobra.Command{
-		Use:   "logs <service-name>",
-		Short: "Stream real-time logs for a deployed service",
-		Args:  cobra.ExactArgs(1),
+		Use: "logs <service-name>", Short: "Stream runtime logs from the configured deployment target", Args: cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			svcName := args[0]
+			project, svc, err := loadOperationService(args[0])
+			if err != nil {
+				return operationError(err)
+			}
+			target, err := operationTarget(project, svc)
+			if err != nil {
+				return operationError(err)
+			}
+			if target.Type == entity.TargetTypeLocal {
+				return workload.NewWorkloadRunner("").StreamLogs(cmd.Context(), svc.Name, os.Stdout)
+			}
+			if target.Type == entity.TargetTypeSSH {
+				return sshinfra.NewClient(target).StreamServiceLogs(cmd.Context(), svc.Name, os.Stdout)
+			}
 			repo, err := config.NewNodeRepository("")
 			if err != nil {
-				return err
+				return operationError(err)
 			}
-			nodes, _ := repo.ListNodes()
-			var targetNode *entity.Node
-			if len(nodes) > 0 {
-				targetNode = nodes[0]
-			} else {
-				targetNode = &entity.Node{
-					Name:      "local-node",
-					Addr:      "127.0.0.1",
-					AuthToken: "kzn_local",
-					IsOnline:  true,
-				}
+			node, err := operationNode(repo, target)
+			if err != nil {
+				return operationError(err)
 			}
-
-			meshGw := mesh.NewMeshGateway()
-			defer func() { _ = meshGw.Close() }()
-			cli := client.NewMeshClient(meshGw)
-
-			return cli.StreamLogs(context.Background(), targetNode, svcName, os.Stdout)
+			gateway := newMeshGatewayWithDiscoveredDERPs()
+			defer func() { _ = gateway.Close() }()
+			return client.NewMeshClient(gateway).StreamLogs(cmd.Context(), node, svc.Name, os.Stdout)
 		},
 	}
 }
 
 func newBackupCmd() *cobra.Command {
 	return &cobra.Command{
-		Use:   "backup <service-name>",
-		Short: "Trigger a backup snapshot for a deployed service",
-		Args:  cobra.ExactArgs(1),
+		Use: "backup <service-name>", Short: "Back up the configured service on its deployment target", Args: cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			svcName := args[0]
-			repo, err := config.NewNodeRepository("")
+			project, svc, err := loadOperationService(args[0])
 			if err != nil {
-				return err
+				return operationError(err)
 			}
-			nodes, _ := repo.ListNodes()
-			var targetNode *entity.Node
-			if len(nodes) > 0 {
-				targetNode = nodes[0]
+			if svc.Backup == nil {
+				return operationError(fmt.Errorf("service %q has no backup configuration", svc.Name))
+			}
+			target, err := operationTarget(project, svc)
+			if err != nil {
+				return operationError(err)
+			}
+			backupCfg, err := backupConfiguration(svc, target)
+			if err != nil {
+				return operationError(err)
+			}
+			var record *entity.BackupRecord
+			if target.Type == entity.TargetTypeLocal {
+				record, err = backup.NewBackupManager("").CreateBackup(cmd.Context(), svc.Name, backupCfg)
 			} else {
-				targetNode = &entity.Node{
-					Name:      "local-node",
-					Addr:      "127.0.0.1",
-					AuthToken: "kzn_local",
-					IsOnline:  true,
+				repo, repoErr := config.NewNodeRepository("")
+				if repoErr != nil {
+					return operationError(repoErr)
 				}
-			}
-
-			var backupCfg *entity.BackupConfig
-			if cfgPath, err := config.FindConfigFile(); err == nil {
-				if proj, err := config.LoadProjectWithEnv(cfgPath, flagEnv); err == nil {
-					if svc, ok := proj.Services[svcName]; ok {
-						backupCfg = svc.Backup
-					}
+				node, nodeErr := operationNode(repo, target)
+				if nodeErr != nil {
+					return operationError(nodeErr)
 				}
+				gateway := newMeshGatewayWithDiscoveredDERPs()
+				defer func() { _ = gateway.Close() }()
+				record, err = client.NewMeshClient(gateway).TriggerBackup(cmd.Context(), node, svc.Name, backupCfg)
 			}
-			if backupCfg == nil {
-				backupCfg = &entity.BackupConfig{
-					Paths:   []string{"."},
-					Storage: &entity.StorageConfig{Type: "local"},
-				}
-			}
-
-			meshGw := mesh.NewMeshGateway()
-			defer func() { _ = meshGw.Close() }()
-			cli := client.NewMeshClient(meshGw)
-
-			if !flagJSON {
-				fmt.Printf("Triggering backup for service '%s' on node '%s'...\n", svcName, targetNode.Name)
-			}
-
-			record, err := cli.TriggerBackup(context.Background(), targetNode, svcName, backupCfg)
 			if err != nil {
-				if flagJSON {
-					return presenter.PrintJSON(os.Stdout, map[string]any{"success": false, "error": err.Error()})
-				}
-				return err
+				return operationError(err)
 			}
-
 			if flagJSON {
 				return presenter.PrintJSON(os.Stdout, map[string]any{"success": true, "record": record})
 			}
-
-			ui := presenter.NewUI("")
-			fmt.Printf("✓ %s\n  File: %s\n  Size: %d bytes\n  Storage: %s\n",
-				ui.SecondaryStyle.Bold(true).Render("Backup created successfully!"),
-				record.Filename, record.Size, record.StorageType)
+			fmt.Printf("Backup created: %s (%d bytes, %s)\n", record.Filename, record.Size, record.StorageType)
 			return nil
 		},
 	}
@@ -2692,7 +2659,7 @@ func newCheckCmd() *cobra.Command {
 			project, err := config.LoadProjectWithEnv(cfgPath, flagEnv)
 			if err != nil {
 				if flagJSON {
-					return presenter.PrintJSON(os.Stdout, map[string]any{"valid": false, "error": err.Error()})
+					return printJSONError(os.Stdout, err, map[string]any{"valid": false})
 				}
 				return fmt.Errorf("syntax error: %w", err)
 			}
@@ -2706,6 +2673,9 @@ func newCheckCmd() *cobra.Command {
 			}
 
 			if flagJSON {
+				if hasErrors {
+					return printJSONError(os.Stdout, fmt.Errorf("configuration validation failed"), map[string]any{"valid": false, "issues": issues})
+				}
 				return presenter.PrintJSON(os.Stdout, map[string]any{
 					"valid":        !hasErrors,
 					"project":      project.Name,
@@ -2788,10 +2758,7 @@ func newUpgradeCmd() *cobra.Command {
 					}
 				})
 				if err != nil {
-					return presenter.PrintJSON(os.Stdout, map[string]any{
-						"success": false,
-						"error":   err.Error(),
-					})
+					return printJSONError(os.Stdout, err, nil)
 				}
 				return presenter.PrintJSON(os.Stdout, map[string]any{
 					"success": true,

@@ -1,7 +1,10 @@
 package entity
 
 import (
+	"fmt"
 	"net"
+	"net/url"
+	"regexp"
 	"strconv"
 	"strings"
 	"time"
@@ -85,6 +88,8 @@ func (m *MeshConfig) GetMaxUploadBytes() int64 {
 
 // Service represents an individual deployable workload
 type Service struct {
+	Target      string            `json:"target,omitempty" yaml:"target,omitempty"`
+	Compose     *ComposeConfig    `json:"compose,omitempty" yaml:"compose,omitempty"`
 	Name        string            `json:"name"`
 	Type        ServiceType       `json:"type"`
 	Root        string            `json:"root"`
@@ -103,6 +108,15 @@ type Service struct {
 	UpdatedAt   time.Time         `json:"updated_at"`
 }
 
+// ComposeConfig references an existing Compose project and optional service selection.
+// EnvFiles are paths on the destination host; their contents are never bundled for upload.
+type ComposeConfig struct {
+	ProjectName string   `json:"project_name,omitempty" yaml:"project_name,omitempty"`
+	Services    []string `json:"services,omitempty" yaml:"services,omitempty"`
+	EnvFiles    []string `json:"env_files,omitempty" yaml:"env_files,omitempty"`
+	Profiles    []string `json:"profiles,omitempty" yaml:"profiles,omitempty"`
+}
+
 // BuildConfig holds local/CI build instructions
 type BuildConfig struct {
 	Local    string `json:"local,omitempty" yaml:"local,omitempty"`
@@ -118,23 +132,23 @@ type DeployConfig struct {
 
 // IngressConfig configures Caddy reverse proxy and auto-HTTPS
 type IngressConfig struct {
-	Provider     string            `json:"provider" yaml:"provider"` // "caddy" or "none"
-	Domain       string            `json:"domain,omitempty" yaml:"domain,omitempty"`
-	AutoTLS      bool              `json:"auto_tls,omitempty" yaml:"auto_tls,omitempty"`
-	TLS             string            `json:"tls,omitempty" yaml:"tls,omitempty"`                                       // "internal" (Local Root CA for LAN/IP), "cloudflare" (DNS-01 ACME), "auto", "none"
-	DNSProvider     string            `json:"dns_provider,omitempty" yaml:"dns_provider,omitempty"`                     // DNS-01 provider (e.g. "cloudflare")
-	CloudflareToken string            `json:"cloudflare_token,omitempty" yaml:"cloudflare_token,omitempty"`             // Cloudflare API Token for DNS-01 ACME
-	DNSToken        string            `json:"dns_token,omitempty" yaml:"dns_token,omitempty"`                           // Generic DNS API Token
-	UpstreamPort    int               `json:"upstream_port,omitempty" yaml:"upstream_port,omitempty"`
-	Upstreams    []string          `json:"upstreams,omitempty" yaml:"upstreams,omitempty"`         // Multi-backend addresses for load balancing
-	LBPolicy     string            `json:"lb_policy,omitempty" yaml:"lb_policy,omitempty"`         // "round_robin" (default), "least_conn", "random", "first"
-	WebSocket    bool              `json:"websocket,omitempty" yaml:"websocket,omitempty"`         // One-click WebSocket proxy preset
-	SSE          bool              `json:"sse,omitempty" yaml:"sse,omitempty"`                     // One-click SSE & AI streaming preset (flush_interval -1)
-	GRPC         bool              `json:"grpc,omitempty" yaml:"grpc,omitempty"`                   // One-click gRPC h2c preset
-	CORS         bool              `json:"cors,omitempty" yaml:"cors,omitempty"`                   // One-click CORS header preset
-	Headers      *IngressHeaders   `json:"headers,omitempty" yaml:"headers,omitempty"`             // Custom request & response headers
-	ProxyOptions *ProxyOptions     `json:"proxy_options,omitempty" yaml:"proxy_options,omitempty"` // SSE, buffer, TLS options
-	Custom       []string          `json:"custom,omitempty" yaml:"custom,omitempty"`               // Raw Caddyfile directives (e.g. "encode gzip zstd", "basic_auth ...")
+	Provider        string          `json:"provider" yaml:"provider"` // "caddy" or "none"
+	Domain          string          `json:"domain,omitempty" yaml:"domain,omitempty"`
+	AutoTLS         bool            `json:"auto_tls,omitempty" yaml:"auto_tls,omitempty"`
+	TLS             string          `json:"tls,omitempty" yaml:"tls,omitempty"`                           // "internal" (Local Root CA for LAN/IP), "cloudflare" (DNS-01 ACME), "auto", "none"
+	DNSProvider     string          `json:"dns_provider,omitempty" yaml:"dns_provider,omitempty"`         // DNS-01 provider (e.g. "cloudflare")
+	CloudflareToken string          `json:"cloudflare_token,omitempty" yaml:"cloudflare_token,omitempty"` // Cloudflare API Token for DNS-01 ACME
+	DNSToken        string          `json:"dns_token,omitempty" yaml:"dns_token,omitempty"`               // Generic DNS API Token
+	UpstreamPort    int             `json:"upstream_port,omitempty" yaml:"upstream_port,omitempty"`
+	Upstreams       []string        `json:"upstreams,omitempty" yaml:"upstreams,omitempty"`         // Multi-backend addresses for load balancing
+	LBPolicy        string          `json:"lb_policy,omitempty" yaml:"lb_policy,omitempty"`         // "round_robin" (default), "least_conn", "random", "first"
+	WebSocket       bool            `json:"websocket,omitempty" yaml:"websocket,omitempty"`         // One-click WebSocket proxy preset
+	SSE             bool            `json:"sse,omitempty" yaml:"sse,omitempty"`                     // One-click SSE & AI streaming preset (flush_interval -1)
+	GRPC            bool            `json:"grpc,omitempty" yaml:"grpc,omitempty"`                   // One-click gRPC h2c preset
+	CORS            bool            `json:"cors,omitempty" yaml:"cors,omitempty"`                   // One-click CORS header preset
+	Headers         *IngressHeaders `json:"headers,omitempty" yaml:"headers,omitempty"`             // Custom request & response headers
+	ProxyOptions    *ProxyOptions   `json:"proxy_options,omitempty" yaml:"proxy_options,omitempty"` // SSE, buffer, TLS options
+	Custom          []string        `json:"custom,omitempty" yaml:"custom,omitempty"`               // Raw Caddyfile directives (e.g. "encode gzip zstd", "basic_auth ...")
 }
 
 // IngressHeaders configures custom HTTP headers
@@ -161,11 +175,11 @@ type BackupConfig struct {
 
 // DatabaseBackupConfig defines how to backup local or remote databases
 type DatabaseBackupConfig struct {
-	Type      string `json:"type" yaml:"type"` // "postgres", "mysql", "sqlite", "custom"
-	URI       string `json:"uri,omitempty" yaml:"uri,omitempty"` // Connection URI (remote or local)
-	Path      string `json:"path,omitempty" yaml:"path,omitempty"` // For SQLite local file path
+	Type      string `json:"type" yaml:"type"`                               // "postgres", "mysql", "sqlite", "custom"
+	URI       string `json:"uri,omitempty" yaml:"uri,omitempty"`             // Connection URI (remote or local)
+	Path      string `json:"path,omitempty" yaml:"path,omitempty"`           // For SQLite local file path
 	Container string `json:"container,omitempty" yaml:"container,omitempty"` // Container name if running inside Docker
-	Command   string `json:"command,omitempty" yaml:"command,omitempty"` // Custom backup command
+	Command   string `json:"command,omitempty" yaml:"command,omitempty"`     // Custom backup command
 }
 
 // RetentionConfig defines how long backups are preserved before automatic cleanup
@@ -205,59 +219,62 @@ type StorageConfig struct {
 
 // EnvironmentConfig specifies environment-specific overrides (development, staging, production, etc.)
 type EnvironmentConfig struct {
+	Compose  *ComposeConfig              `json:"compose,omitempty" yaml:"compose,omitempty"`
 	Target   string                      `json:"target,omitempty" yaml:"target,omitempty"`
 	Targets  []string                    `json:"targets,omitempty" yaml:"targets,omitempty"` // Environment-specific scale-out targets
 	Theme    string                      `json:"theme,omitempty" yaml:"theme,omitempty"`
 	Services map[string]*ServiceOverride `json:"services,omitempty" yaml:"services,omitempty"`
 
 	// Shorthand overrides for single-service projects
-	Ports    []string              `json:"ports,omitempty" yaml:"ports,omitempty"`
-	Replicas int                   `json:"replicas,omitempty" yaml:"replicas,omitempty"`
-	Env      map[string]string     `json:"env,omitempty" yaml:"env,omitempty"`
-	Build    *BuildConfig          `json:"build,omitempty" yaml:"build,omitempty"`
-	Deploy   *DeployConfig         `json:"deploy,omitempty" yaml:"deploy,omitempty"`
-	Ingress  *IngressConfig        `json:"ingress,omitempty" yaml:"ingress,omitempty"`
-	Backup   *BackupConfig         `json:"backup,omitempty" yaml:"backup,omitempty"`
-	Logging  *LoggingConfig        `json:"logging,omitempty" yaml:"logging,omitempty"`
+	Ports    []string          `json:"ports,omitempty" yaml:"ports,omitempty"`
+	Replicas int               `json:"replicas,omitempty" yaml:"replicas,omitempty"`
+	Env      map[string]string `json:"env,omitempty" yaml:"env,omitempty"`
+	Build    *BuildConfig      `json:"build,omitempty" yaml:"build,omitempty"`
+	Deploy   *DeployConfig     `json:"deploy,omitempty" yaml:"deploy,omitempty"`
+	Ingress  *IngressConfig    `json:"ingress,omitempty" yaml:"ingress,omitempty"`
+	Backup   *BackupConfig     `json:"backup,omitempty" yaml:"backup,omitempty"`
+	Logging  *LoggingConfig    `json:"logging,omitempty" yaml:"logging,omitempty"`
 }
 
 // ServiceOverride holds per-service environment overrides
 type ServiceOverride struct {
-	Ports    []string              `json:"ports,omitempty" yaml:"ports,omitempty"`
-	Replicas int                   `json:"replicas,omitempty" yaml:"replicas,omitempty"`
-	Env      map[string]string     `json:"env,omitempty" yaml:"env,omitempty"`
-	Build    *BuildConfig          `json:"build,omitempty" yaml:"build,omitempty"`
-	Deploy   *DeployConfig         `json:"deploy,omitempty" yaml:"deploy,omitempty"`
-	Ingress  *IngressConfig        `json:"ingress,omitempty" yaml:"ingress,omitempty"`
-	Backup   *BackupConfig         `json:"backup,omitempty" yaml:"backup,omitempty"`
-	Logging  *LoggingConfig        `json:"logging,omitempty" yaml:"logging,omitempty"`
+	Target   string            `json:"target,omitempty" yaml:"target,omitempty"`
+	Compose  *ComposeConfig    `json:"compose,omitempty" yaml:"compose,omitempty"`
+	Ports    []string          `json:"ports,omitempty" yaml:"ports,omitempty"`
+	Replicas int               `json:"replicas,omitempty" yaml:"replicas,omitempty"`
+	Env      map[string]string `json:"env,omitempty" yaml:"env,omitempty"`
+	Build    *BuildConfig      `json:"build,omitempty" yaml:"build,omitempty"`
+	Deploy   *DeployConfig     `json:"deploy,omitempty" yaml:"deploy,omitempty"`
+	Ingress  *IngressConfig    `json:"ingress,omitempty" yaml:"ingress,omitempty"`
+	Backup   *BackupConfig     `json:"backup,omitempty" yaml:"backup,omitempty"`
+	Logging  *LoggingConfig    `json:"logging,omitempty" yaml:"logging,omitempty"`
 }
 
 // Node represents a remote machine in the mesh
 type Node struct {
-	ID          string      `json:"id"`
-	Name        string      `json:"name"`
-	Addr        string      `json:"addr"` // Tailcat mesh address
-	AuthToken   string      `json:"auth_token,omitempty"`
-	IsOnline    bool        `json:"is_online"`
-	LastSeen    time.Time   `json:"last_seen"`
-	OS          string      `json:"os"`
-	Arch        string      `json:"arch"`
-	Tags        []string    `json:"tags,omitempty" yaml:"tags,omitempty"`
-	Host        string      `json:"host,omitempty" yaml:"host,omitempty"` // Hostname, domain, or IP (e.g. node-1.example.com or 10.0.0.9)
-	IP          string      `json:"ip,omitempty" yaml:"ip,omitempty"`     // Legacy/convenience alias for Host
-	Status      string      `json:"status,omitempty" yaml:"status,omitempty"` // "alive", "suspect", "dead", "offline"
-	GossipState GossipState `json:"gossip_state,omitempty" yaml:"gossip_state,omitempty"` // Internal protocol state
-	Incarnation uint64      `json:"incarnation,omitempty" yaml:"incarnation,omitempty"`
-	CPUUsage    float64     `json:"cpu_usage"`
-	MemoryUsage float64     `json:"memory_usage"`
-	DiskUsage   float64     `json:"disk_usage"`
-	TotalMemory uint64      `json:"total_memory,omitempty"`
-	UsedMemory  uint64      `json:"used_memory,omitempty"`
-	TotalDisk   uint64      `json:"total_disk,omitempty"`
-	UsedDisk    uint64      `json:"used_disk,omitempty"`
-	CPUCores    int         `json:"cpu_cores,omitempty"`
-	Uptime      uint64      `json:"uptime,omitempty"`
+	ID          string        `json:"id"`
+	Name        string        `json:"name"`
+	Addr        string        `json:"addr"` // Tailcat mesh address
+	AuthToken   string        `json:"auth_token,omitempty"`
+	IsOnline    bool          `json:"is_online"`
+	LastSeen    time.Time     `json:"last_seen"`
+	OS          string        `json:"os"`
+	Arch        string        `json:"arch"`
+	Tags        []string      `json:"tags,omitempty" yaml:"tags,omitempty"`
+	Host        string        `json:"host,omitempty" yaml:"host,omitempty"`                 // Hostname, domain, or IP (e.g. node-1.example.com or 10.0.0.9)
+	IP          string        `json:"ip,omitempty" yaml:"ip,omitempty"`                     // Legacy/convenience alias for Host
+	Status      string        `json:"status,omitempty" yaml:"status,omitempty"`             // "alive", "suspect", "dead", "offline"
+	GossipState GossipState   `json:"gossip_state,omitempty" yaml:"gossip_state,omitempty"` // Internal protocol state
+	Incarnation uint64        `json:"incarnation,omitempty" yaml:"incarnation,omitempty"`
+	CPUUsage    float64       `json:"cpu_usage"`
+	MemoryUsage float64       `json:"memory_usage"`
+	DiskUsage   float64       `json:"disk_usage"`
+	TotalMemory uint64        `json:"total_memory,omitempty"`
+	UsedMemory  uint64        `json:"used_memory,omitempty"`
+	TotalDisk   uint64        `json:"total_disk,omitempty"`
+	UsedDisk    uint64        `json:"used_disk,omitempty"`
+	CPUCores    int           `json:"cpu_cores,omitempty"`
+	Uptime      uint64        `json:"uptime,omitempty"`
 	Load1       float64       `json:"load1,omitempty"`
 	LatencyMs   int64         `json:"latency_ms,omitempty"`
 	DERP        *DERPNodeInfo `json:"derp,omitempty" yaml:"derp,omitempty"`
@@ -266,9 +283,9 @@ type Node struct {
 
 // SSHConfig defines the SSH access control and tag-based firewall policy for this node
 type SSHConfig struct {
-	Enabled    *bool    `json:"enabled,omitempty" yaml:"enabled,omitempty"`       // Whether SSH tunneling on port 22 is allowed (default true)
-	AllowTags  []string `json:"allow_tags,omitempty" yaml:"allow_tags,omitempty"` // Only caller nodes with at least one matching tag can SSH in
-	DenyTags   []string `json:"deny_tags,omitempty" yaml:"deny_tags,omitempty"`   // Caller nodes with any matching tag are rejected
+	Enabled    *bool    `json:"enabled,omitempty" yaml:"enabled,omitempty"`         // Whether SSH tunneling on port 22 is allowed (default true)
+	AllowTags  []string `json:"allow_tags,omitempty" yaml:"allow_tags,omitempty"`   // Only caller nodes with at least one matching tag can SSH in
+	DenyTags   []string `json:"deny_tags,omitempty" yaml:"deny_tags,omitempty"`     // Caller nodes with any matching tag are rejected
 	AllowNodes []string `json:"allow_nodes,omitempty" yaml:"allow_nodes,omitempty"` // Specific allowed node names or IDs
 	DenyNodes  []string `json:"deny_nodes,omitempty" yaml:"deny_nodes,omitempty"`   // Specific denied node names or IDs
 }
@@ -284,10 +301,10 @@ func (s *SSHConfig) IsEnabled() bool {
 // DERPConfig represents configuration for hosting a private DERP relay
 type DERPConfig struct {
 	Enabled    bool   `json:"enabled" yaml:"enabled"`
-	Host       string `json:"host,omitempty" yaml:"host,omitempty"`             // Reachable hostname or IP (e.g. 10.0.0.4 or vps.example.com)
-	Port       int    `json:"port,omitempty" yaml:"port,omitempty"`             // TLS/TCP port (default 8443)
-	STUNPort   int    `json:"stun_port,omitempty" yaml:"stun_port,omitempty"`   // STUN UDP port (default 3478, or 0 if disabled)
-	RegionID   int    `json:"region_id,omitempty" yaml:"region_id,omitempty"`   // Custom Region ID (range 900-999)
+	Host       string `json:"host,omitempty" yaml:"host,omitempty"`           // Reachable hostname or IP (e.g. 10.0.0.4 or vps.example.com)
+	Port       int    `json:"port,omitempty" yaml:"port,omitempty"`           // TLS/TCP port (default 8443)
+	STUNPort   int    `json:"stun_port,omitempty" yaml:"stun_port,omitempty"` // STUN UDP port (default 3478, or 0 if disabled)
+	RegionID   int    `json:"region_id,omitempty" yaml:"region_id,omitempty"` // Custom Region ID (range 900-999)
 	RegionCode string `json:"region_code,omitempty" yaml:"region_code,omitempty"`
 	RegionName string `json:"region_name,omitempty" yaml:"region_name,omitempty"`
 }
@@ -358,18 +375,18 @@ type GossipDigest struct {
 
 // GossipEngineStatus represents diagnostic status of the local Gossip engine
 type GossipEngineStatus struct {
-	NodeID       string         `json:"node_id"`
-	NodeName     string         `json:"node_name"`
-	MeshAddr     string         `json:"mesh_addr"`
-	State        GossipState    `json:"state"`
-	Incarnation  uint64         `json:"incarnation"`
-	Protocol     string         `json:"protocol"`
-	TotalMembers int            `json:"total_members"`
-	AliveCount   int            `json:"alive_count"`
-	SuspectCount int            `json:"suspect_count"`
-	DeadCount    int            `json:"dead_count"`
-	IntervalMs   int64          `json:"interval_ms"`
-	Members      []*Node        `json:"members,omitempty"`
+	NodeID       string      `json:"node_id"`
+	NodeName     string      `json:"node_name"`
+	MeshAddr     string      `json:"mesh_addr"`
+	State        GossipState `json:"state"`
+	Incarnation  uint64      `json:"incarnation"`
+	Protocol     string      `json:"protocol"`
+	TotalMembers int         `json:"total_members"`
+	AliveCount   int         `json:"alive_count"`
+	SuspectCount int         `json:"suspect_count"`
+	DeadCount    int         `json:"dead_count"`
+	IntervalMs   int64       `json:"interval_ms"`
+	Members      []*Node     `json:"members,omitempty"`
 }
 
 // NodeMetaUpdate represents a payload to update node metadata
@@ -517,4 +534,137 @@ func ParseTargetHost(raw string) *TargetHost {
 		Type: TargetTypeMesh,
 		Host: raw,
 	}
+}
+
+var serviceNamePattern = regexp.MustCompile(`^[a-zA-Z0-9][a-zA-Z0-9_-]{0,62}$`)
+
+// ValidateServiceName rejects names unsafe for paths and runtime identifiers.
+func ValidateServiceName(name string) error {
+	if !serviceNamePattern.MatchString(name) {
+		return fmt.Errorf("name must contain 1-63 letters, digits, underscores or hyphens and start with a letter or digit")
+	}
+	return nil
+}
+
+// ValidatePortMapping validates Docker publish syntax, including IPv6 and ranges.
+func ValidatePortMapping(mapping string) error {
+	spec := mapping
+	if strings.Contains(spec, "/") {
+		pieces := strings.Split(spec, "/")
+		if len(pieces) != 2 || (pieces[1] != "tcp" && pieces[1] != "udp" && pieces[1] != "sctp") {
+			return fmt.Errorf("invalid port protocol")
+		}
+		spec = pieces[0]
+	}
+	if strings.HasPrefix(spec, "[") {
+		end := strings.Index(spec, "]:")
+		if end < 0 || net.ParseIP(spec[1:end]) == nil {
+			return fmt.Errorf("invalid bracketed host IP")
+		}
+		spec = spec[end+2:]
+		if strings.Count(spec, ":") != 1 {
+			return fmt.Errorf("host IP requires host and container ports")
+		}
+	} else if strings.Count(spec, ":") == 2 {
+		host, rest, _ := strings.Cut(spec, ":")
+		if net.ParseIP(host) == nil {
+			return fmt.Errorf("invalid host IP")
+		}
+		spec = rest
+	}
+	pieces := strings.Split(spec, ":")
+	if len(pieces) < 1 || len(pieces) > 2 {
+		return fmt.Errorf("expected [host-IP:]host-port:container-port or container-port")
+	}
+	containerSize, err := portRangeSize(pieces[len(pieces)-1])
+	if err != nil {
+		return err
+	}
+	if len(pieces) == 2 && pieces[0] != "" {
+		hostSize, err := portRangeSize(pieces[0])
+		if err != nil {
+			return err
+		}
+		if containerSize > 1 && hostSize != containerSize {
+			return fmt.Errorf("host and container port ranges must have equal size")
+		}
+	}
+	return nil
+}
+
+func portRangeSize(value string) (int, error) {
+	parts := strings.Split(value, "-")
+	if len(parts) > 2 {
+		return 0, fmt.Errorf("invalid port range")
+	}
+	ports := make([]int, len(parts))
+	for i, part := range parts {
+		for _, c := range part {
+			if c < '0' || c > '9' {
+				return 0, fmt.Errorf("port must be a number between 1 and 65535")
+			}
+		}
+		p, err := strconv.Atoi(part)
+		if err != nil || p < 1 || p > 65535 {
+			return 0, fmt.Errorf("port must be between 1 and 65535")
+		}
+		ports[i] = p
+	}
+	if len(ports) == 1 {
+		return 1, nil
+	}
+	if ports[1] < ports[0] {
+		return 0, fmt.Errorf("port range must be ascending")
+	}
+	return ports[1] - ports[0] + 1, nil
+}
+
+// ValidateUpstreamAddress checks the static TCP upstream syntax accepted by Caddy.
+func ValidateUpstreamAddress(address string) error {
+	if address == "" || strings.ContainsAny(address, " \t\r\n{}\x00") {
+		return fmt.Errorf("upstream must be a host:port address without whitespace or directives")
+	}
+	hostPort := address
+	if strings.Contains(address, "://") {
+		u, err := url.Parse(address)
+		if err != nil || u == nil {
+			return fmt.Errorf("invalid upstream URL")
+		}
+		if u.Scheme != "http" && u.Scheme != "https" && u.Scheme != "h2c" {
+			return fmt.Errorf("upstream scheme must be http, https or h2c")
+		}
+		if u.User != nil || u.Path != "" || u.RawQuery != "" || u.ForceQuery || u.Fragment != "" || strings.Contains(address, "#") {
+			return fmt.Errorf("upstream URL cannot contain credentials, path, query or fragment")
+		}
+		hostPort = u.Host
+	}
+	host, port, err := net.SplitHostPort(hostPort)
+	if err != nil || host == "" {
+		return fmt.Errorf("upstream must specify host and port, with IPv6 in brackets")
+	}
+	if net.ParseIP(host) == nil {
+		if strings.HasPrefix(hostPort, "[") {
+			return fmt.Errorf("bracketed upstream host must be an IP address")
+		}
+		hostname := strings.TrimSuffix(host, ".")
+		if len(hostname) > 253 {
+			return fmt.Errorf("invalid upstream hostname")
+		}
+		for _, label := range strings.Split(hostname, ".") {
+			if len(label) == 0 || len(label) > 63 || label[0] == '-' || label[len(label)-1] == '-' {
+				return fmt.Errorf("invalid upstream hostname")
+			}
+			for _, c := range label {
+				valid := c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z' || c >= '0' && c <= '9' || c == '-' || c == '_'
+				if !valid {
+					return fmt.Errorf("invalid upstream hostname")
+				}
+			}
+		}
+	}
+	size, err := portRangeSize(port)
+	if err != nil || size != 1 || strings.Contains(port, "-") {
+		return fmt.Errorf("upstream port must be a number between 1 and 65535")
+	}
+	return nil
 }

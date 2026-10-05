@@ -10,7 +10,7 @@
 </p>
 
 <p align="center">
-  <img src="https://img.shields.io/badge/Go-1.23-00ADD8?style=flat-square&logo=go" alt="Go Version" />
+  <img src="https://img.shields.io/badge/Go-1.27-00ADD8?style=flat-square&logo=go" alt="Go Version" />
   <img src="https://img.shields.io/badge/License-MIT-blue?style=flat-square" alt="License" />
   <img src="https://img.shields.io/badge/HTTP%2F3-QUIC%20Enabled-4E5EE4?style=flat-square" alt="HTTP/3" />
   <img src="https://img.shields.io/badge/Architecture-Clean-success?style=flat-square" alt="Clean Architecture" />
@@ -46,10 +46,10 @@ irm https://raw.githubusercontent.com/osuki-dev/kizuna/main/install.ps1 | iex
 * **Caddy Ingress & HTTP/3**: Automated Let's Encrypt / ZeroSSL, Cloudflare DNS-01 ACME, or internal Root CA for LAN/Homelab IPs, with HTTP/3 (QUIC) and HTTP/2.
 * **Common Proxy Presets**: One-click configuration for WebSockets, SSE & LLM streaming (`flush_interval -1`), gRPC (`h2c`), and CORS headers.
 * **Production Operations Lifecycle**:
-  * **Publish (`kizuna deploy`)**: Zero-downtime deploy with release history tracking.
+  * **Publish (`kizuna deploy`)**: Health-checked Docker replacement with failure recovery and scoped release history. Fixed published ports require a brief interruption.
   * **Scale (`kizuna scale <svc> <N>`)**: One-click horizontal replica scaling with dynamic Caddy load balancer pooling (`round_robin`, `least_conn`).
-  * **Rollback (`kizuna rollback [svc]`)**: Instant one-click rollback to the previous stable revision.
-  * **Backup (`kizuna backup`)**: Respects `.gitignore`, supports DB dumps (PostgreSQL, MySQL, SQLite, custom), and automated retention pruning (`keep_days`, `max_backups`).
+  * **Rollback (`kizuna rollback [svc]`)**: Restore a recorded immutable Docker image and application configuration. Database, Compose, and process rollback are not supported.
+  * **Backup (`kizuna backup`)**: Archive all explicitly selected paths and database dumps (PostgreSQL, MySQL, SQLite, custom); publish only complete backups and apply local retention (`keep_days`, `max_backups`).
 * **Disk Exhaustion Protection**: Docker container logs capped at 150MB with automatic log rotation (`--log-opt max-size=50m --log-opt max-file=3`).
 * **Real-time TUI Dashboard**: Terminal UI with CPU/Memory sparkline historical trends, load average, and telemetry gauges.
 * **Extensible i18n**: Fully localized in English (`en`), Japanese (`ja`), and Chinese (`zh`), with automatic runtime discovery for new languages (`locales/*.json`) without recompiling.
@@ -96,7 +96,7 @@ kizuna deploy -e production
 # One-click horizontal scaling with automatic Caddy load balancing
 kizuna scale web 3
 
-# Instant rollback to previous stable release
+# Restore a recorded immutable Docker revision
 kizuna rollback web
 ```
 
@@ -133,6 +133,7 @@ services:
       # Or for public domains in homelab without public ports:
       # domain: "nas.mydomain.com"
       # tls: "cloudflare"       # Uses Cloudflare DNS-01 ACME challenge for valid Let's Encrypt certs!
+      upstream_port: 3000
       websocket: true          # Auto-configures WebSocket reverse proxy
       sse: true                # Real-time SSE & AI streaming (flush_interval -1)
       cors: true               # Auto-injects CORS headers
@@ -160,7 +161,7 @@ services:
     backup:
       paths:
         - "./data/postgres"
-      schedule: "0 3 * * *"
+      # schedule is metadata; use an external scheduler to invoke backup
       storage:
         type: "s3"
         bucket: "my-backups"
@@ -182,6 +183,8 @@ ingress:
   auto_tls: true
   upstream_port: 3000
 ```
+
+See [deployment behavior and configuration](docs/deployment.md) for SSH verification, Compose settings, Caddy integration, backup prerequisites, and compatibility changes.
 
 ---
 

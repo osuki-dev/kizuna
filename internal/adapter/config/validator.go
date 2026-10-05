@@ -4,8 +4,9 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-	"strconv"
+	"regexp"
 	"strings"
+	"time"
 
 	"github.com/osuki-dev/kizuna/internal/domain/entity"
 )
@@ -56,6 +57,24 @@ func ValidateProject(proj *entity.Project, baseDir string) []ValidationIssue {
 		})
 	}
 
+	if proj.Mesh != nil {
+		if proj.Mesh.MaxUploadMB < 0 || proj.Mesh.MaxUploadMB > 102400 {
+			issues = append(issues, ValidationIssue{Field: "mesh.max_upload_mb", Message: "Upload limit must be between 0 and 102400 MB", Severity: SeverityError})
+		}
+		for field, value := range map[string]string{"probe_timeout": proj.Mesh.ProbeTimeout, "gossip_interval": proj.Mesh.GossipInterval} {
+			if value != "" {
+				if d, err := time.ParseDuration(value); err != nil || d <= 0 {
+					issues = append(issues, ValidationIssue{Field: "mesh." + field, Message: "Duration must be positive", Severity: SeverityError})
+				}
+			}
+		}
+	}
+	if proj.DERP != nil {
+		if proj.DERP.Port < 0 || proj.DERP.Port > 65535 || proj.DERP.STUNPort < 0 || proj.DERP.STUNPort > 65535 {
+			issues = append(issues, ValidationIssue{Field: "derp.port", Message: "Ports must be between 0 and 65535", Severity: SeverityError})
+		}
+	}
+
 	if len(proj.Services) == 0 {
 		issues = append(issues, ValidationIssue{
 			Field:      "services",
@@ -75,6 +94,48 @@ func ValidateProject(proj *entity.Project, baseDir string) []ValidationIssue {
 
 func validateService(svc *entity.Service, name, baseDir string) []ValidationIssue {
 	var issues []ValidationIssue
+	addError := func(field, message string) {
+		issues = append(issues, ValidationIssue{Service: name, Field: field, Message: message, Severity: SeverityError})
+	}
+	if err := entity.ValidateServiceName(name); err != nil {
+		addError("name", err.Error())
+	}
+	if svc == nil {
+		addError("service", "Service cannot be null")
+		return issues
+	}
+	if svc.Replicas < 0 || svc.Replicas > 1000 {
+		addError("replicas", "Replicas must be between 0 and 1000")
+	}
+	if svc.Logging != nil && (svc.Logging.MaxFile < 0 || svc.Logging.MaxFile > 1000) {
+		addError("logging.max_file", "Max file count must be between 0 and 1000")
+	}
+	if svc.Backup != nil && svc.Backup.Retention != nil && (svc.Backup.Retention.KeepDays < 0 || svc.Backup.Retention.MaxBackups < 0) {
+		addError("backup.retention", "Retention values cannot be negative")
+	}
+	if svc.Compose != nil {
+		if svc.Type != entity.TypeCompose {
+			addError("compose", "Compose options require compose workload type")
+		}
+		if svc.Compose.ProjectName != "" && !composeProjectPattern.MatchString(svc.Compose.ProjectName) {
+			addError("compose.project_name", "Project name must start with a lowercase letter or digit and contain lowercase letters, digits, underscores or hyphens")
+		}
+		for _, selection := range svc.Compose.Services {
+			if err := entity.ValidateServiceName(selection); err != nil {
+				addError("compose.services", err.Error())
+			}
+		}
+		for _, profile := range svc.Compose.Profiles {
+			if !composeProfilePattern.MatchString(profile) {
+				addError("compose.profiles", "Invalid Compose profile name")
+			}
+		}
+		for _, path := range svc.Compose.EnvFiles {
+			if strings.TrimSpace(path) == "" || strings.ContainsAny(path, "\x00\r\n") {
+				addError("compose.env_files", "Environment file reference must be a nonempty path")
+			}
+		}
+	}
 
 	// 1. Service Type Validation
 	validTypes := map[entity.ServiceType]bool{
@@ -96,7 +157,7 @@ func validateService(svc *entity.Service, name, baseDir string) []ValidationIssu
 	}
 
 	// 2. Root directory check
-	workDir := filepath.Join(baseDir, svc.Root)
+	workDir := resolvePath(baseDir, svc.Root)
 	if stat, err := os.Stat(workDir); err != nil || !stat.IsDir() {
 		issues = append(issues, ValidationIssue{
 			Service:    name,
@@ -111,7 +172,7 @@ func validateService(svc *entity.Service, name, baseDir string) []ValidationIssu
 	switch svc.Type {
 	case entity.TypeDocker:
 		if svc.Dockerfile != "" {
-			dfPath := filepath.Join(workDir, svc.Dockerfile)
+			dfPath := resolvePath(workDir, svc.Dockerfile)
 			if _, err := os.Stat(dfPath); err != nil {
 				issues = append(issues, ValidationIssue{
 					Service:    name,
@@ -137,7 +198,7 @@ func validateService(svc *entity.Service, name, baseDir string) []ValidationIssu
 		if cf == "" {
 			cf = "docker-compose.yml"
 		}
-		cfPath := filepath.Join(workDir, cf)
+		cfPath := resolvePath(workDir, cf)
 		if _, err := os.Stat(cfPath); err != nil {
 			issues = append(issues, ValidationIssue{
 				Service:    name,
@@ -165,32 +226,9 @@ func validateService(svc *entity.Service, name, baseDir string) []ValidationIssu
 	}
 
 	// 4. Ports validation
-	for _, p := range svc.Ports {
-		parts := strings.Split(p, ":")
-		if len(parts) != 2 {
-			issues = append(issues, ValidationIssue{
-				Service:    name,
-				Field:      "ports",
-				Message:    fmt.Sprintf("Invalid port mapping '%s', must be 'host:container'", p),
-				Severity:   SeverityError,
-			})
-		} else {
-			if _, err := strconv.Atoi(parts[0]); err != nil {
-				issues = append(issues, ValidationIssue{
-					Service:  name,
-					Field:    "ports",
-					Message:  fmt.Sprintf("Invalid host port '%s'", parts[0]),
-					Severity: SeverityError,
-				})
-			}
-			if _, err := strconv.Atoi(parts[1]); err != nil {
-				issues = append(issues, ValidationIssue{
-					Service:  name,
-					Field:    "ports",
-					Message:  fmt.Sprintf("Invalid container port '%s'", parts[1]),
-					Severity: SeverityError,
-				})
-			}
+	for _, mapping := range svc.Ports {
+		if err := entity.ValidatePortMapping(mapping); err != nil {
+			addError("ports", fmt.Sprintf("Invalid port mapping %q: %v", mapping, err))
 		}
 	}
 
@@ -205,7 +243,7 @@ func validateService(svc *entity.Service, name, baseDir string) []ValidationIssu
 				Suggestion: "Set ingress.domain: 'my-site.example.com'",
 			})
 		}
-		if svc.Ingress.UpstreamPort <= 0 || svc.Ingress.UpstreamPort > 65535 {
+		if len(svc.Ingress.Upstreams) == 0 && (svc.Ingress.UpstreamPort <= 0 || svc.Ingress.UpstreamPort > 65535) {
 			issues = append(issues, ValidationIssue{
 				Service:    name,
 				Field:      "ingress.upstream_port",
@@ -214,11 +252,16 @@ func validateService(svc *entity.Service, name, baseDir string) []ValidationIssu
 				Suggestion: "Set ingress.upstream_port to the port your app listens on (e.g. 3000)",
 			})
 		}
+		for _, upstream := range svc.Ingress.Upstreams {
+			if err := entity.ValidateUpstreamAddress(upstream); err != nil {
+				addError("ingress.upstreams", fmt.Sprintf("Invalid upstream %q: %v", upstream, err))
+			}
+		}
 	}
 
 	// 6. Backup validation
 	if svc.Backup != nil {
-		if len(svc.Backup.Paths) == 0 {
+		if len(svc.Backup.Paths) == 0 && svc.Backup.Database == nil {
 			issues = append(issues, ValidationIssue{
 				Service:    name,
 				Field:      "backup.paths",
@@ -241,4 +284,14 @@ func validateService(svc *entity.Service, name, baseDir string) []ValidationIssu
 	}
 
 	return issues
+}
+
+var composeProjectPattern = regexp.MustCompile(`^[a-z0-9][a-z0-9_-]*$`)
+var composeProfilePattern = regexp.MustCompile(`^[a-zA-Z0-9][a-zA-Z0-9_.-]*$`)
+
+func resolvePath(base, path string) string {
+	if filepath.IsAbs(path) {
+		return filepath.Clean(path)
+	}
+	return filepath.Join(base, path)
 }

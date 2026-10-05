@@ -5,11 +5,15 @@ import (
 	"bytes"
 	"compress/gzip"
 	"context"
+	"errors"
 	"fmt"
 	"io"
+	"net"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sort"
+	"strings"
 	"sync"
 	"time"
 
@@ -38,6 +42,7 @@ type DeployUseCase struct {
 	client           NodeClient
 	strategyResolver StrategyResolver
 	ingressMgr       domain.IngressManager
+	releaseDir       string
 }
 
 // NewDeployUseCase initializes DeployUseCase
@@ -60,20 +65,33 @@ func (uc *DeployUseCase) WithIngressManager(mgr domain.IngressManager) *DeployUs
 	return uc
 }
 
+// WithReleaseDirectory configures where successful deployment history is persisted.
+func (uc *DeployUseCase) WithReleaseDirectory(dir string) *DeployUseCase {
+	uc.releaseDir = dir
+	return uc
+}
+
+func projectTargets(project *entity.Project) []string {
+	if len(project.Targets) > 0 {
+		return append([]string(nil), project.Targets...)
+	}
+	if project.Target != "" && project.Target != "default" {
+		return []string{project.Target}
+	}
+	return []string{"localhost"}
+}
+
+func serviceTargets(project *entity.Project, svc *entity.Service) []string {
+	if svc.Target != "" {
+		return []string{svc.Target}
+	}
+	return projectTargets(project)
+}
+
 // Execute deploys one or all services from a project configuration to single or multiple targets
 func (uc *DeployUseCase) Execute(ctx context.Context, project *entity.Project, targetService string, logWriter io.Writer) error {
 	if logWriter == nil {
 		logWriter = os.Stdout
-	}
-
-	// 1. Resolve targets (single or multi-node scale-out cluster)
-	targets := project.Targets
-	if len(targets) == 0 {
-		if project.Target != "" && project.Target != "default" {
-			targets = []string{project.Target}
-		} else {
-			targets = []string{"localhost"}
-		}
 	}
 
 	// 2. Select services to deploy
@@ -85,12 +103,18 @@ func (uc *DeployUseCase) Execute(ctx context.Context, project *entity.Project, t
 		}
 		toDeploy = append(toDeploy, svc)
 	} else {
-		for _, svc := range project.Services {
-			toDeploy = append(toDeploy, svc)
+		names := make([]string, 0, len(project.Services))
+		for name := range project.Services {
+			names = append(names, name)
+		}
+		sort.Strings(names)
+		for _, name := range names {
+			toDeploy = append(toDeploy, project.Services[name])
 		}
 	}
 
 	for _, svc := range toDeploy {
+		targets := serviceTargets(project, svc)
 		// A. Local build step if specified
 		if svc.Build != nil && svc.Build.Local != "" {
 			_, _ = fmt.Fprintln(logWriter, i18n.T("build_running", svc.Build.Local))
@@ -112,7 +136,8 @@ func (uc *DeployUseCase) Execute(ctx context.Context, project *entity.Project, t
 				return fmt.Errorf("failed to package artifact at %s: %w", artifactPath, err)
 			}
 			artifactBytes = buf.Bytes()
-		} else if (svc.Type == entity.TypeDocker && svc.Image == "") || svc.Type == entity.TypeCompose || svc.Dockerfile != "" {
+		} else if (svc.Type == entity.TypeDocker && svc.Image == "") || svc.Type == entity.TypeCompose || svc.Dockerfile != "" ||
+			svc.Type == entity.TypeNode || svc.Type == entity.TypeBun || svc.Type == entity.TypeProcess {
 			srcDir := svc.Root
 			if srcDir == "" {
 				srcDir = "."
@@ -136,12 +161,12 @@ func (uc *DeployUseCase) Execute(ctx context.Context, project *entity.Project, t
 		}
 
 		// D. Record release revision for rollback support
-		revID := fmt.Sprintf("rev-%d", time.Now().Unix())
+		revID := fmt.Sprintf("rev-%d", time.Now().UnixNano())
 		var upstreams []string
 		if svc.Ingress != nil {
 			upstreams = svc.Ingress.Upstreams
 		}
-		_ = RecordRelease("", &entity.ReleaseRecord{
+		err := recordProjectRelease(uc.releaseDir, project, svc, &entity.ReleaseRecord{
 			Revision:    revID,
 			ServiceName: svc.Name,
 			Image:       svc.Image,
@@ -150,6 +175,9 @@ func (uc *DeployUseCase) Execute(ctx context.Context, project *entity.Project, t
 			Upstreams:   upstreams,
 			CreatedAt:   time.Now(),
 		})
+		if err != nil {
+			return fmt.Errorf("deployment completed but release history could not be saved: %w", err)
+		}
 
 		_, _ = fmt.Fprintln(logWriter, i18n.T("deploy_success", svc.Name, revID))
 	}
@@ -169,28 +197,42 @@ func (uc *DeployUseCase) deployToSingleTarget(ctx context.Context, svc *entity.S
 	// 1. If strategy resolver is provided, use strategy pattern
 	if uc.strategyResolver != nil {
 		strategy, err := uc.strategyResolver.GetStrategy(targetHost)
-		if err == nil && strategy != nil {
+		if err != nil {
+			return fmt.Errorf("resolve deployment strategy: %w", err)
+		}
+		if strategy == nil {
+			return fmt.Errorf("no deployment strategy for %s", targetStr)
+		}
+		{
 			result, err := strategy.Deploy(ctx, targetHost, svc, artifactReader)
 			if err != nil {
 				_, _ = fmt.Fprintln(logWriter, i18n.T("deploy_failed", svc.Name, err))
 				return err
 			}
-			if result != nil && !result.Success {
+			if result == nil {
+				return fmt.Errorf("deployment returned no result for %s", targetStr)
+			}
+			if !result.Success {
 				return fmt.Errorf("deploy failed on %s: %s", targetHost.Address(), result.Error)
 			}
 			// Configure Ingress if enabled
-			uc.configureIngressForTarget(ctx, svc, targetHost, logWriter)
-			return nil
+			return uc.configureIngressForTarget(ctx, svc, targetHost, logWriter)
 		}
 	}
 
-	// 2. Fallback to mesh client if available
+	// Only mesh targets may use the mesh client.
+	if targetHost.Type != entity.TargetTypeMesh {
+		return fmt.Errorf("deployment strategy unavailable for target %s", targetStr)
+	}
 	node, err := uc.resolveNode(targetHost.Host)
 	if err != nil {
 		return err
 	}
 
-	if uc.client != nil {
+	if uc.client == nil {
+		return fmt.Errorf("no deployment client for target %s", targetStr)
+	}
+	{
 		if err := uc.client.DeployService(ctx, node, svc, artifactReader); err != nil {
 			_, _ = fmt.Fprintln(logWriter, i18n.T("deploy_failed", svc.Name, err))
 			return err
@@ -198,7 +240,7 @@ func (uc *DeployUseCase) deployToSingleTarget(ctx context.Context, svc *entity.S
 
 		if svc.Ingress != nil && svc.Ingress.Provider == "caddy" && svc.Ingress.Domain != "" {
 			if err := uc.client.ConfigureIngress(ctx, node, svc.Ingress); err != nil {
-				_, _ = fmt.Fprintf(logWriter, "[warning] Ingress setup failed: %v\n", err)
+				return fmt.Errorf("application deployed but ingress setup failed: %w", err)
 			} else {
 				_, _ = fmt.Fprintln(logWriter, i18n.T("ingress_configured", svc.Ingress.Domain, svc.Ingress.UpstreamPort))
 			}
@@ -214,6 +256,7 @@ func (uc *DeployUseCase) deployToMultipleTargets(ctx context.Context, svc *entit
 	type outcome struct {
 		targetHost *entity.TargetHost
 		result     *entity.DeployResult
+		service    *entity.Service
 		err        error
 	}
 
@@ -236,21 +279,48 @@ func (uc *DeployUseCase) deployToMultipleTargets(ctx context.Context, svc *entit
 					outcomes[idx] = outcome{targetHost: tHost, err: err}
 					return
 				}
-				res, err := strategy.Deploy(ctx, tHost, svc, r)
-				outcomes[idx] = outcome{targetHost: tHost, result: res, err: err}
+				if strategy == nil {
+					outcomes[idx] = outcome{targetHost: tHost, err: fmt.Errorf("no deployment strategy")}
+					return
+				}
+				// Each target receives an independent configuration snapshot.
+				targetSvc, err := cloneService(svc)
+				if err != nil {
+					outcomes[idx] = outcome{targetHost: tHost, err: err}
+					return
+				}
+				res, err := strategy.Deploy(ctx, tHost, targetSvc, r)
+				if res == nil && err == nil {
+					err = fmt.Errorf("deployment returned no result")
+				}
+				outcomes[idx] = outcome{targetHost: tHost, result: res, service: targetSvc, err: err}
 				return
 			}
 
+			if tHost.Type != entity.TargetTypeMesh {
+				outcomes[idx] = outcome{targetHost: tHost, err: fmt.Errorf("deployment strategy unavailable")}
+				return
+			}
 			// Fallback: Mesh RPC
 			node, err := uc.resolveNode(tHost.Host)
 			if err != nil {
 				outcomes[idx] = outcome{targetHost: tHost, err: err}
 				return
 			}
+			if uc.client == nil {
+				outcomes[idx] = outcome{targetHost: tHost, err: fmt.Errorf("no deployment client")}
+				return
+			}
+			targetSvc, err := cloneService(svc)
+			if err != nil {
+				outcomes[idx] = outcome{targetHost: tHost, err: err}
+				return
+			}
 			start := time.Now()
-			err = uc.client.DeployService(ctx, node, svc, r)
+			err = uc.client.DeployService(ctx, node, targetSvc, r)
 			outcomes[idx] = outcome{
 				targetHost: tHost,
+				service:    targetSvc,
 				result:     &entity.DeployResult{Target: tHost.Address(), ServiceName: svc.Name, Success: err == nil, Duration: time.Since(start)},
 				err:        err,
 			}
@@ -260,15 +330,16 @@ func (uc *DeployUseCase) deployToMultipleTargets(ctx context.Context, svc *entit
 	wg.Wait()
 
 	var successfulUpstreams []string
-	var failCount int
+	var failures []error
 
 	for _, oc := range outcomes {
 		if oc.err != nil || (oc.result != nil && !oc.result.Success) {
-			failCount++
+
 			errMsg := oc.err
 			if errMsg == nil && oc.result != nil {
 				errMsg = fmt.Errorf("%s", oc.result.Error)
 			}
+			failures = append(failures, fmt.Errorf("%s: %w", oc.targetHost.Address(), errMsg))
 			_, _ = fmt.Fprintln(logWriter, i18n.T("scale_target_failed", oc.targetHost.Address(), errMsg))
 		} else {
 			durationStr := "done"
@@ -282,21 +353,13 @@ func (uc *DeployUseCase) deployToMultipleTargets(ctx context.Context, svc *entit
 			if svc.Ingress != nil && svc.Ingress.UpstreamPort > 0 {
 				upstreamPort = svc.Ingress.UpstreamPort
 			} else if len(svc.Ports) > 0 {
-				// Parse host port
-				p := svc.Ports[0]
-				var hostPort string
-				if idx := filepath.Clean(p); idx != "" {
-					parts := bytes.Split([]byte(p), []byte(":"))
-					if len(parts) >= 2 {
-						hostPort = string(parts[0])
-					}
-				}
-				if hostPort != "" {
-					_, _ = fmt.Sscanf(hostPort, "%d", &upstreamPort)
+				parts := strings.Split(strings.TrimSuffix(strings.TrimSuffix(svc.Ports[0], "/tcp"), "/udp"), ":")
+				if len(parts) >= 2 {
+					_, _ = fmt.Sscanf(parts[len(parts)-2], "%d", &upstreamPort)
 				}
 			}
 
-			upstreamAddr := fmt.Sprintf("%s:%d", oc.targetHost.Host, upstreamPort)
+			upstreamAddr := net.JoinHostPort(oc.targetHost.Host, fmt.Sprint(upstreamPort))
 			if oc.targetHost.Type == entity.TargetTypeLocal {
 				upstreamAddr = fmt.Sprintf("127.0.0.1:%d", upstreamPort)
 			}
@@ -304,8 +367,23 @@ func (uc *DeployUseCase) deployToMultipleTargets(ctx context.Context, svc *entit
 		}
 	}
 
-	if len(successfulUpstreams) == 0 {
-		return fmt.Errorf("all %d target deployment(s) failed", len(targets))
+	if len(failures) > 0 {
+		return fmt.Errorf("%d of %d target deployments failed (successful targets remain deployed): %w", len(failures), len(targets), errors.Join(failures...))
+	}
+	// A shared immutable reference is safe to reuse across these targets.
+	// Different local build IDs must not be treated as a reproducible revision.
+	image := ""
+	if len(outcomes) > 0 && outcomes[0].service != nil {
+		image = outcomes[0].service.Image
+	}
+	for _, oc := range outcomes {
+		if oc.service == nil || oc.service.Image != image {
+			image = ""
+			break
+		}
+	}
+	if image != "" {
+		svc.Image = image
 	}
 
 	// D. Synchronize Ingress Load Balancing across all successful targets
@@ -315,54 +393,73 @@ func (uc *DeployUseCase) deployToMultipleTargets(ctx context.Context, svc *entit
 			svc.Ingress.LBPolicy = "round_robin"
 		}
 
-		if uc.ingressMgr != nil {
-			if err := uc.ingressMgr.ConfigureRoute(ctx, svc.Ingress); err != nil {
-				_, _ = fmt.Fprintf(logWriter, "[warning] Load balancer configuration failed: %v\n", err)
-			} else {
-				_, _ = fmt.Fprintln(logWriter, i18n.T("ingress_lb_configured", svc.Ingress.Domain, len(successfulUpstreams), svc.Ingress.LBPolicy))
+		controllerConfigured := false
+		for _, oc := range outcomes {
+			if oc.targetHost.Type == entity.TargetTypeMesh {
+				if err := uc.configureIngressForTarget(ctx, svc, oc.targetHost, logWriter); err != nil {
+					return err
+				}
+			} else if !controllerConfigured {
+				if uc.ingressMgr == nil {
+					return fmt.Errorf("application deployed but ingress manager is unavailable")
+				}
+				if err := uc.ingressMgr.ConfigureRoute(ctx, svc.Ingress); err != nil {
+					return fmt.Errorf("application deployed but load balancer configuration failed: %w", err)
+				}
+				controllerConfigured = true
 			}
 		}
+		_, _ = fmt.Fprintln(logWriter, i18n.T("ingress_lb_configured", svc.Ingress.Domain, len(successfulUpstreams), svc.Ingress.LBPolicy))
 	}
 
 	return nil
 }
 
-func (uc *DeployUseCase) configureIngressForTarget(ctx context.Context, svc *entity.Service, target *entity.TargetHost, logWriter io.Writer) {
+func (uc *DeployUseCase) configureIngressForTarget(ctx context.Context, svc *entity.Service, target *entity.TargetHost, logWriter io.Writer) error {
 	if svc.Ingress == nil || svc.Ingress.Provider != "caddy" || svc.Ingress.Domain == "" {
-		return
+		return nil
 	}
 
-	if target.Type == entity.TargetTypeSSH && target.Host != "" {
-		svc.Ingress.Upstreams = []string{fmt.Sprintf("%s:%d", target.Host, svc.Ingress.UpstreamPort)}
-	}
-
-	if uc.ingressMgr != nil {
-		if err := uc.ingressMgr.ConfigureRoute(ctx, svc.Ingress); err != nil {
-			_, _ = fmt.Fprintf(logWriter, "[warning] Ingress setup failed: %v\n", err)
-		} else {
-			_, _ = fmt.Fprintln(logWriter, i18n.T("ingress_configured", svc.Ingress.Domain, svc.Ingress.UpstreamPort))
+	if target.Type == entity.TargetTypeMesh {
+		if uc.client == nil {
+			return fmt.Errorf("application deployed but mesh ingress client is unavailable")
 		}
+		node, err := uc.resolveNode(target.Host)
+		if err != nil {
+			return err
+		}
+		if err := uc.client.ConfigureIngress(ctx, node, svc.Ingress); err != nil {
+			return fmt.Errorf("application deployed but mesh ingress setup failed: %w", err)
+		}
+		return nil
 	}
+
+	if target.Type == entity.TargetTypeSSH && target.Host != "" && len(svc.Ingress.Upstreams) == 0 {
+		svc.Ingress.Upstreams = []string{net.JoinHostPort(target.Host, fmt.Sprint(svc.Ingress.UpstreamPort))}
+	}
+
+	if uc.ingressMgr == nil {
+		return fmt.Errorf("application deployed but ingress manager is unavailable")
+	}
+	if err := uc.ingressMgr.ConfigureRoute(ctx, svc.Ingress); err != nil {
+		return fmt.Errorf("application deployed but ingress setup failed: %w", err)
+	}
+	_, _ = fmt.Fprintln(logWriter, i18n.T("ingress_configured", svc.Ingress.Domain, svc.Ingress.UpstreamPort))
+	return nil
 }
 
 func (uc *DeployUseCase) resolveNode(name string) (*entity.Node, error) {
-	if uc.nodeRepo != nil {
-		node, err := uc.nodeRepo.GetNode(name)
-		if err == nil {
-			return node, nil
-		}
-		nodes, _ := uc.nodeRepo.ListNodes()
-		if len(nodes) > 0 {
-			return nodes[0], nil
-		}
+	if uc.nodeRepo == nil {
+		return nil, fmt.Errorf("node repository unavailable for target %q", name)
 	}
-
-	return &entity.Node{
-		Name:      name,
-		Addr:      name,
-		AuthToken: "kzn_default",
-		IsOnline:  true,
-	}, nil
+	node, err := uc.nodeRepo.GetNode(name)
+	if err != nil {
+		return nil, fmt.Errorf("target node %q not found: %w", name, err)
+	}
+	if node == nil {
+		return nil, fmt.Errorf("target node %q not found", name)
+	}
+	return node, nil
 }
 
 func (uc *DeployUseCase) runLocalBuild(ctx context.Context, svc *entity.Service, logWriter io.Writer) error {
@@ -407,7 +504,14 @@ func createTarGzArchive(srcPath string) (*bytes.Buffer, error) {
 			}
 			return nil
 		}
-		header, err := tar.FileInfoHeader(f, f.Name())
+		link := ""
+		if f.Mode()&os.ModeSymlink != 0 {
+			link, err = os.Readlink(path)
+			if err != nil {
+				return err
+			}
+		}
+		header, err := tar.FileInfoHeader(f, link)
 		if err != nil {
 			return err
 		}
@@ -415,19 +519,17 @@ func createTarGzArchive(srcPath string) (*bytes.Buffer, error) {
 		if err := tw.WriteHeader(header); err != nil {
 			return err
 		}
-		if f.IsDir() {
+		if !f.Mode().IsRegular() {
 			return nil
 		}
 		file, err := os.Open(path)
 		if err != nil {
 			return err
 		}
-		defer func() { _ = file.Close() }()
-		_, err = io.Copy(tw, file)
-		return err
+		_, copyErr := io.Copy(tw, file)
+		return errors.Join(copyErr, file.Close())
 	})
 
-	_ = tw.Close()
-	_ = gw.Close()
+	err = errors.Join(err, tw.Close(), gw.Close())
 	return &buf, err
 }

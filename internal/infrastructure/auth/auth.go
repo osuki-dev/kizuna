@@ -39,14 +39,18 @@ func NewAuthStore(configDir string) (domain.AuthManager, error) {
 		home, _ := os.UserHomeDir()
 		configDir = filepath.Join(home, ".kizuna")
 	}
-	_ = os.MkdirAll(configDir, 0700)
+	if err := os.MkdirAll(configDir, 0700); err != nil {
+		return nil, err
+	}
 
 	store := &Store{
 		storePath: filepath.Join(configDir, "authorized_clients.json"),
 		clients:   make(map[string]AuthorizedClient),
 	}
 
-	_ = store.load()
+	if err := store.load(); err != nil && !os.IsNotExist(err) {
+		return nil, fmt.Errorf("load authorized clients: %w", err)
+	}
 	return store, nil
 }
 
@@ -81,9 +85,6 @@ func (s *Store) VerifyPIN(pin, clientName string) (string, error) {
 		return "", domain.ErrInvalidPIN
 	}
 
-	// Invalidate PIN after successful pairing
-	s.activePIN = ""
-
 	tokenBytes := make([]byte, 24)
 	if _, err := rand.Read(tokenBytes); err != nil {
 		return "", err
@@ -98,8 +99,11 @@ func (s *Store) VerifyPIN(pin, clientName string) (string, error) {
 	}
 
 	s.clients[token] = client
-	_ = s.saveLocked()
-
+	if err := s.saveLocked(); err != nil {
+		delete(s.clients, token)
+		return "", fmt.Errorf("persist paired client: %w", err)
+	}
+	s.activePIN = ""
 	return token, nil
 }
 
@@ -140,10 +144,12 @@ func (s *Store) RevokeClient(nameOrID string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
+	removedClients := make(map[string]AuthorizedClient)
 	var tokensToDelete []string
 	for token, c := range s.clients {
 		if c.Name == nameOrID || c.ID == nameOrID {
 			tokensToDelete = append(tokensToDelete, token)
+			removedClients[token] = c
 		}
 	}
 
@@ -155,7 +161,13 @@ func (s *Store) RevokeClient(nameOrID string) error {
 		delete(s.clients, token)
 	}
 
-	return s.saveLocked()
+	if err := s.saveLocked(); err != nil {
+		for token, client := range removedClients {
+			s.clients[token] = client
+		}
+		return err
+	}
+	return nil
 }
 
 // RevokeToken revokes a specific token
@@ -167,8 +179,13 @@ func (s *Store) RevokeToken(token string) error {
 		return fmt.Errorf("token not found")
 	}
 
+	client := s.clients[token]
 	delete(s.clients, token)
-	return s.saveLocked()
+	if err := s.saveLocked(); err != nil {
+		s.clients[token] = client
+		return err
+	}
+	return nil
 }
 
 func (s *Store) load() error {
@@ -195,5 +212,17 @@ func (s *Store) saveLocked() error {
 	if err != nil {
 		return err
 	}
-	return os.WriteFile(s.storePath, data, 0600)
+	tmp, err := os.CreateTemp(filepath.Dir(s.storePath), ".authorized-clients-*")
+	if err != nil {
+		return err
+	}
+	defer func() { _ = os.Remove(tmp.Name()) }()
+	if _, err := tmp.Write(data); err != nil {
+		_ = tmp.Close()
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		return err
+	}
+	return os.Rename(tmp.Name(), s.storePath)
 }
