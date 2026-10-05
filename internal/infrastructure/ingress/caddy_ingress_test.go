@@ -2,6 +2,7 @@ package ingress
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -108,6 +109,8 @@ func TestCaddyfileGenerationWithCustomizations(t *testing.T) {
 		t.Errorf("missing lb_policy least_conn in Caddyfile")
 	}
 
+	mgr.lookPath = func(string) (string, error) { return "mock", nil }
+	mgr.run = func(context.Context, string, ...string) ([]byte, error) { return nil, nil }
 	// Test RemoveRoute
 	err = mgr.RemoveRoute(context.Background(), "simple.example.com")
 	if err != nil && !strings.Contains(err.Error(), "neither caddy binary nor docker found") {
@@ -192,5 +195,232 @@ func TestLANandHomelabHTTPSPresets(t *testing.T) {
 	contentBytes2, _ := os.ReadFile(caddyFile)
 	if !strings.Contains(string(contentBytes2), "dns cloudflare test_token_secret_12345") {
 		t.Errorf("expected explicit Cloudflare API token in Caddyfile:\n%s", string(contentBytes2))
+	}
+}
+
+func mockLocalManager(t *testing.T) *CaddyManager {
+	t.Helper()
+	mgr := NewCaddyManagerWithOptions(t.TempDir(), CaddyOptions{}).(*CaddyManager)
+	mgr.lookPath = func(string) (string, error) { return "mock", nil }
+	mgr.run = func(context.Context, string, ...string) ([]byte, error) { return nil, nil }
+	return mgr
+}
+
+func TestRoutesSurviveRestartAndRemove(t *testing.T) {
+	mgr := mockLocalManager(t)
+	route := &entity.IngressConfig{Domain: "one.example.com", UpstreamPort: 8080, CloudflareToken: "sensitive"}
+	if err := mgr.ConfigureRoute(context.Background(), route); err != nil {
+		t.Fatal(err)
+	}
+	route.UpstreamPort = 9000
+	recovered := NewCaddyManagerWithOptions(mgr.caddyDir, CaddyOptions{}).(*CaddyManager)
+	recovered.lookPath, recovered.run = mgr.lookPath, mgr.run
+	if got := recovered.routes[route.Domain].UpstreamPort; got != 8080 {
+		t.Fatalf("persisted port = %d", got)
+	}
+	if err := recovered.ConfigureRoute(context.Background(), &entity.IngressConfig{Domain: "two.example.com", UpstreamPort: 8081}); err != nil {
+		t.Fatal(err)
+	}
+	content, _ := os.ReadFile(mgr.caddyFile)
+	if !strings.Contains(string(content), "one.example.com {") || !strings.Contains(string(content), "two.example.com {") {
+		t.Fatal("old route lost after restart")
+	}
+	info, _ := os.Stat(mgr.caddyFile)
+	if info.Mode().Perm() != 0600 {
+		t.Fatalf("sensitive file permissions = %o", info.Mode().Perm())
+	}
+	if err := recovered.RemoveRoute(context.Background(), route.Domain); err != nil {
+		t.Fatal(err)
+	}
+	last := NewCaddyManagerWithOptions(mgr.caddyDir, CaddyOptions{}).(*CaddyManager)
+	if _, ok := last.routes[route.Domain]; ok {
+		t.Fatal("removed route persisted")
+	}
+}
+
+func TestFailedUpdateRestoresRoutesAndFile(t *testing.T) {
+	for _, phase := range []string{"validate", "reload"} {
+		t.Run(phase, func(t *testing.T) {
+			mgr := mockLocalManager(t)
+			route := &entity.IngressConfig{Domain: "one.example.com", UpstreamPort: 8080}
+			if err := mgr.ConfigureRoute(context.Background(), route); err != nil {
+				t.Fatal(err)
+			}
+			old, _ := os.ReadFile(mgr.caddyFile)
+			var commands []string
+			mgr.run = func(_ context.Context, _ string, args ...string) ([]byte, error) {
+				commands = append(commands, args[0])
+				if args[0] == phase {
+					return nil, fmt.Errorf("mock failure")
+				}
+				return nil, nil
+			}
+			if err := mgr.RemoveRoute(context.Background(), route.Domain); err == nil {
+				t.Fatal("expected failure")
+			}
+			restored, _ := os.ReadFile(mgr.caddyFile)
+			if string(old) != string(restored) || mgr.routes[route.Domain] == nil {
+				t.Fatal("failed update changed committed state")
+			}
+			if phase == "validate" && strings.Contains(strings.Join(commands, " "), "reload") {
+				t.Fatal("reload after validation failure")
+			}
+			for _, command := range commands {
+				if command == "start" {
+					t.Fatal("failed reload attempted to start another server")
+				}
+			}
+		})
+	}
+}
+
+func TestUnmanagedAndCorruptFilesAreProtected(t *testing.T) {
+	for _, content := range []string{"operator.example.com { reverse_proxy localhost:8080 }", statePrefix + "broken"} {
+		dir := t.TempDir()
+		path := filepath.Join(dir, "Caddyfile")
+		if err := os.WriteFile(path, []byte(content), 0600); err != nil {
+			t.Fatal(err)
+		}
+		mgr := NewCaddyManagerWithOptions(dir, CaddyOptions{}).(*CaddyManager)
+		if err := mgr.ConfigureRoute(context.Background(), &entity.IngressConfig{Domain: "app.example.com", UpstreamPort: 8080}); err == nil {
+			t.Fatal("expected load failure")
+		}
+		after, _ := os.ReadFile(path)
+		if string(after) != content {
+			t.Fatal("existing file overwritten")
+		}
+	}
+}
+
+func TestCloudflareRequiresModule(t *testing.T) {
+	mgr := mockLocalManager(t)
+	mgr.run = func(context.Context, string, ...string) ([]byte, error) { return []byte("http.reverse_proxy"), nil }
+	err := mgr.ConfigureRoute(context.Background(), &entity.IngressConfig{Domain: "app.example.com", TLS: "cloudflare", UpstreamPort: 8080})
+	if err == nil || !strings.Contains(err.Error(), "dns.providers.cloudflare") {
+		t.Fatalf("missing module error: %v", err)
+	}
+	if len(mgr.routes) != 0 {
+		t.Fatal("failed route committed")
+	}
+	if _, err := os.Stat(mgr.caddyFile); !os.IsNotExist(err) {
+		t.Fatal("failed initial config persisted")
+	}
+}
+
+func TestExistingCaddyRequiresImportAndDoesNotEditRoot(t *testing.T) {
+	dir := t.TempDir()
+	root := filepath.Join(dir, "operator.Caddyfile")
+	content := "operator.example.com {\n reverse_proxy localhost:9000\n}\nimport " + filepath.Join(dir, "Caddyfile") + "\n"
+	if err := os.WriteFile(root, []byte(content), 0600); err != nil {
+		t.Fatal(err)
+	}
+	mgr := NewCaddyManagerWithOptions(dir, CaddyOptions{ConfigFile: root}).(*CaddyManager)
+	mgr.lookPath = func(string) (string, error) { return "mock", nil }
+	mgr.run = func(_ context.Context, _ string, args ...string) ([]byte, error) {
+		if len(args) < 3 || args[2] != root {
+			t.Fatalf("expected full root config: %v", args)
+		}
+		return nil, nil
+	}
+	if err := mgr.ConfigureRoute(context.Background(), &entity.IngressConfig{Domain: "app.example.com", UpstreamPort: 8080}); err != nil {
+		t.Fatal(err)
+	}
+	after, _ := os.ReadFile(root)
+	if string(after) != content {
+		t.Fatal("operator config changed")
+	}
+	managed, _ := os.ReadFile(mgr.caddyFile)
+	if strings.Contains(string(managed), "admin 127.0.0.1") {
+		t.Fatal("import fragment includes global config")
+	}
+}
+
+func TestDockerReloadFailurePreservesCommittedConfiguration(t *testing.T) {
+	mgr := mockLocalManager(t)
+	original := &entity.IngressConfig{Domain: "app.example.com", UpstreamPort: 8080}
+	if err := mgr.ConfigureRoute(context.Background(), original); err != nil {
+		t.Fatal(err)
+	}
+	old, _ := os.ReadFile(mgr.caddyFile)
+	mgr.options.ContainerName = "existing"
+	mgr.run = func(_ context.Context, command string, args ...string) ([]byte, error) {
+		if command != "docker" {
+			t.Fatalf("unexpected command %s", command)
+		}
+		if args[0] == "inspect" {
+			return []byte("true"), nil
+		}
+		if args[0] == "exec" && args[2] == "cat" {
+			return os.ReadFile(mgr.caddyFile)
+		}
+		if args[0] == "exec" && args[2] == "caddy" {
+			if args[3] == "reload" {
+				return nil, fmt.Errorf("mock reload failure")
+			}
+			return nil, nil
+		}
+		t.Fatalf("unexpected docker command %v", args)
+		return nil, nil
+	}
+	if err := mgr.ConfigureRoute(context.Background(), &entity.IngressConfig{Domain: original.Domain, UpstreamPort: 9000}); err == nil {
+		t.Fatal("expected reload failure")
+	}
+	after, _ := os.ReadFile(mgr.caddyFile)
+	if string(after) != string(old) || mgr.routes[original.Domain].UpstreamPort != 8080 {
+		t.Fatal("failed Docker reload changed committed configuration")
+	}
+}
+
+func TestDockerCloudflareNeverUsesDefaultImage(t *testing.T) {
+	mgr := mockLocalManager(t)
+	mgr.lookPath = func(name string) (string, error) {
+		if name == "caddy" {
+			return "", fmt.Errorf("not found")
+		}
+		return "mock", nil
+	}
+	mgr.run = func(_ context.Context, _ string, args ...string) ([]byte, error) {
+		if args[0] != "inspect" {
+			t.Fatalf("unexpected Docker invocation: %v", args)
+		}
+		return nil, fmt.Errorf("container missing")
+	}
+	err := mgr.ConfigureRoute(context.Background(), &entity.IngressConfig{Domain: "app.example.com", TLS: "cloudflare", UpstreamPort: 8080})
+	if err == nil || !strings.Contains(err.Error(), "KIZUNA_CADDY_IMAGE") {
+		t.Fatalf("expected explicit image requirement, got %v", err)
+	}
+}
+
+func TestTLSNoneExplicitlyDisablesAutomaticHTTPS(t *testing.T) {
+	mgr := mockLocalManager(t)
+	if err := mgr.ConfigureRoute(context.Background(), &entity.IngressConfig{Domain: "plain.example.com", UpstreamPort: 8080, TLS: "none", DNSProvider: "cloudflare"}); err != nil {
+		t.Fatal(err)
+	}
+	content, _ := os.ReadFile(mgr.caddyFile)
+	if !strings.Contains(string(content), "http://plain.example.com {") {
+		t.Fatal("TLS none still allows automatic HTTPS")
+	}
+	if strings.Contains(string(content), "    tls") {
+		t.Fatal("TLS none emitted a TLS directive")
+	}
+}
+
+func TestIngressBoundaryRejectsInvalidUpstreams(t *testing.T) {
+	for _, upstream := range []string{"localhost:8080\n}\nmalicious.example.com {", "http://user:pass@localhost:8080", "http://localhost:8080/path", "localhost:0"} {
+		mgr := mockLocalManager(t)
+		mgr.run = func(context.Context, string, ...string) ([]byte, error) {
+			t.Fatal("invalid upstream reached Caddy")
+			return nil, nil
+		}
+		if err := mgr.ConfigureRoute(context.Background(), &entity.IngressConfig{Domain: "app.example.com", Upstreams: []string{upstream}}); err == nil {
+			t.Fatalf("accepted invalid upstream %q", upstream)
+		}
+		if len(mgr.routes) != 0 {
+			t.Fatal("invalid upstream changed committed routes")
+		}
+	}
+	mgr := mockLocalManager(t)
+	if err := mgr.ConfigureRoute(context.Background(), &entity.IngressConfig{Domain: "app.example.com", Upstreams: []string{"h2c://[::1]:8080"}}); err != nil {
+		t.Fatal(err)
 	}
 }
